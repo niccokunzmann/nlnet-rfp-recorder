@@ -129,7 +129,7 @@ def test_task_output_shows_budget_without_time_left_when_rfp_euros_is_unset(
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
-    runner.invoke(app, ["mou", "budget", str(budget_file)])
+    runner.invoke(app, ["mou", "import", str(budget_file)])
 
     result = runner.invoke(app, ["task", "select", "10a"])
 
@@ -143,7 +143,7 @@ def test_task_output_shows_budget_and_time_left(tmp_path, settings):
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
-    runner.invoke(app, ["mou", "budget", str(budget_file)])
+    runner.invoke(app, ["mou", "import", str(budget_file)])
     task = Task.objects.get(name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     now = timezone.now()
@@ -1247,7 +1247,7 @@ def test_mou_status_sums_budget_across_tasks(tmp_path, settings):
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("(DONE) 10a. Already done\t€ 300\n10b. Still open\t€ 200\n")
-    runner.invoke(app, ["mou", "budget", str(budget_file)])
+    runner.invoke(app, ["mou", "import", str(budget_file)])
 
     result = runner.invoke(app, ["mou", "status"])
 
@@ -1319,32 +1319,32 @@ def test_mou_select_switches_to_an_existing_mou_without_creating():
     assert MoU.get_selected().name == "nlnet-2025"
 
 
-def test_mou_budget_prints_the_current_mou(tmp_path):
+def test_mou_import_prints_the_current_mou(tmp_path):
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
 
-    result = runner.invoke(app, ["mou", "budget", str(budget_file)])
+    result = runner.invoke(app, ["mou", "import", str(budget_file)])
 
     assert result.exit_code == 0, result.output
     assert "Current MoU: nlnet-2026" in result.output
 
 
-def test_mou_budget_fails_without_a_selected_mou(tmp_path):
+def test_mou_import_fails_without_a_selected_mou(tmp_path):
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
 
-    result = runner.invoke(app, ["mou", "budget", str(budget_file)])
+    result = runner.invoke(app, ["mou", "import", str(budget_file)])
 
     assert result.exit_code != 0
 
 
-def test_mou_budget_caps_matching_tasks(tmp_path):
+def test_mou_import_caps_matching_tasks(tmp_path):
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
 
-    result = runner.invoke(app, ["mou", "budget", str(budget_file)])
+    result = runner.invoke(app, ["mou", "import", str(budget_file)])
 
     assert result.exit_code == 0, result.output
     mou = MoU.objects.get()
@@ -1354,12 +1354,12 @@ def test_mou_budget_caps_matching_tasks(tmp_path):
     assert task.mou == mou
 
 
-def test_mou_budget_with_mou_option_creates_and_selects_it(tmp_path):
+def test_mou_import_with_mou_option_creates_and_selects_it(tmp_path):
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
 
     result = runner.invoke(
-        app, ["mou", "budget", str(budget_file), "--mou", "nlnet-2026"]
+        app, ["mou", "import", str(budget_file), "--mou", "nlnet-2026"]
     )
 
     assert result.exit_code == 0, result.output
@@ -1371,14 +1371,14 @@ def test_mou_budget_with_mou_option_creates_and_selects_it(tmp_path):
     assert task.mou == mou
 
 
-def test_mou_budget_with_mou_option_selects_an_existing_mou(tmp_path):
+def test_mou_import_with_mou_option_selects_an_existing_mou(tmp_path):
     runner.invoke(app, ["mou", "add", "nlnet-2025"])
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
 
     result = runner.invoke(
-        app, ["mou", "budget", str(budget_file), "--mou", "nlnet-2025"]
+        app, ["mou", "import", str(budget_file), "--mou", "nlnet-2025"]
     )
 
     assert result.exit_code == 0, result.output
@@ -1386,17 +1386,45 @@ def test_mou_budget_with_mou_option_selects_an_existing_mou(tmp_path):
     assert MoU.get_selected().name == "nlnet-2025"
 
 
-def test_mou_budget_from_stdin_notifies_when_parsing_starts():
+def test_mou_import_from_stdin_notifies_when_parsing_starts():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
 
     result = runner.invoke(
-        app, ["mou", "budget"], input="10a. Do the thing\t€ 500\n\n\n\n"
+        app, ["mou", "import"], input="10a. Do the thing\t€ 500\n\n\n\n"
     )
 
     assert result.exit_code == 0, result.output
     assert "stop typing" in result.stderr.lower()
     task = Task.objects.get(name="10a")
     assert task.max_budget == 500.0
+
+
+def test_mou_export_prints_the_raw_imported_text(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    budget_file = tmp_path / "budget.txt"
+    budget_file.write_text("10a. Do the thing\t€ 500\n")
+    runner.invoke(app, ["mou", "import", str(budget_file)])
+
+    result = runner.invoke(app, ["mou", "export"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output == "10a. Do the thing\t€ 500\n"
+
+
+def test_mou_export_fails_without_a_selected_mou():
+    result = runner.invoke(app, ["mou", "export"])
+
+    assert result.exit_code != 0
+    assert "No MoU selected" in result.output
+
+
+def test_mou_export_is_empty_before_anything_was_imported():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["mou", "export"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output == ""
 
 
 def test_start_tags_default_to_implementation():
@@ -1664,7 +1692,8 @@ def test_mou_help_lists_subcommands_alphabetically():
     assert result.exit_code == 0, result.output
     assert _subcommand_names("mou") == [
         "add",
-        "budget",
+        "export",
+        "import",
         "list",
         "remove",
         "select",

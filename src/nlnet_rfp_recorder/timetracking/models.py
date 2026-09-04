@@ -45,7 +45,10 @@ class GitHubToken(models.Model):
 class MoU(models.Model):
     name = models.CharField(max_length=64, unique=True, validators=[mou_name_validator])
     selected = models.BooleanField(default=True)
-    budget = models.CharField(max_length=255, blank=True, default="")
+    # The raw text of the last budget document imported via set_budget() -
+    # a whole milestone table or takentaal document, not a short value, so
+    # this needs to be unbounded rather than a short CharField.
+    budget = models.TextField(blank=True, default="")
 
     @classmethod
     def select(cls, name: str) -> MoU:
@@ -86,7 +89,11 @@ class MoU(models.Model):
             task, _ = Task.objects.update_or_create(
                 mou=self,
                 name=code,
-                defaults={"max_budget": milestone.amount, "used_budget": used},
+                defaults={
+                    "max_budget": milestone.amount,
+                    "used_budget": used,
+                    "description": milestone.description,
+                },
             )
             tasks[code] = task
         return tasks
@@ -121,6 +128,7 @@ class Task(models.Model):
     selected = models.BooleanField(default=True)
     max_budget = models.FloatField(null=True, blank=True)
     used_budget = models.FloatField(default=0.0)
+    description = models.TextField(blank=True, default="")
 
     class Meta:
         constraints = [
@@ -147,7 +155,7 @@ class Task(models.Model):
         if created:
             warnings.warn(
                 f"Task {name} is new for MoU {mou}; it should already be in "
-                "the MoU's budget. Run `rfp mou budget` first if it isn't.",
+                "the MoU's budget. Run `rfp mou import` first if it isn't.",
                 TaskWarning,
                 stacklevel=2,
             )

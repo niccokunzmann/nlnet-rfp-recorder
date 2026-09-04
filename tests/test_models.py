@@ -563,6 +563,37 @@ def test_mou_set_budget_stores_the_raw_text():
     assert mou.budget == text
 
 
+def test_mou_set_budget_stores_text_longer_than_a_short_charfield():
+    # budget used to be a CharField(max_length=255) - too short for a
+    # real milestone document; must not be truncated.
+    mou = MoU.objects.create(name="nlnet-2026")
+    lines = [f"{10 + i}a. Milestone {i}\t€ 100\n" for i in range(20)]
+    text = "".join(lines)
+    assert len(text) > 255
+
+    mou.set_budget(text)
+
+    mou.refresh_from_db()
+    assert mou.budget == text
+
+
+def test_mou_set_budget_saves_each_tasks_description():
+    mou = MoU.objects.create(name="nlnet-2026")
+
+    mou.set_budget("10a. Do the thing - see the details\t€ 500\n")
+
+    assert Task.objects.get(name="10a").description == "Do the thing - see the details"
+
+
+def test_mou_set_budget_saves_descriptions_from_a_takentaal_document():
+    mou = MoU.objects.create(name="nlnet-2026")
+    text = "takentaal v1.0\n\n## 1. A task\n\n* {500} Do the thing\n"
+
+    mou.set_budget(text)
+
+    assert Task.objects.get(name="1a").description == "Do the thing"
+
+
 def test_mou_set_budget_updates_an_existing_tasks_max_budget():
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(name="10a", mou=mou)

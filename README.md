@@ -14,7 +14,7 @@ make install
 
 ```bash
 rfp mou add nlnet-2026
-rfp mou budget path/to/budget.txt          # milestone table from the MoU doc
+rfp mou import path/to/budget.txt          # milestone table or takentaal doc
 rfp task select 10a
 rfp start https://github.com/collective/icalendar/issues/1708
 rfp stop

@@ -351,19 +351,22 @@ def mou_remove(
     typer.echo(f"Removed MoU: {name}")
 
 
-@mou_app.command("budget")
-def mou_budget(
+@mou_app.command("import")
+def mou_import(
     path: Path | None = typer.Argument(
         None,
         exists=True,
         dir_okay=False,
-        help="Path to a budget table. Omit to paste it via stdin.",
+        help=(
+            "Path to a budget document (milestone table or takentaal). "
+            "Omit to paste it via stdin."
+        ),
     ),
     mou: str | None = typer.Option(
         None,
         "--mou",
         autocompletion=_complete_mou_name,
-        help="MoU to create (if needed) and select before setting its budget.",
+        help="MoU to create (if needed) and select before importing its budget.",
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
@@ -390,8 +393,21 @@ def mou_budget(
     tasks = selected.set_budget(text)
     source = str(path) if path is not None else "stdin"
     typer.echo(
-        f"Set budget for MoU {selected.name} from {source} ({len(tasks)} tasks)."
+        f"Imported budget for MoU {selected.name} from {source} ({len(tasks)} tasks)."
     )
+
+
+@mou_app.command("export")
+def mou_export(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Print the raw budget text last imported for the selected MoU."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import MoU
+
+    selected = MoU.get_selected()
+    if selected is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+
+    typer.echo(selected.budget, nl=False)
 
 
 def _show_task_status() -> None:
