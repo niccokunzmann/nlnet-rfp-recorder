@@ -49,3 +49,19 @@ def test_mou_migrates_a_fresh_database_without_an_explicit_migrate_call(tmp_path
 
     assert result.returncode == 0, result.stderr
     assert db_path.is_file()
+
+
+def test_backup_creates_a_timestamped_copy_next_to_the_database(tmp_path):
+    db_path = tmp_path / "custom.sqlite3"
+    run_rfp("--db", str(db_path), "migrate")
+
+    result = run_rfp("--db", str(db_path), "backup")
+
+    assert result.returncode == 0, result.stderr
+    backups = [p for p in tmp_path.iterdir() if p != db_path]
+    assert len(backups) == 1
+    backup_path = backups[0]
+    assert backup_path.name.startswith("custom-")
+    assert backup_path.suffix == ".sqlite3"
+    assert " " not in backup_path.name
+    assert backup_path.read_bytes() == db_path.read_bytes()

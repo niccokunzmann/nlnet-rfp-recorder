@@ -299,6 +299,19 @@ def test_stop_ends_the_running_time_entry():
     assert record.is_running is False
 
 
+def test_stop_with_a_url_replaces_the_running_records_link():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/wrong"])
+
+    result = runner.invoke(app, ["stop", "https://example.com/issues/right"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.link.url == "https://example.com/issues/right"
+    assert "https://example.com/issues/right" in result.output
+
+
 def test_report_fails_without_rfp_euros(settings):
     settings.RFP_EUROS = None
 
@@ -339,7 +352,36 @@ def test_report_prints_budget_issues_and_pull_requests(settings):
     assert "Total: 20€" in result.output
 
 
-def test_report_excludes_running_records_and_warns(settings):
+def test_report_includes_open_issues_but_excludes_open_prs(settings):
+    settings.RFP_EUROS = 20.0
+    task = Task.objects.create(name="10a")
+    now = timezone.now()
+    issue_link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    pr_link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/pull/2"
+    )
+    for link in (issue_link, pr_link):
+        TimeRecord.objects.create(
+            link=link,
+            start_time=now - timedelta(minutes=20),
+            end_time=now,
+        )
+
+    with _mock_github_session("open"):
+        result = runner.invoke(app, ["report"])
+
+    assert result.exit_code == 0, result.output
+    assert "Issues:" in result.output
+    assert "- https://github.com/nlnet/rfp-recorder/issues/1" in result.output
+    assert "Pull Requests:" not in result.output
+    assert "- https://github.com/nlnet/rfp-recorder/pull/2" not in result.output
+    # only the issue's 20 minutes count, not the open PR's
+    assert "10a: 10€" in result.output
+
+
+def test_report_fails_while_something_is_running(settings):
     settings.RFP_EUROS = 20.0
     task = Task.objects.create(name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -347,9 +389,9 @@ def test_report_excludes_running_records_and_warns(settings):
 
     result = runner.invoke(app, ["report"])
 
-    assert result.exit_code == 0, result.output
-    assert "10a: 0€" in result.output
-    assert "not included" in result.stderr.lower()
+    assert result.exit_code != 0
+    assert "https://example.com/issues/1" in result.output
+    assert "still running" in result.output.lower()
 
 
 def test_report_shows_review_tag_suffix(settings):
@@ -675,3 +717,41 @@ def test_complete_link_url_matches_by_prefix():
     }
     assert _complete_link_url("https://other") == ["https://other.example/pull/1"]
     assert _complete_link_url("https://nope") == []
+
+
+def test_help_lists_commands_alphabetically():
+    result = runner.invoke(app, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    names = [
+        "migrate",
+        "mou",
+        "report",
+        "review",
+        "start",
+        "status",
+        "stop",
+        "task",
+        "token",
+        "version",
+    ]
+    positions = [result.output.index(f"│ {name} ") for name in names]
+    assert positions == sorted(positions)
+
+
+def test_mou_help_lists_subcommands_alphabetically():
+    result = runner.invoke(app, ["mou", "--help"])
+
+    assert result.exit_code == 0, result.output
+    names = ["add", "budget", "list", "remove", "select", "status"]
+    positions = [result.output.index(f"│ {name} ") for name in names]
+    assert positions == sorted(positions)
+
+
+def test_task_help_lists_subcommands_alphabetically():
+    result = runner.invoke(app, ["task", "--help"])
+
+    assert result.exit_code == 0, result.output
+    names = ["list", "remove", "select", "set", "status"]
+    positions = [result.output.index(f"│ {name} ") for name in names]
+    assert positions == sorted(positions)

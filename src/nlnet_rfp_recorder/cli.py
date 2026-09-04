@@ -1,8 +1,9 @@
 import os
+import shutil
 import sys
 import tempfile
 import warnings
-from datetime import timedelta
+from datetime import datetime, timedelta
 from importlib.metadata import version as get_version
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
@@ -10,6 +11,8 @@ from typing import TYPE_CHECKING, NoReturn
 import django
 import typer
 from typer.core import TyperGroup
+
+from nlnet_rfp_recorder.budget import format_duration_hours
 
 if TYPE_CHECKING:
     from nlnet_rfp_recorder.timetracking.models import Link, MoU, Task, TimeRecord
@@ -67,8 +70,7 @@ def _fail(message: str) -> NoReturn:
 
 
 def _format_duration(duration: timedelta) -> str:
-    hours, minutes = divmod(int(duration.total_seconds() // 60), 60)
-    return f"{hours}:{minutes:02d}"
+    return format_duration_hours(duration.total_seconds() / 3600)
 
 
 def _task_name(record: TimeRecord) -> str:
@@ -558,12 +560,16 @@ def review(
 
 
 @app.command()
-def stop(db: Path | None = DbOption, test: bool = TestOption) -> None:
-    """Stop the currently running time entry, if any."""
+def stop(
+    link: str | None = typer.Argument(None, autocompletion=_complete_link_url),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Stop the currently running time entry, optionally replacing its link."""
     _setup(db, test)
     from nlnet_rfp_recorder.timetracking.models import TimeRecord
 
-    record = TimeRecord.stop()
+    record = TimeRecord.stop(link)
     if record is None:
         typer.echo("No time entry is running.")
         return
@@ -581,6 +587,14 @@ def report(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
     if settings.RFP_EUROS is None:
         _fail("RFP_EUROS is not set.")
+
+    running = TimeRecord.get_running()
+    if running is not None:
+        url = running.link.url if running.link else ""
+        _fail(
+            f"{_task_name(running)}: {url} is still running. "
+            "Stop it first (`rfp stop`) to get an accurate report."
+        )
 
     total = 0.0
     for task in Task.objects.all():
@@ -610,13 +624,6 @@ def report(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
     typer.echo(f"Total: {_round10(total)}€")
 
-    running = TimeRecord.objects.running()
-    if running.exists():
-        typer.echo("Not included in the report (still running):", err=True)
-        for record in running:
-            url = record.link.url if record.link else ""
-            typer.echo(f"  - {_task_name(record)}: {url}", err=True)
-
 
 @app.command()
 def migrate(db: Path | None = DbOption, test: bool = TestOption) -> None:
@@ -625,6 +632,21 @@ def migrate(db: Path | None = DbOption, test: bool = TestOption) -> None:
     from django.conf import settings
 
     typer.echo(f"Migrated {settings.DATABASES['default']['NAME']}")
+
+
+@app.command()
+def backup(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Copy the database file, timestamped, next to itself."""
+    _setup(db, test)
+    from django.conf import settings
+
+    database_file = Path(settings.DATABASES["default"]["NAME"])
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    backup_file = database_file.with_name(
+        f"{database_file.stem}-{timestamp}{database_file.suffix}"
+    )
+    shutil.copy2(database_file, backup_file)
+    typer.echo(f"Backed up {database_file} to {backup_file}")
 
 
 def main() -> None:

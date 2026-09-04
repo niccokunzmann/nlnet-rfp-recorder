@@ -150,40 +150,38 @@ class Task(models.Model):
         return cls.objects.filter(selected=True).first()
 
     @property
-    def links_with_finished_work(self) -> models.QuerySet[Link]:
-        return self.links.filter(time_records__end_time__isnull=False).distinct()
+    def links_with_tracked_time(self) -> models.QuerySet[Link]:
+        return self.links.filter(time_records__isnull=False).distinct()
 
     @cached_property
     def billable_links(self) -> list[Link]:
-        # Issues/PRs only count once GitHub shows them as closed; anything
-        # that isn't an issue or PR (docs, discussions, ...) has no such
-        # status, so it's always billable once finished. Statuses for all
-        # issue/PR links are fetched concurrently in one batch.
-        links = list(self.links_with_finished_work)
-        reference_links = [link for link in links if link.is_issue or link.is_pr]
-        references = [link.issue or link.pr for link in reference_links]
+        # Issues count once tracked regardless of GitHub status - opening
+        # an issue is real work either way. PRs only count once merged or
+        # closed, since work on an open PR isn't done yet. Anything that
+        # isn't an issue or PR is always billable. A record still running
+        # counts too (see TimeRecord.duration) - its live elapsed time is
+        # part of "how much has been used" until it's stopped.
+        links = list(self.links_with_tracked_time)
+        pr_links = [link for link in links if link.is_pr]
+        references = [link.pr for link in pr_links]
         token = GitHubToken.get()
         statuses = fetch_statuses(references, token=token) if references else []
-        closed_link_ids = {
+        closed_pr_ids = {
             link.id
-            for link, status in zip(reference_links, statuses, strict=True)
+            for link, status in zip(pr_links, statuses, strict=True)
             if status == Status.CLOSED
         }
-        return [
-            link
-            for link in links
-            if (not link.is_issue and not link.is_pr) or link.id in closed_link_ids
-        ]
+        return [link for link in links if not link.is_pr or link.id in closed_pr_ids]
 
     @property
-    def finished_time_records(self) -> models.QuerySet[TimeRecord]:
+    def tracked_time_records(self) -> models.QuerySet[TimeRecord]:
         link_ids = [link.id for link in self.billable_links]
-        return TimeRecord.objects.filter(link_id__in=link_ids, end_time__isnull=False)
+        return TimeRecord.objects.filter(link_id__in=link_ids)
 
     @property
     def duration(self) -> timedelta:
         return sum(
-            (record.duration for record in self.finished_time_records), timedelta()
+            (record.duration for record in self.tracked_time_records), timedelta()
         )
 
     @property
@@ -316,10 +314,12 @@ class TimeRecord(models.Model):
         return cls.objects.running().order_by("-start_time").first()
 
     @classmethod
-    def stop(cls) -> TimeRecord | None:
+    def stop(cls, url: str | None = None) -> TimeRecord | None:
         record = cls.get_running()
         if record is None:
             return None
+        if url is not None and record.link is not None and record.link.task is not None:
+            record.link = Link.get_or_create_for_task(url, record.link.task)
         record.end_time = timezone.now()
         record.save()
         return record

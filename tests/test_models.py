@@ -218,6 +218,16 @@ def test_task_duration_is_zero_without_time_records():
     assert task.duration == timedelta()
 
 
+def test_task_duration_counts_a_running_record_live():
+    task = Task.objects.create(name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link, start_time=timezone.now() - timedelta(minutes=5)
+    )
+
+    assert task.duration >= timedelta(minutes=5)
+
+
 def test_task_budget_is_none_without_rfp_euros(settings):
     settings.RFP_EUROS = None
     task = Task.objects.create(name="10a")
@@ -261,11 +271,14 @@ def test_task_other_lists_links_that_are_not_issues_or_pull_requests():
         end_time=datetime(2026, 9, 4, 10, 0),
     )
 
-    with _mock_github_session("open"):
-        assert task.other == ["https://example.com/docs/design"]
+    # No mocking needed: issues never trigger a GitHub call now.
+    assert task.other == ["https://example.com/docs/design"]
 
 
-def test_task_other_ignores_links_with_no_finished_work():
+def test_task_other_includes_links_with_a_running_record():
+    # A running record's elapsed time counts live (see TimeRecord.duration),
+    # so its link is included too - unlike a link with no tracked time at
+    # all, which never shows up.
     task = Task.objects.create(name="10a")
     finished_link = Link.objects.create(
         task=task, url="https://example.com/docs/design"
@@ -277,8 +290,12 @@ def test_task_other_ignores_links_with_no_finished_work():
     )
     running_link = Link.objects.create(task=task, url="https://example.com/docs/other")
     TimeRecord.objects.create(link=running_link, start_time=datetime(2026, 9, 4, 11, 0))
+    Link.objects.create(task=task, url="https://example.com/docs/untouched")
 
-    assert task.other == ["https://example.com/docs/design"]
+    assert set(task.other) == {
+        "https://example.com/docs/design",
+        "https://example.com/docs/other",
+    }
 
 
 def test_link_get_or_create_for_task_creates_a_new_link():
@@ -405,6 +422,17 @@ def test_stop_ends_the_running_record():
     assert stopped.pk == started.pk
     assert stopped.is_running is False
     assert stopped.end_time is not None
+
+
+def test_stop_with_a_url_replaces_the_running_records_link():
+    task = Task.objects.create(name="10a")
+    started = TimeRecord.start("https://example.com/issues/wrong")
+
+    stopped = TimeRecord.stop("https://example.com/issues/right")
+
+    assert stopped.pk == started.pk
+    assert stopped.link.url == "https://example.com/issues/right"
+    assert stopped.link.task == task
 
 
 def test_stop_twice_is_a_no_op_the_second_time():
@@ -671,10 +699,12 @@ def test_github_token_set_replaces_the_previous_token():
 
 
 def test_billable_links_sends_the_saved_token():
+    # Only PRs trigger a GitHub status check (issues are always billable
+    # once finished), so use a PR link here to exercise the token header.
     GitHubToken.set("secret")
     task = Task.objects.create(name="10a")
     link = Link.objects.create(
-        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+        task=task, url="https://github.com/nlnet/rfp-recorder/pull/1"
     )
     TimeRecord.objects.create(
         link=link,
@@ -688,6 +718,6 @@ def test_billable_links_sends_the_saved_token():
     assert billable == [link]
     session = mock_session_cls.return_value
     session.get.assert_called_once_with(
-        "https://api.github.com/repos/nlnet/rfp-recorder/issues/1",
+        "https://api.github.com/repos/nlnet/rfp-recorder/pulls/1",
         headers={"Authorization": "Bearer secret"},
     )
