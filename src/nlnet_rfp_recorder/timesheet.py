@@ -1,0 +1,65 @@
+import csv
+import io
+from dataclasses import asdict, dataclass
+from datetime import timedelta
+
+FIELDNAMES = ["pk", "mou", "task", "start", "duration", "link", "tags"]
+
+
+@dataclass
+class TimesheetRow:
+    pk: int | None
+    mou: str
+    task: str
+    start: str
+    duration: str
+    link: str
+    tags: str = ""
+
+
+def format_hhmmss(duration: timedelta) -> str:
+    """Format a duration as 'HH:MM:SS', to second precision."""
+    total_seconds = int(duration.total_seconds())
+    hh, remainder = divmod(total_seconds, 3600)
+    mm, ss = divmod(remainder, 60)
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
+def parse_hhmmss(text: str) -> timedelta:
+    """Parse a 'HH:MM:SS' duration, as produced by format_hhmmss."""
+    parts = text.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid duration {text!r}; expected HH:MM:SS.")
+    try:
+        hh, mm, ss = (int(part) for part in parts)
+    except ValueError:
+        raise ValueError(f"Invalid duration {text!r}; expected HH:MM:SS.") from None
+    return timedelta(hours=hh, minutes=mm, seconds=ss)
+
+
+def write_csv(rows: list[TimesheetRow]) -> str:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=FIELDNAMES)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(asdict(row))
+    return buffer.getvalue()
+
+
+def read_csv(text: str) -> list[TimesheetRow]:
+    reader = csv.DictReader(io.StringIO(text))
+    rows = []
+    for line in reader:
+        pk = line["pk"].strip() if line.get("pk") else ""
+        rows.append(
+            TimesheetRow(
+                pk=int(pk) if pk else None,
+                mou=line["mou"],
+                task=line["task"],
+                start=line["start"],
+                duration=line["duration"],
+                link=line["link"],
+                tags=line.get("tags") or "",
+            )
+        )
+    return rows

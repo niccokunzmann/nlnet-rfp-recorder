@@ -1,6 +1,6 @@
 import warnings
 from collections.abc import Iterable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import cached_property
 
 from django.conf import settings
@@ -11,11 +11,17 @@ from django.utils import timezone
 from nlnet_rfp_recorder.budget import BudgetLine
 from nlnet_rfp_recorder.github import Issue, PullRequest, Status, fetch_statuses
 from nlnet_rfp_recorder.mou_budget import parse_milestone_budgets
+from nlnet_rfp_recorder.timesheet import TimesheetRow, format_hhmmss, parse_hhmmss
 from nlnet_rfp_recorder.warnings import TaskWarning
 
 task_name_validator = RegexValidator(
     regex=r"^\d+[a-z]+$",
     message="Task name must look like '10a': a number followed by letters.",
+)
+
+mou_name_validator = RegexValidator(
+    regex=r"^\S+$",
+    message="MoU name must not contain spaces.",
 )
 
 TAG_NAMES = ("implementation", "review")
@@ -36,12 +42,17 @@ class GitHubToken(models.Model):
 
 
 class MoU(models.Model):
-    name = models.CharField(max_length=64, unique=True)
+    name = models.CharField(max_length=64, unique=True, validators=[mou_name_validator])
     selected = models.BooleanField(default=True)
     budget = models.CharField(max_length=255, blank=True, default="")
 
     @classmethod
     def select(cls, name: str) -> MoU:
+        cls(name=name).full_clean(
+            exclude=["selected", "budget"],
+            validate_unique=False,
+            validate_constraints=False,
+        )
         cls.objects.exclude(name=name).update(selected=False)
         mou, _ = cls.objects.update_or_create(name=name, defaults={"selected": True})
         return mou
@@ -314,6 +325,10 @@ class TimeRecord(models.Model):
         return cls.objects.running().order_by("-start_time").first()
 
     @classmethod
+    def get_last(cls) -> TimeRecord | None:
+        return cls.objects.order_by("-start_time").first()
+
+    @classmethod
     def stop(cls, url: str | None = None) -> TimeRecord | None:
         record = cls.get_running()
         if record is None:
@@ -337,6 +352,70 @@ class TimeRecord(models.Model):
         if settings.RFP_EUROS is None:
             return None
         return self.duration.total_seconds() / 3600 * settings.RFP_EUROS
+
+    @property
+    def row(self) -> TimesheetRow:
+        task = self.link.task if self.link else None
+        mou = task.mou if task else None
+        tags = (
+            ",".join(sorted(tag.name for tag in self.link.tags.all()))
+            if self.link
+            else ""
+        )
+        return TimesheetRow(
+            pk=self.pk,
+            mou=mou.name if mou else "",
+            task=task.name if task else "",
+            start=self.start_time.isoformat(),
+            duration=format_hhmmss(self.duration),
+            link=self.link.url if self.link else "",
+            tags=tags,
+        )
+
+    @classmethod
+    def apply_row(cls, row: TimesheetRow) -> TimeRecord:
+        try:
+            mou = MoU.objects.get(name=row.mou)
+        except MoU.DoesNotExist:
+            raise ValueError(
+                f"No such MoU: {row.mou}. Run `rfp mou add {row.mou}` first."
+            ) from None
+        try:
+            task = Task.objects.get(mou=mou, name=row.task)
+        except Task.DoesNotExist:
+            raise ValueError(
+                f"No such task: {row.task} for MoU {row.mou}. "
+                f"Run `rfp task select {row.task}` first."
+            ) from None
+
+        link = Link.get_or_create_for_task(row.link, task) if row.link else None
+        if link is not None:
+            for tag in filter(None, (t.strip() for t in row.tags.split(","))):
+                link.add_tag(tag)
+
+        try:
+            start_time = datetime.fromisoformat(row.start)
+        except ValueError:
+            raise ValueError(
+                f"Invalid start time: {row.start!r}; expected ISO format."
+            ) from None
+        duration = parse_hhmmss(row.duration)
+        end_time = start_time + duration
+
+        if row.pk is None:
+            return cls.objects.create(
+                link=link, start_time=start_time, end_time=end_time
+            )
+
+        try:
+            record = cls.objects.get(pk=row.pk)
+        except cls.DoesNotExist:
+            raise ValueError(f"No such time record: {row.pk}.") from None
+        record.link = link
+        record.start_time = start_time
+        record.end_time = end_time
+        record.save()
+        return record
 
     def __str__(self) -> str:
         return f"TimeRecord({self.start_time} - {self.end_time or 'running'})"

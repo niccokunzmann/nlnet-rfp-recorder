@@ -7,6 +7,7 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 from nlnet_rfp_recorder.github import Issue, PullRequest
+from nlnet_rfp_recorder.timesheet import TimesheetRow
 from nlnet_rfp_recorder.timetracking.models import (
     GitHubToken,
     Link,
@@ -409,6 +410,19 @@ def test_get_running_returns_the_most_recently_started_record():
     assert TimeRecord.get_running() == later
 
 
+def test_get_last_returns_none_when_no_records_exist():
+    assert TimeRecord.get_last() is None
+
+
+def test_get_last_returns_the_most_recently_started_record_even_if_stopped():
+    TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 4, 8, 0), end_time=datetime(2026, 9, 4, 9, 0)
+    )
+    later = TimeRecord.objects.create(start_time=datetime(2026, 9, 4, 10, 0))
+
+    assert TimeRecord.get_last() == later
+
+
 def test_stop_without_a_running_record_returns_none():
     assert TimeRecord.stop() is None
 
@@ -461,6 +475,11 @@ def test_mou_select_creates_and_selects():
     assert mou.selected is True
 
 
+def test_mou_select_rejects_a_name_with_spaces():
+    with pytest.raises(ValidationError):
+        MoU.select("nlnet 2026")
+
+
 def test_mou_select_leaves_only_one_mou_selected():
     MoU.objects.create(name="nlnet-2025", selected=True)
 
@@ -468,6 +487,15 @@ def test_mou_select_leaves_only_one_mou_selected():
 
     selected = MoU.objects.filter(selected=True)
     assert [mou.name for mou in selected] == ["nlnet-2026"]
+
+
+def test_mou_select_reselecting_an_existing_mou_does_not_raise():
+    MoU.select("nlnet-2026")
+
+    mou = MoU.select("nlnet-2026")
+
+    assert mou.name == "nlnet-2026"
+    assert MoU.objects.count() == 1
 
 
 def test_mou_get_selected_returns_none_when_nothing_is_selected():
@@ -721,3 +749,173 @@ def test_billable_links_sends_the_saved_token():
         "https://api.github.com/repos/nlnet/rfp-recorder/pulls/1",
         headers={"Authorization": "Bearer secret"},
     )
+
+
+def test_row_reflects_a_finished_record():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    link.add_tag("review")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 30),
+    )
+
+    row = record.row
+
+    assert row == TimesheetRow(
+        pk=record.pk,
+        mou="nlnet-2026",
+        task="10a",
+        start=datetime(2026, 9, 4, 9, 0).isoformat(),
+        duration="01:30:00",
+        link="https://example.com/issues/1",
+        tags="review",
+    )
+
+
+def test_row_without_a_link_leaves_fields_blank():
+    record = TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 4, 9, 0), end_time=datetime(2026, 9, 4, 10, 0)
+    )
+
+    row = record.row
+
+    assert row.mou == ""
+    assert row.task == ""
+    assert row.link == ""
+    assert row.tags == ""
+
+
+def test_apply_row_creates_a_new_record_without_a_pk():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="10a")
+    row = TimesheetRow(
+        pk=None,
+        mou="nlnet-2026",
+        task="10a",
+        start=datetime(2026, 9, 4, 9, 0).isoformat(),
+        duration="01:00:00",
+        link="https://example.com/issues/1",
+        tags="implementation",
+    )
+
+    record = TimeRecord.apply_row(row)
+
+    assert record.pk is not None
+    assert record.start_time == datetime(2026, 9, 4, 9, 0)
+    assert record.end_time == datetime(2026, 9, 4, 10, 0)
+    assert record.link.url == "https://example.com/issues/1"
+    assert [tag.name for tag in record.link.tags.all()] == ["implementation"]
+
+
+def test_apply_row_updates_an_existing_record_by_pk():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    row = TimesheetRow(
+        pk=record.pk,
+        mou="nlnet-2026",
+        task="10a",
+        start=datetime(2026, 9, 4, 9, 0).isoformat(),
+        duration="02:00:00",
+        link="https://example.com/issues/2",
+        tags="",
+    )
+
+    updated = TimeRecord.apply_row(row)
+
+    assert updated.pk == record.pk
+    assert updated.end_time == datetime(2026, 9, 4, 11, 0)
+    assert updated.link.url == "https://example.com/issues/2"
+
+
+def test_apply_row_raises_for_an_unknown_pk():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="10a")
+    row = TimesheetRow(
+        pk=999,
+        mou="nlnet-2026",
+        task="10a",
+        start=datetime(2026, 9, 4, 9, 0).isoformat(),
+        duration="01:00:00",
+        link="https://example.com/issues/1",
+        tags="",
+    )
+
+    with pytest.raises(ValueError, match="No such time record"):
+        TimeRecord.apply_row(row)
+
+
+def test_apply_row_raises_for_an_unknown_mou():
+    row = TimesheetRow(
+        pk=None,
+        mou="does-not-exist",
+        task="10a",
+        start=datetime(2026, 9, 4, 9, 0).isoformat(),
+        duration="01:00:00",
+        link="https://example.com/issues/1",
+        tags="",
+    )
+
+    with pytest.raises(ValueError, match="No such MoU"):
+        TimeRecord.apply_row(row)
+
+
+def test_apply_row_changing_mou_looks_up_that_mous_task_without_mutating_tasks():
+    # Changing `row.mou` on an existing record must not repoint either
+    # task's own `mou` FK - it must look up the (new-mou, same-name-task)
+    # pair and move the record's link there, leaving both tasks untouched.
+    mou_a = MoU.objects.create(name="mou-a")
+    mou_b = MoU.objects.create(name="mou-b")
+    task_a = Task.objects.create(mou=mou_a, name="10a")
+    task_b = Task.objects.create(mou=mou_b, name="10a")
+    link = Link.objects.create(task=task_a, url="https://example.com/issues/1")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    row = TimesheetRow(
+        pk=record.pk,
+        mou="mou-b",
+        task="10a",
+        start=datetime(2026, 9, 4, 9, 0).isoformat(),
+        duration="01:00:00",
+        link="https://example.com/issues/2",
+        tags="",
+    )
+
+    updated = TimeRecord.apply_row(row)
+
+    assert updated.link.task == task_b
+    assert updated.link.url == "https://example.com/issues/2"
+    task_a.refresh_from_db()
+    task_b.refresh_from_db()
+    assert task_a.mou == mou_a
+    assert task_b.mou == mou_b
+    # The original link (and task_a's association) is untouched.
+    link.refresh_from_db()
+    assert link.task == task_a
+
+
+def test_apply_row_raises_for_an_unknown_task():
+    MoU.objects.create(name="nlnet-2026")
+    row = TimesheetRow(
+        pk=None,
+        mou="nlnet-2026",
+        task="10a",
+        start=datetime(2026, 9, 4, 9, 0).isoformat(),
+        duration="01:00:00",
+        link="https://example.com/issues/1",
+        tags="",
+    )
+
+    with pytest.raises(ValueError, match="No such task"):
+        TimeRecord.apply_row(row)

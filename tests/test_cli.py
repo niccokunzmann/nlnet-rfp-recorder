@@ -33,6 +33,14 @@ pytestmark = pytest.mark.django_db
 runner = CliRunner()
 
 
+def _invoke_timesheet_import(*args: str, input: str | None = None):
+    # The pytest-django test database is ":memory:", which shutil.copy2
+    # can't back up - that path is covered for real in
+    # test_cli_db_option.py via a real subprocess against a file-backed db.
+    with patch("nlnet_rfp_recorder.cli.shutil.copy2"):
+        return runner.invoke(app, ["timesheet", "import", *args], input=input)
+
+
 def test_no_args_shows_help():
     result = runner.invoke(app, [])
     assert "Usage" in result.output
@@ -312,6 +320,311 @@ def test_stop_with_a_url_replaces_the_running_records_link():
     assert "https://example.com/issues/right" in result.output
 
 
+def test_edit_without_any_time_entries_fails():
+    result = runner.invoke(app, ["edit", "https://example.com/issues/1"])
+
+    assert result.exit_code != 0
+
+
+def test_edit_replaces_the_last_entrys_link():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/wrong"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(app, ["edit", "https://example.com/issues/right"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.link.url == "https://example.com/issues/right"
+
+
+def test_edit_adds_tags_without_changing_the_link():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    result = runner.invoke(app, ["edit", "--tags", "review"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.link.url == "https://example.com/issues/1"
+    assert {tag.name for tag in record.link.tags.all()} == {"implementation", "review"}
+
+
+def test_edit_edits_the_most_recent_entry_even_if_stopped():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(app, ["edit", "https://example.com/issues/2"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.link.url == "https://example.com/issues/2"
+    assert record.is_running is False
+
+
+def _time_record_pk() -> int:
+    return TimeRecord.objects.get().pk
+
+
+def test_timesheet_show_reports_when_there_are_none():
+    result = runner.invoke(app, ["timesheet", "show"])
+
+    assert result.exit_code == 0, result.output
+    assert "No time entries" in result.output
+
+
+def test_timesheet_show_prints_one_line_per_entry():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    pk = _time_record_pk()
+
+    result = runner.invoke(app, ["timesheet", "show"])
+
+    assert result.exit_code == 0, result.output
+    line = result.output.strip()
+    assert line.startswith(f"{pk} nlnet-2026 10a ")
+    assert "https://example.com/issues/1" in line
+    assert "implementation" in line
+    start_field = line.split()[3]
+    assert "." not in start_field  # no seconds/microseconds in the start timestamp
+    assert start_field.count(":") == 1  # HH:MM only, no seconds
+
+
+def test_timesheet_show_uses_a_dash_for_an_entry_without_a_link():
+    TimeRecord.objects.create(start_time=timezone.now(), end_time=timezone.now())
+
+    result = runner.invoke(app, ["timesheet", "show"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().endswith(" -")
+
+
+def test_timesheet_export_to_stdout_is_valid_csv():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(app, ["timesheet", "export"])
+
+    assert result.exit_code == 0, result.output
+    assert "pk,mou,task,start,duration,link,tags" in result.output
+    assert "https://example.com/issues/1" in result.output
+
+
+def test_timesheet_export_to_a_file(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    path = tmp_path / "timesheet.csv"
+
+    result = runner.invoke(app, ["timesheet", "export", str(path)])
+
+    assert result.exit_code == 0, result.output
+    assert "https://example.com/issues/1" in path.read_text()
+
+
+def test_timesheet_import_creates_entries_from_csv(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    path = tmp_path / "timesheet.csv"
+    path.write_text(
+        "pk,mou,task,start,duration,link,tags\n"
+        ",nlnet-2026,10a,2026-09-04T09:00:00,01:00:00,"
+        "https://example.com/issues/1,implementation\n"
+    )
+
+    result = _invoke_timesheet_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.link.url == "https://example.com/issues/1"
+
+
+def test_timesheet_import_prompts_to_delete_missing_entries_and_deletes_on_yes(
+    tmp_path,
+):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    path = tmp_path / "timesheet.csv"
+    path.write_text("pk,mou,task,start,duration,link,tags\n")
+
+    result = _invoke_timesheet_import(str(path), input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Delete them?" in result.output
+    assert TimeRecord.objects.count() == 0
+
+
+def test_timesheet_import_prompts_to_delete_missing_entries_and_keeps_on_no(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    path = tmp_path / "timesheet.csv"
+    path.write_text("pk,mou,task,start,duration,link,tags\n")
+
+    result = _invoke_timesheet_import(str(path), input="n\n")
+
+    assert result.exit_code == 0, result.output
+    assert TimeRecord.objects.count() == 1
+
+
+def test_timesheet_import_does_not_prompt_when_nothing_is_missing(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    pk = _time_record_pk()
+    path = tmp_path / "timesheet.csv"
+    path.write_text(
+        "pk,mou,task,start,duration,link,tags\n"
+        f"{pk},nlnet-2026,10a,2026-09-04T09:00:00,01:00:00,"
+        "https://example.com/issues/1,implementation\n"
+    )
+
+    result = _invoke_timesheet_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    assert "Delete them?" not in result.output
+    assert TimeRecord.objects.count() == 1
+
+
+def test_import_edit_import_then_export_round_trips_all_fields(tmp_path):
+    mou_a = MoU.objects.create(name="mou-a")
+    Task.objects.create(mou=mou_a, name="10a")
+    mou_b = MoU.objects.create(name="mou-b")
+    Task.objects.create(mou=mou_b, name="20b")
+
+    initial_csv = (
+        "pk,mou,task,start,duration,link,tags\n"
+        ",mou-a,10a,2026-01-01T09:00:00,01:00:00,https://example.com/1,implementation\n"
+    )
+    initial_path = tmp_path / "initial.csv"
+    initial_path.write_text(initial_csv)
+    result = _invoke_timesheet_import(str(initial_path))
+    assert result.exit_code == 0, result.output
+
+    pk = TimeRecord.objects.get().pk
+    # Change every field: mou, task, start, duration, link, and tags.
+    edited_csv = (
+        "pk,mou,task,start,duration,link,tags\n"
+        f"{pk},mou-b,20b,2026-02-02T10:30:00,02:15:00,https://example.com/2,review\n"
+    )
+    edited_path = tmp_path / "edited.csv"
+    edited_path.write_text(edited_csv)
+    result = _invoke_timesheet_import(str(edited_path))
+    assert result.exit_code == 0, result.output
+
+    from nlnet_rfp_recorder.timesheet import read_csv
+
+    export_result = runner.invoke(app, ["timesheet", "export"])
+
+    assert export_result.exit_code == 0, export_result.output
+    assert read_csv(export_result.output) == read_csv(edited_csv)
+
+
+def test_timesheet_import_fails_for_an_unknown_mou(tmp_path):
+    path = tmp_path / "timesheet.csv"
+    path.write_text(
+        "pk,mou,task,start,duration,link,tags\n"
+        ",does-not-exist,10a,2026-09-04T09:00:00,01:00:00,https://example.com/1,\n"
+    )
+
+    result = _invoke_timesheet_import(str(path))
+
+    assert result.exit_code != 0
+    assert "No such MoU" in result.output
+
+
+def test_timesheet_remove_deletes_it():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    pk = _time_record_pk()
+
+    result = runner.invoke(app, ["timesheet", "remove", str(pk)])
+
+    assert result.exit_code == 0, result.output
+    assert TimeRecord.objects.count() == 0
+
+
+def test_timesheet_remove_fails_for_an_unknown_pk():
+    result = runner.invoke(app, ["timesheet", "remove", "999"])
+
+    assert result.exit_code != 0
+
+
+def test_timesheet_edit_replaces_all_fields():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    pk = _time_record_pk()
+
+    result = runner.invoke(
+        app,
+        [
+            "timesheet",
+            "edit",
+            str(pk),
+            "nlnet-2026",
+            "10a",
+            "2026-09-04T09:00:00",
+            "02:00:00",
+            "https://example.com/issues/2",
+            "review",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get(pk=pk)
+    assert record.link.url == "https://example.com/issues/2"
+    assert record.duration == timedelta(hours=2)
+    # A new link was created for the new URL, so it only carries the tag
+    # given in this edit - the old link's "implementation" tag stays there.
+    assert {tag.name for tag in record.link.tags.all()} == {"review"}
+
+
+def test_timesheet_edit_fails_for_an_unknown_pk():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(
+        app,
+        [
+            "timesheet",
+            "edit",
+            "999",
+            "nlnet-2026",
+            "10a",
+            "2026-09-04T09:00:00",
+            "01:00:00",
+            "https://example.com/issues/1",
+        ],
+    )
+
+    assert result.exit_code != 0
+
+
+def test_mou_add_rejects_a_name_with_spaces():
+    result = runner.invoke(app, ["mou", "add", "nlnet 2026"])
+
+    assert result.exit_code != 0
+    assert "must not contain spaces" in result.output
+    assert MoU.objects.count() == 0
+
+
 def test_report_fails_without_rfp_euros(settings):
     settings.RFP_EUROS = None
 
@@ -320,9 +633,48 @@ def test_report_fails_without_rfp_euros(settings):
     assert result.exit_code != 0
 
 
+def test_report_fails_without_a_selected_mou(settings):
+    settings.RFP_EUROS = 20.0
+
+    result = runner.invoke(app, ["report"])
+
+    assert result.exit_code != 0
+    assert "No MoU selected" in result.output
+
+
+def test_report_only_includes_tasks_from_the_selected_mou(settings):
+    settings.RFP_EUROS = 20.0
+    other_mou = MoU.objects.create(name="other-mou", selected=False)
+    other_task = Task.objects.create(mou=other_mou, name="99z")
+    other_link = Link.objects.create(task=other_task, url="https://example.com/other")
+    TimeRecord.objects.create(
+        link=other_link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/mine")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+
+    result = runner.invoke(app, ["report"])
+
+    assert result.exit_code == 0, result.output
+    assert "MoU: nlnet-2026" in result.output
+    assert "10a" in result.output
+    assert "99z" not in result.output
+    assert "https://example.com/other" not in result.output
+    assert "Total: 10€" in result.output
+
+
 def test_report_prints_budget_issues_and_pull_requests(settings):
     settings.RFP_EUROS = 20.0
-    task = Task.objects.create(name="10a")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
     now = timezone.now()
     issue_link = Link.objects.create(
         task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
@@ -354,7 +706,8 @@ def test_report_prints_budget_issues_and_pull_requests(settings):
 
 def test_report_includes_open_issues_but_excludes_open_prs(settings):
     settings.RFP_EUROS = 20.0
-    task = Task.objects.create(name="10a")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
     now = timezone.now()
     issue_link = Link.objects.create(
         task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
@@ -383,7 +736,8 @@ def test_report_includes_open_issues_but_excludes_open_prs(settings):
 
 def test_report_fails_while_something_is_running(settings):
     settings.RFP_EUROS = 20.0
-    task = Task.objects.create(name="10a")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     TimeRecord.objects.create(link=link, start_time=timezone.now())
 
@@ -396,7 +750,8 @@ def test_report_fails_while_something_is_running(settings):
 
 def test_report_shows_review_tag_suffix(settings):
     settings.RFP_EUROS = 20.0
-    task = Task.objects.create(name="10a")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/docs/design")
     link.add_tag("review")
     TimeRecord.objects.create(
@@ -476,6 +831,18 @@ def test_mou_remove_deletes_it():
 
     assert result.exit_code == 0, result.output
     assert MoU.objects.count() == 0
+
+
+def test_task_status_survives_its_mou_being_removed():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    runner.invoke(app, ["mou", "remove", "nlnet-2026"])
+    result = runner.invoke(app, ["task"])
+
+    assert result.exit_code == 0, result.output
+    assert "MoU: none" in result.output
+    assert "Selected task: 10a" in result.output
 
 
 def test_mou_remove_fails_for_an_unknown_mou():
@@ -719,22 +1086,58 @@ def test_complete_link_url_matches_by_prefix():
     assert _complete_link_url("https://nope") == []
 
 
+def test_complete_backup_name_matches_by_prefix(tmp_path, settings):
+    db_path = tmp_path / "custom.sqlite3"
+    db_path.write_bytes(b"")
+    settings.DATABASES["default"]["NAME"] = str(db_path)
+    (tmp_path / "custom-20260101T090000.sqlite3").write_bytes(b"")
+    (tmp_path / "custom-20260102T090000.sqlite3").write_bytes(b"")
+    (tmp_path / "other-20260101T090000.sqlite3").write_bytes(b"")
+
+    from nlnet_rfp_recorder.cli import _complete_backup_name
+
+    assert set(_complete_backup_name("custom-2026010")) == {
+        "custom-20260101T090000",
+        "custom-20260102T090000",
+    }
+    assert _complete_backup_name("nope") == []
+
+
+def test_restore_fails_for_an_unknown_backup_name():
+    result = runner.invoke(app, ["restore", "does-not-exist"])
+
+    assert result.exit_code != 0
+    assert "No such backup" in result.output
+
+
 def test_help_lists_commands_alphabetically():
     result = runner.invoke(app, ["--help"])
 
     assert result.exit_code == 0, result.output
     names = [
+        "edit",
         "migrate",
         "mou",
         "report",
+        "restore",
         "review",
         "start",
         "status",
         "stop",
         "task",
+        "timesheet",
         "token",
         "version",
     ]
+    positions = [result.output.index(f"│ {name} ") for name in names]
+    assert positions == sorted(positions)
+
+
+def test_timesheet_help_lists_subcommands_alphabetically():
+    result = runner.invoke(app, ["timesheet", "--help"])
+
+    assert result.exit_code == 0, result.output
+    names = ["edit", "export", "import", "remove", "show"]
     positions = [result.output.index(f"│ {name} ") for name in names]
     assert positions == sorted(positions)
 

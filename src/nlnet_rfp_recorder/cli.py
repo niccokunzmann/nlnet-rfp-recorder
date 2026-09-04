@@ -13,6 +13,7 @@ import typer
 from typer.core import TyperGroup
 
 from nlnet_rfp_recorder.budget import format_duration_hours
+from nlnet_rfp_recorder.timesheet import TimesheetRow, parse_hhmmss
 
 if TYPE_CHECKING:
     from nlnet_rfp_recorder.timetracking.models import Link, MoU, Task, TimeRecord
@@ -90,7 +91,10 @@ def _round10(amount: float) -> int:
 
 
 def _echo_task_status(task: Task) -> None:
-    typer.echo(f"MoU: {task.mou.name}")
+    # A task's MoU can be None: removing an MoU orphans (not deletes) its
+    # tasks, so a still-selected task can outlive its MoU.
+    mou_name = task.mou.name if task.mou is not None else "none (its MoU was removed)"
+    typer.echo(f"MoU: {mou_name}")
     typer.echo(f"Selected task: {task.name}")
     if task.budget_line is not None:
         typer.echo(str(task.budget_line))
@@ -154,6 +158,23 @@ def _complete_link_url(incomplete: str) -> list[str]:
                 "url", flat=True
             )
         )
+    except Exception:
+        return []
+
+
+def _backup_glob_pattern(database_file: Path) -> str:
+    return f"{database_file.stem}-*{database_file.suffix}"
+
+
+def _complete_backup_name(incomplete: str) -> list[str]:
+    try:
+        django.setup()
+        from django.conf import settings
+
+        database_file = Path(settings.DATABASES["default"]["NAME"])
+        pattern = _backup_glob_pattern(database_file)
+        names = sorted(path.stem for path in database_file.parent.glob(pattern))
+        return [name for name in names if name.startswith(incomplete)]
     except Exception:
         return []
 
@@ -274,9 +295,14 @@ def mou_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
 def mou_add(name: str, db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Add (and select) an MoU, creating it if it doesn't exist yet."""
     _setup(db, test)
+    from django.core.exceptions import ValidationError
+
     from nlnet_rfp_recorder.timetracking.models import MoU
 
-    MoU.select(name)
+    try:
+        MoU.select(name)
+    except ValidationError as error:
+        _fail("; ".join(error.messages))
     typer.echo(f"Selected MoU: {name}")
 
 
@@ -333,10 +359,15 @@ def mou_budget(
 ) -> None:
     """Read milestone budgets from a file (or stdin) and cap matching tasks."""
     _setup(db, test)
+    from django.core.exceptions import ValidationError
+
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     if mou is not None:
-        selected = MoU.select(mou)
+        try:
+            selected = MoU.select(mou)
+        except ValidationError as error:
+            _fail("; ".join(error.messages))
     else:
         selected = MoU.get_selected()
         if selected is None:
@@ -492,6 +523,160 @@ def task_remove(
     typer.echo(f"Removed task: {name}")
 
 
+timesheet_app = typer.Typer(
+    help="Manage individual time entries.", no_args_is_help=True, cls=AlphabeticalGroup
+)
+app.add_typer(timesheet_app, name="timesheet")
+
+
+@timesheet_app.callback()
+def timesheet_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Manage individual time entries."""
+    if test:
+        db = TEST_DB_FILE
+    if db is not None:
+        os.environ["RFP_DB"] = str(db)
+
+
+def _timesheet_display_start(start: str) -> str:
+    # Round down to the minute: no seconds, no microseconds.
+    return datetime.fromisoformat(start).strftime("%Y-%m-%dT%H:%M")
+
+
+def _timesheet_display_duration(duration: str) -> str:
+    # Round up to the minute, so a few seconds of work never shows as 0:00.
+    total_seconds = int(parse_hhmmss(duration).total_seconds())
+    minutes = -(-total_seconds // 60)
+    hh, mm = divmod(minutes, 60)
+    return f"{hh}:{mm:02d}"
+
+
+def _echo_timesheet_row(row: TimesheetRow) -> None:
+    start = _timesheet_display_start(row.start)
+    duration = _timesheet_display_duration(row.duration)
+    link = row.link or "-"
+    line = f"{row.pk} {row.mou} {row.task} {start} {duration} {link}"
+    if row.tags:
+        line += f" {row.tags}"
+    typer.echo(line)
+
+
+@timesheet_app.command("show")
+def timesheet_show(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """List all time entries, one per line."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import TimeRecord
+
+    records = TimeRecord.objects.order_by("start_time")
+    if not records:
+        typer.echo("No time entries yet.")
+        return
+
+    for record in records:
+        _echo_timesheet_row(record.row)
+
+
+@timesheet_app.command("export")
+def timesheet_export(
+    path: Path | None = typer.Argument(
+        None, help="Output CSV file. Omit to print to stdout."
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Export all time entries as CSV."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timesheet import write_csv
+    from nlnet_rfp_recorder.timetracking.models import TimeRecord
+
+    rows = [record.row for record in TimeRecord.objects.order_by("start_time")]
+    csv_text = write_csv(rows)
+    if path is None:
+        typer.echo(csv_text, nl=False)
+    else:
+        path.write_text(csv_text)
+        typer.echo(f"Exported {len(rows)} time entries to {path}")
+
+
+@timesheet_app.command("import")
+def timesheet_import(
+    path: Path = typer.Argument(..., exists=True, dir_okay=False),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Import time entries from a CSV file, creating or updating by pk."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timesheet import read_csv
+    from nlnet_rfp_recorder.timetracking.models import TimeRecord
+
+    _, backup_file = _backup_database()
+    typer.echo(f"Backed up database to {backup_file}")
+
+    rows = read_csv(path.read_text())
+    imported_pks = {row.pk for row in rows if row.pk is not None}
+    existing_pks = set(TimeRecord.objects.values_list("pk", flat=True))
+    missing_pks = sorted(existing_pks - imported_pks)
+
+    for row in rows:
+        try:
+            TimeRecord.apply_row(row)
+        except ValueError as error:
+            _fail(str(error))
+
+    if missing_pks:
+        ids = ", ".join(str(pk) for pk in missing_pks)
+        if typer.confirm(
+            f"{len(missing_pks)} existing time entries are missing from {path} "
+            f"({ids}). Delete them?"
+        ):
+            deleted, _ = TimeRecord.objects.filter(pk__in=missing_pks).delete()
+            typer.echo(f"Deleted {deleted} time entries.")
+
+    typer.echo(f"Imported {len(rows)} time entries from {path}")
+
+
+@timesheet_app.command("remove")
+def timesheet_remove(
+    pk: int, db: Path | None = DbOption, test: bool = TestOption
+) -> None:
+    """Remove a time entry by pk."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import TimeRecord
+
+    deleted, _ = TimeRecord.objects.filter(pk=pk).delete()
+    if deleted == 0:
+        _fail(f"No such time entry: {pk}")
+    typer.echo(f"Removed time entry: {pk}")
+
+
+@timesheet_app.command("edit")
+def timesheet_edit(
+    pk: int,
+    mou: str,
+    task: str,
+    start: str,
+    duration: str,
+    link: str,
+    tags: str = typer.Argument(""),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Replace a time entry's fields by pk."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timesheet import TimesheetRow
+    from nlnet_rfp_recorder.timetracking.models import TimeRecord
+
+    row = TimesheetRow(
+        pk=pk, mou=mou, task=task, start=start, duration=duration, link=link, tags=tags
+    )
+    try:
+        record = TimeRecord.apply_row(row)
+    except ValueError as error:
+        _fail(str(error))
+
+    _echo_timesheet_row(record.row)
+
+
 @app.command()
 def status(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Print MoU, task, and running-timer status."""
@@ -560,6 +745,39 @@ def review(
 
 
 @app.command()
+def edit(
+    link: str | None = typer.Argument(None, autocompletion=_complete_link_url),
+    tags: str | None = typer.Option(
+        None, "--tags", help="Comma-separated tags to add (implementation, review)."
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Edit the most recent time entry's link and/or tags."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Link, TimeRecord
+
+    record = TimeRecord.get_last()
+    if record is None:
+        _fail("No time entries yet.")
+
+    if link is not None:
+        if record.link is None or record.link.task is None:
+            _fail("Cannot edit the link: this time entry has no task.")
+        record.link = Link.get_or_create_for_task(link, record.link.task)
+        record.save(update_fields=["link"])
+
+    if tags is not None:
+        if record.link is None:
+            _fail("Cannot edit tags: this time entry has no link.")
+        for tag in (t.strip() for t in tags.split(",") if t.strip()):
+            record.link.add_tag(tag)
+
+    url = record.link.url if record.link else ""
+    typer.echo(f"Edited {_task_name(record)} {_format_duration(record.duration)} {url}")
+
+
+@app.command()
 def stop(
     link: str | None = typer.Argument(None, autocompletion=_complete_link_url),
     db: Path | None = DbOption,
@@ -583,10 +801,14 @@ def report(db: Path | None = DbOption, test: bool = TestOption) -> None:
     _setup(db, test)
     from django.conf import settings
 
-    from nlnet_rfp_recorder.timetracking.models import Task, TimeRecord
+    from nlnet_rfp_recorder.timetracking.models import MoU, Task, TimeRecord
 
     if settings.RFP_EUROS is None:
         _fail("RFP_EUROS is not set.")
+
+    mou = MoU.get_selected()
+    if mou is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
 
     running = TimeRecord.get_running()
     if running is not None:
@@ -596,8 +818,9 @@ def report(db: Path | None = DbOption, test: bool = TestOption) -> None:
             "Stop it first (`rfp stop`) to get an accurate report."
         )
 
+    typer.echo(f"MoU: {mou.name}")
     total = 0.0
-    for task in Task.objects.all():
+    for task in Task.objects.filter(mou=mou):
         budget = task.budget or 0.0
         total += budget
         typer.echo(f"{task.name}: {_round10(budget)}€")
@@ -634,10 +857,7 @@ def migrate(db: Path | None = DbOption, test: bool = TestOption) -> None:
     typer.echo(f"Migrated {settings.DATABASES['default']['NAME']}")
 
 
-@app.command()
-def backup(db: Path | None = DbOption, test: bool = TestOption) -> None:
-    """Copy the database file, timestamped, next to itself."""
-    _setup(db, test)
+def _backup_database() -> tuple[Path, Path]:
     from django.conf import settings
 
     database_file = Path(settings.DATABASES["default"]["NAME"])
@@ -646,7 +866,39 @@ def backup(db: Path | None = DbOption, test: bool = TestOption) -> None:
         f"{database_file.stem}-{timestamp}{database_file.suffix}"
     )
     shutil.copy2(database_file, backup_file)
+    return database_file, backup_file
+
+
+@app.command()
+def backup(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Copy the database file, timestamped, next to itself."""
+    _setup(db, test)
+    database_file, backup_file = _backup_database()
     typer.echo(f"Backed up {database_file} to {backup_file}")
+
+
+@app.command()
+def restore(
+    name: str = typer.Argument(..., autocompletion=_complete_backup_name),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Restore the database from a backup created by `rfp backup`."""
+    _setup(db, test)
+    from django.conf import settings
+
+    database_file = Path(settings.DATABASES["default"]["NAME"])
+    backup_name = (
+        name if name.endswith(database_file.suffix) else name + database_file.suffix
+    )
+    backup_file = database_file.parent / backup_name
+    if not backup_file.is_file():
+        _fail(f"No such backup: {backup_file}")
+
+    _, safety_backup = _backup_database()
+    shutil.copy2(backup_file, database_file)
+    typer.echo(f"Backed up current database to {safety_backup}")
+    typer.echo(f"Restored {database_file} from {backup_file}")
 
 
 def main() -> None:
