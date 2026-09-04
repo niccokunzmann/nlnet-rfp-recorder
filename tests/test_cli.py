@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import niquests
 import pytest
+import typer
 from django.utils import timezone
 from typer.testing import CliRunner
 
@@ -830,7 +831,7 @@ def test_report_create_and_print_fetch_statuses_once_for_many_tasks(settings):
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     now = timezone.now()
     for task_index in range(3):
-        task = Task.objects.create(mou=mou, name=f"task-{task_index}")
+        task = Task.objects.create(mou=mou, name=f"{10 + task_index}a")
         for pr_index in range(4):
             link = Link.objects.create(
                 task=task,
@@ -859,7 +860,7 @@ def test_report_create_and_print_fetch_statuses_once_for_many_tasks(settings):
     assert result.exit_code == 0, result.output
     assert mock_fetch.call_count == 1
     for task_index in range(3):
-        assert f"task-{task_index}: 40€" in result.output
+        assert f"{10 + task_index}a: 40€" in result.output
     assert "Total: 120€" in result.output
 
 
@@ -1593,11 +1594,27 @@ def test_restore_fails_for_an_unknown_backup_name():
     assert "No such backup" in result.output
 
 
+def _subcommand_names(*group_path: str) -> list[str]:
+    # Ask Click's own list_commands() - the exact hook it uses to order the
+    # rendered --help panel - instead of parsing rendered/wrapped Rich
+    # output, which is sensitive to terminal width and Rich version and
+    # made these tests flaky in CI (though not reproducible locally).
+    from typer.main import get_command
+
+    group = get_command(app)
+    ctx = typer.Context(group)
+    for name in group_path:
+        group = group.commands[name]
+        ctx = typer.Context(group, parent=ctx)
+    return group.list_commands(ctx)
+
+
 def test_help_lists_commands_alphabetically():
     result = runner.invoke(app, ["--help"])
 
     assert result.exit_code == 0, result.output
-    names = [
+    assert _subcommand_names() == [
+        "backup",
         "edit",
         "migrate",
         "mou",
@@ -1612,41 +1629,51 @@ def test_help_lists_commands_alphabetically():
         "token",
         "version",
     ]
-    positions = [result.output.index(f"│ {name} ") for name in names]
-    assert positions == sorted(positions)
 
 
 def test_timesheet_help_lists_subcommands_alphabetically():
     result = runner.invoke(app, ["timesheet", "--help"])
 
     assert result.exit_code == 0, result.output
-    names = ["edit", "export", "import", "remove", "show"]
-    positions = [result.output.index(f"│ {name} ") for name in names]
-    assert positions == sorted(positions)
+    assert _subcommand_names("timesheet") == [
+        "edit",
+        "export",
+        "import",
+        "remove",
+        "show",
+    ]
 
 
 def test_report_help_lists_subcommands_alphabetically():
     result = runner.invoke(app, ["report", "--help"])
 
     assert result.exit_code == 0, result.output
-    names = ["create", "export", "import", "list", "print", "remove"]
-    positions = [result.output.index(f"│ {name} ") for name in names]
-    assert positions == sorted(positions)
+    assert _subcommand_names("report") == [
+        "create",
+        "export",
+        "import",
+        "list",
+        "print",
+        "remove",
+    ]
 
 
 def test_mou_help_lists_subcommands_alphabetically():
     result = runner.invoke(app, ["mou", "--help"])
 
     assert result.exit_code == 0, result.output
-    names = ["add", "budget", "list", "remove", "select", "status"]
-    positions = [result.output.index(f"│ {name} ") for name in names]
-    assert positions == sorted(positions)
+    assert _subcommand_names("mou") == [
+        "add",
+        "budget",
+        "list",
+        "remove",
+        "select",
+        "status",
+    ]
 
 
 def test_task_help_lists_subcommands_alphabetically():
     result = runner.invoke(app, ["task", "--help"])
 
     assert result.exit_code == 0, result.output
-    names = ["list", "remove", "select", "set", "status"]
-    positions = [result.output.index(f"│ {name} ") for name in names]
-    assert positions == sorted(positions)
+    assert _subcommand_names("task") == ["list", "remove", "select", "set", "status"]

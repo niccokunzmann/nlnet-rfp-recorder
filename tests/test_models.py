@@ -1199,6 +1199,49 @@ def test_report_generate_report_groups_by_task_and_totals(settings):
     assert "Excluded Pull Requests" not in text
 
 
+def test_report_generate_report_orders_tasks_and_links_and_spaces_them_out(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    # Created out of order, and "9a" would sort after "10a" as plain text -
+    # both must be undone by number-then-letter task ordering.
+    task_10a = Task.objects.create(mou=mou, name="10a")
+    task_9a = Task.objects.create(mou=mou, name="9a")
+    link_10a_5 = Link.objects.create(
+        task=task_10a, url="https://github.com/nlnet/rfp-recorder/issues/5"
+    )
+    link_10a_2 = Link.objects.create(
+        task=task_10a, url="https://github.com/nlnet/rfp-recorder/issues/2"
+    )
+    link_9a = Link.objects.create(
+        task=task_9a, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    now = timezone.now()
+    for link in (link_10a_5, link_10a_2, link_9a):
+        TimeRecord.objects.create(
+            link=link, start_time=now - timedelta(minutes=30), end_time=now
+        )
+    report = Report.create(mou)
+    for record in TimeRecord.objects.all():
+        report.add_time_record(record)
+
+    text = report.generate_report()
+
+    assert text == (
+        f"Report: {report.id}\n"
+        "MoU: nlnet-2026\n"
+        "9a: 10€\n"
+        "  Issues:\n"
+        "    - https://github.com/nlnet/rfp-recorder/issues/1\n"
+        "\n"
+        "10a: 20€\n"
+        "  Issues:\n"
+        "    - https://github.com/nlnet/rfp-recorder/issues/2\n"
+        "    - https://github.com/nlnet/rfp-recorder/issues/5\n"
+        "\n"
+        "Total: 30€"
+    )
+
+
 def test_format_excluded_links_groups_by_task():
     task_a = Task.objects.create(name="10a")
     task_b = Task.objects.create(name="10b")
@@ -1221,6 +1264,40 @@ def test_format_excluded_links_groups_by_task():
         "    - https://github.com/nlnet/rfp-recorder/pull/2\n"
         "  10b:\n"
         "    - https://github.com/nlnet/rfp-recorder/pull/3"
+    )
+
+
+def test_format_excluded_links_orders_tasks_by_number_then_letter_and_prs_by_number():
+    # Created out of order on purpose, and with a task name ("9a") that a
+    # plain string sort would put after "10a"/"10b" - both must be undone
+    # by sorting on (number, letters) and PR number, not creation order.
+    task_10b = Task.objects.create(name="10b")
+    task_10a = Task.objects.create(name="10a")
+    task_9a = Task.objects.create(name="9a")
+    link_10a_5 = Link.objects.create(
+        task=task_10a, url="https://github.com/nlnet/rfp-recorder/pull/5"
+    )
+    link_10a_2 = Link.objects.create(
+        task=task_10a, url="https://github.com/nlnet/rfp-recorder/pull/2"
+    )
+    link_10b_1 = Link.objects.create(
+        task=task_10b, url="https://github.com/nlnet/rfp-recorder/pull/1"
+    )
+    link_9a_9 = Link.objects.create(
+        task=task_9a, url="https://github.com/nlnet/rfp-recorder/pull/9"
+    )
+
+    text = Report.format_excluded_links([link_10a_5, link_10a_2, link_10b_1, link_9a_9])
+
+    assert text == (
+        "Excluded Pull Requests (not merged):\n"
+        "  9a:\n"
+        "    - https://github.com/nlnet/rfp-recorder/pull/9\n"
+        "  10a:\n"
+        "    - https://github.com/nlnet/rfp-recorder/pull/2\n"
+        "    - https://github.com/nlnet/rfp-recorder/pull/5\n"
+        "  10b:\n"
+        "    - https://github.com/nlnet/rfp-recorder/pull/1"
     )
 
 

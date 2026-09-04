@@ -1014,7 +1014,11 @@ def _backup_database() -> tuple[Path, Path]:
     from django.conf import settings
 
     database_file = Path(settings.DATABASES["default"]["NAME"])
-    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    # Microsecond precision: two backups within the same second (e.g.
+    # `restore` backing up the current database right after a `backup` a
+    # moment earlier) would otherwise collide on the same filename, and the
+    # second copy would silently overwrite - and corrupt - the first.
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
     backup_file = database_file.with_name(
         f"{database_file.stem}-{timestamp}{database_file.suffix}"
     )

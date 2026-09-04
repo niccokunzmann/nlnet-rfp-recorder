@@ -1,3 +1,4 @@
+import re
 import warnings
 from collections.abc import Iterable
 from datetime import datetime, timedelta
@@ -240,6 +241,18 @@ class Task(models.Model):
             if not link.is_issue and not link.is_pr
         ]
 
+    @property
+    def sort_key(self) -> tuple[int, str]:
+        # name is validated as \d+[a-z]+ ("10a"), so plain string sort
+        # would put "10a" before "9a" - sort by the number, then letters.
+        number, letters = re.match(r"^(\d+)([a-z]+)$", self.name).groups()
+        return (int(number), letters)
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, Task):
+            return NotImplemented
+        return self.sort_key < other.sort_key
+
     def __str__(self) -> str:
         return self.name
 
@@ -297,6 +310,21 @@ class Link(models.Model):
     @property
     def is_pr(self) -> bool:
         return self.pr is not None
+
+    @property
+    def sort_key(self) -> tuple:
+        # Issues and PRs sort by number; anything else sorts after them,
+        # by URL. Issue/PR numbers are never compared against each other
+        # here since callers always sort within one already-filtered kind.
+        reference = self.pr or self.issue
+        if reference is not None:
+            return (0, reference.number)
+        return (1, self.url)
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, Link):
+            return NotImplemented
+        return self.sort_key < other.sort_key
 
     def __str__(self) -> str:
         return self.url
@@ -482,6 +510,12 @@ def _format_report_link(link: Link) -> str:
     return url
 
 
+def _task_sort_key(task: Task | None) -> tuple:
+    # Groups with no task (task was removed) sort last, after every real
+    # task in number-then-letter order.
+    return (1,) if task is None else (0, task.sort_key)
+
+
 def _billable_and_excluded_links(mou: MoU) -> tuple[list[TimeRecord], list[Link]]:
     """Unreported billable records and excluded (open PR) links for `mou`.
 
@@ -624,7 +658,10 @@ class Report(models.Model):
             task = record.link.task if record.link else None
             records_by_task.setdefault(task, []).append(record)
 
-        for task, task_records in records_by_task.items():
+        for index, task in enumerate(sorted(records_by_task, key=_task_sort_key)):
+            if index > 0:
+                lines.append("")
+            task_records = records_by_task[task]
             duration = sum((record.duration for record in task_records), timedelta())
             budget = (
                 duration.total_seconds() / 3600 * settings.RFP_EUROS
@@ -635,7 +672,7 @@ class Report(models.Model):
                 f"{task.name if task is not None else '?'}: {_round10(budget)}€"
             )
 
-            links = list({record.link for record in task_records if record.link})
+            links = sorted({record.link for record in task_records if record.link})
             issue_links = [link for link in links if link.is_issue]
             pr_links = [link for link in links if link.is_pr]
             other_links = [
@@ -652,6 +689,7 @@ class Report(models.Model):
                 lines.append("  Links:")
                 lines += [f"    - {_format_report_link(link)}" for link in other_links]
 
+        lines.append("")
         lines.append(f"Total: {_round10(self._budget_for(records))}€")
 
         excluded_section = Report.format_excluded_links(excluded_links)
@@ -665,11 +703,13 @@ class Report(models.Model):
         if not excluded_links:
             return ""
         links_by_task: dict[Task | None, list[Link]] = {}
-        for link in excluded_links:
+        for link in sorted(excluded_links):
             links_by_task.setdefault(link.task, []).append(link)
 
         lines = ["Excluded Pull Requests (not merged):"]
-        for task, links in links_by_task.items():
+        for task in sorted(links_by_task, key=_task_sort_key):
             lines.append(f"  {task.name if task is not None else '?'}:")
-            lines += [f"    - {_format_report_link(link)}" for link in links]
+            lines += [
+                f"    - {_format_report_link(link)}" for link in links_by_task[task]
+            ]
         return "\n".join(lines)
