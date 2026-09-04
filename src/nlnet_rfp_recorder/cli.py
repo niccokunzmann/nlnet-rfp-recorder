@@ -9,16 +9,24 @@ from typing import TYPE_CHECKING, NoReturn
 
 import django
 import typer
+from typer.core import TyperGroup
 
 if TYPE_CHECKING:
     from nlnet_rfp_recorder.timetracking.models import Link, MoU, Task, TimeRecord
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "nlnet_rfp_recorder.settings")
 
+
+class AlphabeticalGroup(TyperGroup):
+    def list_commands(self, ctx: typer.Context) -> list[str]:
+        return sorted(self.commands)
+
+
 app = typer.Typer(
     name="rfp",
     help="Create RfPs from work on issues and pull requests, record time.",
     no_args_is_help=True,
+    cls=AlphabeticalGroup,
 )
 
 DbOption = typer.Option(None, "--db", help="Path to the sqlite database file.")
@@ -212,7 +220,7 @@ def token(
     typer.echo("Saved GitHub token.")
 
 
-mou_app = typer.Typer(help="Manage MoUs.", no_args_is_help=True)
+mou_app = typer.Typer(help="Manage MoUs.", no_args_is_help=True, cls=AlphabeticalGroup)
 app.add_typer(mou_app, name="mou")
 
 
@@ -352,7 +360,7 @@ def _show_task_status() -> None:
     _echo_task_status(current)
 
 
-task_app = typer.Typer(help="Manage the current task.")
+task_app = typer.Typer(help="Manage the current task.", cls=AlphabeticalGroup)
 app.add_typer(task_app, name="task")
 
 
@@ -504,15 +512,7 @@ def status(db: Path | None = DbOption, test: bool = TestOption) -> None:
         typer.echo(f"Running: {url} ({_format_duration(running.duration)})")
 
 
-@app.command()
-def start(
-    link: str = typer.Argument(..., autocompletion=_complete_link_url),
-    tags: str = TagsOption,
-    db: Path | None = DbOption,
-    test: bool = TestOption,
-) -> None:
-    """Start a time entry for the currently selected task."""
-    _setup(db, test)
+def _start(link: str, tags: str) -> None:
     from nlnet_rfp_recorder.timetracking.models import TimeRecord
 
     stopped = TimeRecord.stop()
@@ -532,6 +532,29 @@ def start(
         typer.echo(str(warning.message), err=True)
 
     typer.echo(f"Started time entry for task {_task_name(record)}: {link}")
+
+
+@app.command()
+def start(
+    link: str = typer.Argument(..., autocompletion=_complete_link_url),
+    tags: str = TagsOption,
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Start a time entry for the currently selected task."""
+    _setup(db, test)
+    _start(link, tags)
+
+
+@app.command()
+def review(
+    link: str = typer.Argument(..., autocompletion=_complete_link_url),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Start a time entry tagged 'review' for the currently selected task."""
+    _setup(db, test)
+    _start(link, "review")
 
 
 @app.command()

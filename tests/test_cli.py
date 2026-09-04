@@ -561,6 +561,35 @@ def test_start_accepts_explicit_tags():
     assert [tag.name for tag in link.tags.all()] == ["review"]
 
 
+def test_review_starts_a_time_entry_tagged_review():
+    Task.objects.create(name="10a")
+
+    result = runner.invoke(app, ["review", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.is_running is True
+    link = Link.objects.get()
+    assert [tag.name for tag in link.tags.all()] == ["review"]
+    assert "Started time entry for task 10a" in result.output
+
+
+def test_review_without_a_task_fails():
+    result = runner.invoke(app, ["review", "https://example.com/issues/1"])
+
+    assert result.exit_code != 0
+
+
+def test_review_stops_a_previously_running_entry():
+    Task.objects.create(name="10a")
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    result = runner.invoke(app, ["review", "https://example.com/issues/2"])
+
+    assert result.exit_code == 0, result.output
+    assert "Stopped 10a" in result.output
+
+
 def test_token_without_args_prints_instructions_and_saves_nothing():
     result = runner.invoke(app, ["token"])
 
