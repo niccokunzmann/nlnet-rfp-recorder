@@ -8,7 +8,7 @@ APP_NAME = "nlnet-rfp-recorder"
 
 XDG_DATA_HOME = env.str("XDG_DATA_HOME", default=str(Path.home() / ".local" / "share"))
 
-_db_override = env.str("NLNET_RFP_RECORDER_DB", default="")
+_db_override = env.str("RFP_DB", default="")
 if _db_override:
     DATABASE_FILE = Path(_db_override).expanduser()
 else:
