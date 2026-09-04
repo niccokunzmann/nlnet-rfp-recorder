@@ -1,0 +1,42 @@
+[project]
+name = "nlnet-rfp-recorder"
+version = "0.1.0"
+description = "Create RfPs from work on issues and pull requests, record time."
+authors = [
+    { name = "Nicco Kunzmann", email = "niccokunzmann@rambler.ru" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "django>=5.1",
+    "django-environ",
+    "typer>=0.15",
+]
+
+[project.scripts]
+rfp = "nlnet_rfp_recorder.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "django-stubs",
+    "pre-commit",
+    "pytest",
+    "pytest-django",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "nlnet_rfp_recorder.settings"
+
+[tool.django-stubs]
+django_settings_module = "nlnet_rfp_recorder.settings"
