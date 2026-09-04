@@ -14,6 +14,8 @@ if _db_override:
 else:
     DATABASE_FILE = Path(XDG_DATA_HOME).expanduser() / APP_NAME / "rfp.db"
 
+RFP_EUROS = env.float("RFP_EUROS", default=50)
+
 SECRET_KEY = "django-insecure-not-used-outside-tests"
 DEBUG = False
 USE_TZ = False

@@ -9,6 +9,7 @@ requires-python = ">=3.14"
 dependencies = [
     "django>=5.1",
     "django-environ",
+    "niquests>=3.21.1",
     "typer>=0.15",
 ]
 
@@ -24,6 +25,7 @@ dev = [
     "django-stubs",
     "pre-commit",
     "pytest",
+    "pytest-asyncio>=1.4.0",
     "pytest-django",
     "ruff",
 ]
@@ -40,6 +42,10 @@ select = ["E", "F", "I", "UP"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "nlnet_rfp_recorder.settings"
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::nlnet_rfp_recorder.warnings.TaskWarning",
+]
 
 [tool.django-stubs]
 django_settings_module = "nlnet_rfp_recorder.settings"

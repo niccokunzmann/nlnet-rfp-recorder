@@ -41,3 +41,11 @@ def test_rfp_db_env_var_is_used_when_no_option_given(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert db_path.is_file()
+
+
+def test_mou_migrates_a_fresh_database_without_an_explicit_migrate_call(tmp_path):
+    db_path = tmp_path / "custom.sqlite3"
+    result = run_rfp("--db", str(db_path), "mou", "list")
+
+    assert result.returncode == 0, result.stderr
+    assert db_path.is_file()

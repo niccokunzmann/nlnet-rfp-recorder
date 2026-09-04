@@ -5,7 +5,11 @@ init:
 	uv run pre-commit install
 
 install:
-	uv tool install --force .
+	uv tool install --editable --force .
+	rfp --install-completion
+	@echo
+	@echo "Shell completion installed. Existing terminals won't see it until you"
+	@echo "run 'source ~/.bashrc' (or the equivalent for your shell) or open a new one."
 
 test:
 	uv run pytest

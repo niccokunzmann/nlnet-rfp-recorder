@@ -1,0 +1,135 @@
+[
+  {
+    "model": "timetracking.tag",
+    "pk": 1,
+    "fields": {"name": "implementation"}
+  },
+  {
+    "model": "timetracking.tag",
+    "pk": 2,
+    "fields": {"name": "review"}
+  },
+  {
+    "model": "timetracking.mou",
+    "pk": 1,
+    "fields": {"name": "sample-mou", "selected": true, "budget": ""}
+  },
+  {
+    "model": "timetracking.task",
+    "pk": 1,
+    "fields": {"mou": 1, "name": "10a", "selected": false}
+  },
+  {
+    "model": "timetracking.task",
+    "pk": 2,
+    "fields": {"mou": 1, "name": "11b", "selected": true}
+  },
+  {
+    "model": "timetracking.link",
+    "pk": 1,
+    "fields": {
+      "task": 1,
+      "url": "https://github.com/collective/icalendar/issues/1708",
+      "tags": [1]
+    }
+  },
+  {
+    "model": "timetracking.link",
+    "pk": 2,
+    "fields": {
+      "task": 2,
+      "url": "https://github.com/collective/icalendar/pull/1752",
+      "tags": [1]
+    }
+  },
+  {
+    "model": "timetracking.link",
+    "pk": 3,
+    "fields": {
+      "task": 1,
+      "url": "https://github.com/django/django/issues/1",
+      "tags": [2]
+    }
+  },
+  {
+    "model": "timetracking.link",
+    "pk": 4,
+    "fields": {
+      "task": 2,
+      "url": "https://github.com/django/django/pull/2",
+      "tags": [2]
+    }
+  },
+  {
+    "model": "timetracking.link",
+    "pk": 5,
+    "fields": {
+      "task": 1,
+      "url": "https://github.com/collective/icalendar/issues/999999999",
+      "tags": [1]
+    }
+  },
+  {
+    "model": "timetracking.link",
+    "pk": 6,
+    "fields": {
+      "task": 2,
+      "url": "https://example.com/docs/architecture",
+      "tags": [1]
+    }
+  },
+  {
+    "model": "timetracking.timerecord",
+    "pk": 1,
+    "fields": {
+      "link": 1,
+      "start_time": "2026-09-01T09:00:00",
+      "end_time": "2026-09-01T10:30:00"
+    }
+  },
+  {
+    "model": "timetracking.timerecord",
+    "pk": 2,
+    "fields": {
+      "link": 2,
+      "start_time": "2026-09-02T09:00:00",
+      "end_time": "2026-09-02T09:45:00"
+    }
+  },
+  {
+    "model": "timetracking.timerecord",
+    "pk": 3,
+    "fields": {
+      "link": 3,
+      "start_time": "2026-09-03T09:00:00",
+      "end_time": "2026-09-03T09:20:00"
+    }
+  },
+  {
+    "model": "timetracking.timerecord",
+    "pk": 4,
+    "fields": {
+      "link": 4,
+      "start_time": "2026-09-03T10:00:00",
+      "end_time": "2026-09-03T10:25:00"
+    }
+  },
+  {
+    "model": "timetracking.timerecord",
+    "pk": 5,
+    "fields": {
+      "link": 5,
+      "start_time": "2026-09-04T09:00:00",
+      "end_time": "2026-09-04T09:10:00"
+    }
+  },
+  {
+    "model": "timetracking.timerecord",
+    "pk": 6,
+    "fields": {
+      "link": 6,
+      "start_time": "2026-09-04T11:00:00",
+      "end_time": "2026-09-04T11:15:00"
+    }
+  }
+]
