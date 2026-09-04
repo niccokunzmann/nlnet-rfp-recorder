@@ -165,6 +165,15 @@ class Task(models.Model):
         return self.links.filter(time_records__isnull=False).distinct()
 
     @cached_property
+    def _pr_link_statuses(self) -> dict[int, Status]:
+        links = list(self.links_with_tracked_time)
+        pr_links = [link for link in links if link.is_pr]
+        references = [link.pr for link in pr_links]
+        token = GitHubToken.get()
+        statuses = fetch_statuses(references, token=token) if references else []
+        return dict(zip((link.id for link in pr_links), statuses, strict=True))
+
+    @cached_property
     def billable_links(self) -> list[Link]:
         # Issues count once tracked regardless of GitHub status - opening
         # an issue is real work either way. PRs only count once merged or
@@ -173,16 +182,23 @@ class Task(models.Model):
         # counts too (see TimeRecord.duration) - its live elapsed time is
         # part of "how much has been used" until it's stopped.
         links = list(self.links_with_tracked_time)
-        pr_links = [link for link in links if link.is_pr]
-        references = [link.pr for link in pr_links]
-        token = GitHubToken.get()
-        statuses = fetch_statuses(references, token=token) if references else []
-        closed_pr_ids = {
-            link.id
-            for link, status in zip(pr_links, statuses, strict=True)
-            if status == Status.CLOSED
-        }
-        return [link for link in links if not link.is_pr or link.id in closed_pr_ids]
+        statuses = self._pr_link_statuses
+        return [
+            link
+            for link in links
+            if not link.is_pr or statuses.get(link.id) == Status.CLOSED
+        ]
+
+    @cached_property
+    def excluded_pull_request_links(self) -> list[Link]:
+        """Tracked PR links held back from billable_links because still open."""
+        links = list(self.links_with_tracked_time)
+        statuses = self._pr_link_statuses
+        return [
+            link
+            for link in links
+            if link.is_pr and statuses.get(link.id) != Status.CLOSED
+        ]
 
     @property
     def tracked_time_records(self) -> models.QuerySet[TimeRecord]:
@@ -301,6 +317,13 @@ class TimeRecord(models.Model):
     )
     start_time = models.DateTimeField()
     end_time = models.DateTimeField(null=True, blank=True)
+    report = models.ForeignKey(
+        "Report",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="time_records",
+    )
 
     objects = TimeRecordManager()
 
@@ -370,10 +393,13 @@ class TimeRecord(models.Model):
             duration=format_hhmmss(self.duration),
             link=self.link.url if self.link else "",
             tags=tags,
+            report=self.report_id or "",
         )
 
     @classmethod
-    def apply_row(cls, row: TimesheetRow) -> TimeRecord:
+    def apply_row(
+        cls, row: TimesheetRow, allow_create_with_pk: bool = False
+    ) -> TimeRecord:
         try:
             mou = MoU.objects.get(name=row.mou)
         except MoU.DoesNotExist:
@@ -393,6 +419,13 @@ class TimeRecord(models.Model):
             for tag in filter(None, (t.strip() for t in row.tags.split(","))):
                 link.add_tag(tag)
 
+        report = None
+        if row.report:
+            try:
+                report = Report.objects.get(pk=row.report)
+            except Report.DoesNotExist:
+                raise ValueError(f"No such report: {row.report}.") from None
+
         try:
             start_time = datetime.fromisoformat(row.start)
         except ValueError:
@@ -403,19 +436,240 @@ class TimeRecord(models.Model):
         end_time = start_time + duration
 
         if row.pk is None:
-            return cls.objects.create(
+            record = cls.objects.create(
                 link=link, start_time=start_time, end_time=end_time
             )
+        else:
+            try:
+                record = cls.objects.get(pk=row.pk)
+            except cls.DoesNotExist:
+                if not allow_create_with_pk:
+                    raise ValueError(f"No such time record: {row.pk}.") from None
+                record = cls.objects.create(
+                    pk=row.pk, link=link, start_time=start_time, end_time=end_time
+                )
+            else:
+                record.link = link
+                record.start_time = start_time
+                record.end_time = end_time
+                record.save()
 
-        try:
-            record = cls.objects.get(pk=row.pk)
-        except cls.DoesNotExist:
-            raise ValueError(f"No such time record: {row.pk}.") from None
-        record.link = link
-        record.start_time = start_time
-        record.end_time = end_time
-        record.save()
+        if report is not None:
+            report.add_time_record(record)
+        elif record.report_id is not None:
+            record.report.remove_time_record(record)
+
         return record
 
     def __str__(self) -> str:
         return f"TimeRecord({self.start_time} - {self.end_time or 'running'})"
+
+
+def _round10(amount: float) -> int:
+    return round(amount / 10) * 10
+
+
+def _format_report_link(link: Link) -> str:
+    if link.is_issue:
+        url = link.issue.url
+    elif link.is_pr:
+        url = link.pr.url
+    else:
+        url = link.url
+    extra_tags = [tag.name for tag in link.tags.all() if tag.name != "implementation"]
+    if extra_tags:
+        return f"{url} ({', '.join(extra_tags)})"
+    return url
+
+
+def _billable_and_excluded_links(mou: MoU) -> tuple[list[TimeRecord], list[Link]]:
+    """Unreported billable records and excluded (open PR) links for `mou`.
+
+    Checks every open PR across all of the MoU's tasks in a single batched
+    GitHub status request, instead of one request per task - otherwise the
+    time this takes scales with the number of tasks/PRs involved.
+    """
+    links_by_task = {
+        task: list(task.links_with_tracked_time)
+        for task in Task.objects.filter(mou=mou)
+    }
+    all_pr_links = [
+        link for links in links_by_task.values() for link in links if link.is_pr
+    ]
+    references = [link.pr for link in all_pr_links]
+    token = GitHubToken.get()
+    statuses = fetch_statuses(references, token=token) if references else []
+    status_by_link_id = dict(
+        zip((link.id for link in all_pr_links), statuses, strict=True)
+    )
+
+    records: list[TimeRecord] = []
+    excluded_links: list[Link] = []
+    for links in links_by_task.values():
+        billable_ids = {
+            link.id
+            for link in links
+            if not link.is_pr or status_by_link_id.get(link.id) == Status.CLOSED
+        }
+        records += list(
+            TimeRecord.objects.filter(link_id__in=billable_ids, report__isnull=True)
+        )
+        excluded_links += [
+            link
+            for link in links
+            if link.is_pr and status_by_link_id.get(link.id) != Status.CLOSED
+        ]
+    return records, excluded_links
+
+
+class Report(models.Model):
+    id = models.CharField(max_length=80, primary_key=True, editable=False)
+    mou = models.ForeignKey(
+        MoU, null=True, blank=True, on_delete=models.SET_NULL, related_name="reports"
+    )
+    created = models.DateTimeField(auto_now_add=True)
+
+    @classmethod
+    def create(cls, mou: MoU) -> Report:
+        # Report ids are "<MoU name>-<n>", numbered per MoU starting at 1.
+        # Counted by id prefix (not the mou FK) so numbering survives the
+        # MoU later being removed (which orphans, not deletes, old reports).
+        prefix = f"{mou.name}-"
+        existing_ids = cls.objects.filter(id__startswith=prefix).values_list(
+            "id", flat=True
+        )
+        numbers = [
+            int(suffix)
+            for existing_id in existing_ids
+            if (suffix := existing_id[len(prefix) :]).isdigit()
+        ]
+        next_number = max(numbers, default=0) + 1
+        return cls.objects.create(id=f"{prefix}{next_number}", mou=mou)
+
+    def add_time_record(self, record: TimeRecord) -> None:
+        task = record.link.task if record.link else None
+        record_mou = task.mou if task else None
+        if record_mou is None or record_mou.id != self.mou_id:
+            raise ValueError(
+                f"TimeRecord {record.pk} does not belong to MoU "
+                f"{self.mou.name if self.mou else 'none'}."
+            )
+        record.report = self
+        record.save(update_fields=["report"])
+
+    def add_unreported_time_records(self) -> list[Link]:
+        """Attach unreported billable records; return the PR links excluded.
+
+        Whether a PR was merged yet is decided once, right here, at create
+        time - which PRs were excluded is not recorded anywhere, so printing
+        this report later never needs to check GitHub again. The caller (the
+        `create` command) is responsible for showing this list to the user
+        now, since it won't be available again.
+        """
+        records, excluded_links = _billable_and_excluded_links(self.mou)
+        for record in records:
+            self.add_time_record(record)
+        return excluded_links
+
+    def remove_time_record(self, record: TimeRecord) -> None:
+        if record.report_id != self.pk:
+            raise ValueError(f"TimeRecord {record.pk} is not part of report {self.id}.")
+        record.report = None
+        record.save(update_fields=["report"])
+
+    def __str__(self) -> str:
+        return self.id
+
+    @staticmethod
+    def _budget_for(records: Iterable[TimeRecord]) -> float:
+        if settings.RFP_EUROS is None:
+            return 0.0
+        duration = sum((record.duration for record in records), timedelta())
+        return duration.total_seconds() / 3600 * settings.RFP_EUROS
+
+    @property
+    def total_budget(self) -> float:
+        return self._budget_for(self.time_records.all())
+
+    def generate_report(self) -> str:
+        """Render this persisted report. Read-only: never hits the network.
+
+        Every attached TimeRecord is treated as included - which PRs were
+        excluded at create time is not recorded, so there is nothing to
+        show here.
+        """
+        return self._render(
+            self.time_records.select_related("link__task"),
+            self.id or "(unreported)",
+            excluded_links=[],
+        )
+
+    @classmethod
+    def preview(cls, mou: MoU) -> str:
+        """Render what `create` would produce for `mou`, without persisting it."""
+        records, excluded_links = _billable_and_excluded_links(mou)
+        return cls(mou=mou)._render(records, "(unreported)", excluded_links)
+
+    def _render(
+        self,
+        records: Iterable[TimeRecord],
+        title: str,
+        excluded_links: list[Link],
+    ) -> str:
+        records = list(records)
+        lines = [f"Report: {title}", f"MoU: {self.mou.name if self.mou else 'none'}"]
+
+        records_by_task: dict[Task | None, list[TimeRecord]] = {}
+        for record in records:
+            task = record.link.task if record.link else None
+            records_by_task.setdefault(task, []).append(record)
+
+        for task, task_records in records_by_task.items():
+            duration = sum((record.duration for record in task_records), timedelta())
+            budget = (
+                duration.total_seconds() / 3600 * settings.RFP_EUROS
+                if settings.RFP_EUROS is not None
+                else 0.0
+            )
+            lines.append(
+                f"{task.name if task is not None else '?'}: {_round10(budget)}€"
+            )
+
+            links = list({record.link for record in task_records if record.link})
+            issue_links = [link for link in links if link.is_issue]
+            pr_links = [link for link in links if link.is_pr]
+            other_links = [
+                link for link in links if not link.is_issue and not link.is_pr
+            ]
+
+            if issue_links:
+                lines.append("  Issues:")
+                lines += [f"    - {_format_report_link(link)}" for link in issue_links]
+            if pr_links:
+                lines.append("  Pull Requests:")
+                lines += [f"    - {_format_report_link(link)}" for link in pr_links]
+            if other_links:
+                lines.append("  Links:")
+                lines += [f"    - {_format_report_link(link)}" for link in other_links]
+
+        lines.append(f"Total: {_round10(self._budget_for(records))}€")
+
+        excluded_section = Report.format_excluded_links(excluded_links)
+        if excluded_section:
+            lines.append(excluded_section)
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_excluded_links(excluded_links: list[Link]) -> str:
+        if not excluded_links:
+            return ""
+        links_by_task: dict[Task | None, list[Link]] = {}
+        for link in excluded_links:
+            links_by_task.setdefault(link.task, []).append(link)
+
+        lines = ["Excluded Pull Requests (not merged):"]
+        for task, links in links_by_task.items():
+            lines.append(f"  {task.name if task is not None else '?'}:")
+            lines += [f"    - {_format_report_link(link)}" for link in links]
+        return "\n".join(lines)

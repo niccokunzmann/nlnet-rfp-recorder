@@ -1,8 +1,15 @@
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+import niquests
 import pytest
 
-from nlnet_rfp_recorder.github import Issue, PullRequest, Status, fetch_statuses
+from nlnet_rfp_recorder.github import (
+    TIMEOUT_SECONDS,
+    Issue,
+    PullRequest,
+    Status,
+    fetch_statuses,
+)
 
 
 def _mock_session(state: str = "closed", status_code: int = 200):
@@ -47,7 +54,8 @@ def test_issue_current_status_queries_the_github_api():
         status = issue.current_status
 
     get.assert_called_once_with(
-        "https://api.github.com/repos/nlnet/rfp-recorder/issues/42"
+        "https://api.github.com/repos/nlnet/rfp-recorder/issues/42",
+        timeout=TIMEOUT_SECONDS,
     )
     response.raise_for_status.assert_called_once()
     assert status == Status.OPEN
@@ -61,7 +69,8 @@ def test_pull_request_current_status_queries_the_github_api():
         status = pr.current_status
 
     get.assert_called_once_with(
-        "https://api.github.com/repos/nlnet/rfp-recorder/pulls/7"
+        "https://api.github.com/repos/nlnet/rfp-recorder/pulls/7",
+        timeout=TIMEOUT_SECONDS,
     )
     response.raise_for_status.assert_called_once()
     assert status == Status.CLOSED
@@ -90,6 +99,26 @@ def test_current_status_is_nonexistent_when_not_found():
     assert status == Status.NONEXISTENT
 
 
+def test_current_status_includes_githubs_own_message_on_error():
+    issue = Issue(owner="collective", repo="icalendar", number=1559)
+    response = MagicMock(status_code=403)
+    response.raise_for_status = Mock(
+        side_effect=niquests.exceptions.HTTPError("403 Client Error: Forbidden")
+    )
+    response.json = Mock(
+        return_value={"message": "the organization forbids this token"}
+    )
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response):
+        with pytest.raises(niquests.exceptions.HTTPError) as exc_info:
+            issue.current_status
+
+    message = str(exc_info.value)
+    assert issue.url in message
+    assert "403" in message
+    assert "the organization forbids this token" in message
+
+
 @pytest.mark.asyncio
 async def test_current_status_async_queries_the_github_api():
     issue = Issue(owner="nlnet", repo="rfp-recorder", number=42)
@@ -98,7 +127,9 @@ async def test_current_status_async_queries_the_github_api():
     status = await issue.current_status_async(session)
 
     session.get.assert_called_once_with(
-        "https://api.github.com/repos/nlnet/rfp-recorder/issues/42", headers=None
+        "https://api.github.com/repos/nlnet/rfp-recorder/issues/42",
+        headers=None,
+        timeout=TIMEOUT_SECONDS,
     )
     response.raise_for_status.assert_called_once()
     assert status == Status.OPEN
@@ -114,6 +145,7 @@ async def test_current_status_async_sends_the_token_as_a_bearer_header():
     session.get.assert_called_once_with(
         "https://api.github.com/repos/nlnet/rfp-recorder/issues/42",
         headers={"Authorization": "Bearer secret"},
+        timeout=TIMEOUT_SECONDS,
     )
 
 
@@ -126,6 +158,26 @@ async def test_current_status_async_is_nonexistent_when_not_found():
 
     response.raise_for_status.assert_not_called()
     assert status == Status.NONEXISTENT
+
+
+@pytest.mark.asyncio
+async def test_current_status_async_includes_githubs_own_message_on_error():
+    issue = Issue(owner="collective", repo="icalendar", number=1559)
+    session, response = _mock_session(status_code=403)
+    response.raise_for_status = Mock(
+        side_effect=niquests.exceptions.HTTPError("403 Client Error: Forbidden")
+    )
+    response.json = Mock(
+        return_value={"message": "the organization forbids this token"}
+    )
+
+    with pytest.raises(niquests.exceptions.HTTPError) as exc_info:
+        await issue.current_status_async(session)
+
+    message = str(exc_info.value)
+    assert issue.url in message
+    assert "403" in message
+    assert "the organization forbids this token" in message
 
 
 def test_fetch_statuses_runs_requests_concurrently_in_one_session():
@@ -142,3 +194,36 @@ def test_fetch_statuses_runs_requests_concurrently_in_one_session():
 
     assert statuses == [Status.CLOSED, Status.CLOSED]
     assert session.get.call_count == 2
+
+
+def test_fetch_statuses_raises_after_every_request_finishes():
+    # Regression test: gather() used to raise the first HTTPError while
+    # sibling requests were still in flight, and closing the session out
+    # from under them then deadlocked forever instead of raising. All
+    # requests must complete before the exception surfaces.
+    issue = Issue(owner="nlnet", repo="rfp-recorder", number=1)
+    forbidden_pr = PullRequest(owner="nlnet", repo="rfp-recorder", number=2)
+    closed_pr = PullRequest(owner="nlnet", repo="rfp-recorder", number=3)
+
+    ok_response = MagicMock(status_code=200)
+    ok_response.json = MagicMock(return_value={"state": "closed"})
+    forbidden_response = MagicMock(status_code=200)
+    forbidden_response.raise_for_status = Mock(
+        side_effect=niquests.exceptions.HTTPError("403 Client Error: Forbidden")
+    )
+
+    async def fake_get(url, **kwargs):
+        return forbidden_response if url.endswith("/pulls/2") else ok_response
+
+    session = MagicMock()
+    session.get = AsyncMock(side_effect=fake_get)
+
+    with patch(
+        "nlnet_rfp_recorder.github.niquests.AsyncSession", return_value=session
+    ) as async_session:
+        async_session.return_value.__aenter__ = AsyncMock(return_value=session)
+        async_session.return_value.__aexit__ = AsyncMock(return_value=False)
+        with pytest.raises(niquests.exceptions.HTTPError):
+            fetch_statuses([issue, forbidden_pr, closed_pr])
+
+    assert session.get.call_count == 3

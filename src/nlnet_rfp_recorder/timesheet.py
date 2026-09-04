@@ -3,7 +3,7 @@ import io
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 
-FIELDNAMES = ["pk", "mou", "task", "start", "duration", "link", "tags"]
+FIELDNAMES = ["pk", "mou", "task", "start", "duration", "link", "tags", "report"]
 
 
 @dataclass
@@ -15,6 +15,7 @@ class TimesheetRow:
     duration: str
     link: str
     tags: str = ""
+    report: str = ""
 
 
 def format_hhmmss(duration: timedelta) -> str:
@@ -60,6 +61,7 @@ def read_csv(text: str) -> list[TimesheetRow]:
                 duration=line["duration"],
                 link=line["link"],
                 tags=line.get("tags") or "",
+                report=line.get("report") or "",
             )
         )
     return rows

@@ -6,12 +6,13 @@ import pytest
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 
-from nlnet_rfp_recorder.github import Issue, PullRequest
+from nlnet_rfp_recorder.github import TIMEOUT_SECONDS, Issue, PullRequest
 from nlnet_rfp_recorder.timesheet import TimesheetRow
 from nlnet_rfp_recorder.timetracking.models import (
     GitHubToken,
     Link,
     MoU,
+    Report,
     Task,
     TaskWarning,
     TimeRecord,
@@ -748,7 +749,65 @@ def test_billable_links_sends_the_saved_token():
     session.get.assert_called_once_with(
         "https://api.github.com/repos/nlnet/rfp-recorder/pulls/1",
         headers={"Authorization": "Bearer secret"},
+        timeout=TIMEOUT_SECONDS,
     )
+
+
+def test_excluded_pull_request_links_holds_back_open_prs():
+    task = Task.objects.create(name="10a")
+    open_link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/pull/1"
+    )
+    TimeRecord.objects.create(
+        link=open_link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+
+    with _mock_github_session("open"):
+        billable = task.billable_links
+        excluded = task.excluded_pull_request_links
+
+    assert billable == []
+    assert excluded == [open_link]
+
+
+def test_excluded_pull_request_links_is_empty_when_all_prs_are_closed():
+    task = Task.objects.create(name="10a")
+    closed_link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/pull/1"
+    )
+    TimeRecord.objects.create(
+        link=closed_link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+
+    with _mock_github_session("closed"):
+        excluded = task.excluded_pull_request_links
+
+    assert excluded == []
+
+
+def test_billable_links_and_excluded_pull_request_links_share_one_status_check():
+    # Both properties need each PR's open/closed status; they must share a
+    # single GitHub round trip rather than fetching it twice.
+    task = Task.objects.create(name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/pull/1"
+    )
+    TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+
+    with _mock_github_session("open") as mock_session_cls:
+        task.billable_links
+        task.excluded_pull_request_links
+
+    session = mock_session_cls.return_value
+    assert session.get.call_count == 1
 
 
 def test_row_reflects_a_finished_record():
@@ -808,6 +867,69 @@ def test_apply_row_creates_a_new_record_without_a_pk():
     assert record.end_time == datetime(2026, 9, 4, 10, 0)
     assert record.link.url == "https://example.com/issues/1"
     assert [tag.name for tag in record.link.tags.all()] == ["implementation"]
+
+
+def test_apply_row_with_an_unknown_pk_raises_by_default():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="10a")
+    row = TimesheetRow(
+        pk=1000,
+        mou="nlnet-2026",
+        task="10a",
+        start=datetime(2026, 9, 4, 9, 0).isoformat(),
+        duration="01:00:00",
+        link="https://example.com/issues/1",
+        tags="",
+    )
+
+    with pytest.raises(ValueError, match="No such time record"):
+        TimeRecord.apply_row(row)
+
+
+def test_apply_row_with_allow_create_with_pk_creates_a_record_with_that_pk():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="10a")
+    row = TimesheetRow(
+        pk=1000,
+        mou="nlnet-2026",
+        task="10a",
+        start=datetime(2026, 9, 4, 9, 0).isoformat(),
+        duration="01:00:00",
+        link="https://example.com/issues/1",
+        tags="",
+    )
+
+    record = TimeRecord.apply_row(row, allow_create_with_pk=True)
+
+    assert record.pk == 1000
+    reloaded = TimeRecord.objects.get(pk=1000)
+    assert reloaded.link.url == "https://example.com/issues/1"
+
+
+def test_apply_row_with_allow_create_with_pk_still_updates_an_existing_pk():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    row = TimesheetRow(
+        pk=record.pk,
+        mou="nlnet-2026",
+        task="10a",
+        start=datetime(2026, 9, 4, 9, 0).isoformat(),
+        duration="02:00:00",
+        link="https://example.com/issues/2",
+        tags="",
+    )
+
+    updated = TimeRecord.apply_row(row, allow_create_with_pk=True)
+
+    assert updated.pk == record.pk
+    assert TimeRecord.objects.count() == 1
+    assert updated.link.url == "https://example.com/issues/2"
 
 
 def test_apply_row_updates_an_existing_record_by_pk():
@@ -919,3 +1041,271 @@ def test_apply_row_raises_for_an_unknown_task():
 
     with pytest.raises(ValueError, match="No such task"):
         TimeRecord.apply_row(row)
+
+
+def test_report_create_starts_numbering_at_1():
+    mou = MoU.objects.create(name="nlnet-2026")
+
+    report = Report.create(mou)
+
+    assert report.id == "nlnet-2026-1"
+    assert report.mou == mou
+
+
+def test_report_create_increments_per_mou():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Report.create(mou)
+
+    second = Report.create(mou)
+
+    assert second.id == "nlnet-2026-2"
+
+
+def test_report_create_numbers_are_independent_per_mou():
+    mou_a = MoU.objects.create(name="mou-a")
+    mou_b = MoU.objects.create(name="mou-b")
+    Report.create(mou_a)
+
+    first_for_b = Report.create(mou_b)
+
+    assert first_for_b.id == "mou-b-1"
+
+
+def test_report_create_continues_numbering_after_the_mou_is_removed():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Report.create(mou)
+    mou.delete()
+
+    # A newly (re)created MoU with the same name must not reuse report ids
+    # of the removed one's history.
+    new_mou = MoU.objects.create(name="nlnet-2026")
+    report = Report.create(new_mou)
+
+    assert report.id == "nlnet-2026-2"
+
+
+def test_report_add_time_record_attaches_a_record_of_the_same_mou():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    report = Report.create(mou)
+
+    report.add_time_record(record)
+
+    record.refresh_from_db()
+    assert record.report == report
+
+
+def test_report_add_time_record_rejects_a_record_of_a_different_mou():
+    mou_a = MoU.objects.create(name="mou-a")
+    mou_b = MoU.objects.create(name="mou-b")
+    task_b = Task.objects.create(mou=mou_b, name="10a")
+    link = Link.objects.create(task=task_b, url="https://example.com/issues/1")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    report = Report.create(mou_a)
+
+    with pytest.raises(ValueError, match="does not belong to MoU"):
+        report.add_time_record(record)
+
+    record.refresh_from_db()
+    assert record.report is None
+
+
+def test_report_add_time_record_rejects_a_record_without_a_task():
+    mou = MoU.objects.create(name="nlnet-2026")
+    record = TimeRecord.objects.create(start_time=datetime(2026, 9, 4, 9, 0))
+    report = Report.create(mou)
+
+    with pytest.raises(ValueError, match="does not belong to MoU"):
+        report.add_time_record(record)
+
+
+def test_report_remove_time_record_detaches_it():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    report = Report.create(mou)
+    report.add_time_record(record)
+
+    report.remove_time_record(record)
+
+    record.refresh_from_db()
+    assert record.report is None
+
+
+def test_report_remove_time_record_rejects_a_record_from_another_report():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    other_report = Report.create(mou)
+
+    with pytest.raises(ValueError, match="is not part of report"):
+        other_report.remove_time_record(record)
+
+
+def test_report_str_is_its_id():
+    mou = MoU.objects.create(name="nlnet-2026")
+    report = Report.create(mou)
+
+    assert str(report) == "nlnet-2026-1"
+
+
+def test_report_generate_report_groups_by_task_and_totals(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    issue_link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    other_link = Link.objects.create(task=task, url="https://example.com/docs/design")
+    now = timezone.now()
+    for link in (issue_link, other_link):
+        TimeRecord.objects.create(
+            link=link, start_time=now - timedelta(minutes=30), end_time=now
+        )
+    report = Report.create(mou)
+    for record in TimeRecord.objects.all():
+        report.add_time_record(record)
+
+    text = report.generate_report()
+
+    assert f"Report: {report.id}" in text
+    assert "MoU: nlnet-2026" in text
+    assert "10a: 20€" in text
+    assert "Issues:" in text
+    assert "- https://github.com/nlnet/rfp-recorder/issues/1" in text
+    assert "Links:" in text
+    assert "- https://example.com/docs/design" in text
+    assert "Total: 20€" in text
+    assert "Excluded Pull Requests" not in text
+
+
+def test_format_excluded_links_groups_by_task():
+    task_a = Task.objects.create(name="10a")
+    task_b = Task.objects.create(name="10b")
+    link_a1 = Link.objects.create(
+        task=task_a, url="https://github.com/nlnet/rfp-recorder/pull/1"
+    )
+    link_a2 = Link.objects.create(
+        task=task_a, url="https://github.com/nlnet/rfp-recorder/pull/2"
+    )
+    link_b1 = Link.objects.create(
+        task=task_b, url="https://github.com/nlnet/rfp-recorder/pull/3"
+    )
+
+    text = Report.format_excluded_links([link_a1, link_a2, link_b1])
+
+    assert text == (
+        "Excluded Pull Requests (not merged):\n"
+        "  10a:\n"
+        "    - https://github.com/nlnet/rfp-recorder/pull/1\n"
+        "    - https://github.com/nlnet/rfp-recorder/pull/2\n"
+        "  10b:\n"
+        "    - https://github.com/nlnet/rfp-recorder/pull/3"
+    )
+
+
+def test_report_add_unreported_time_records_excludes_open_pull_requests(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    closed_link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/pull/1"
+    )
+    open_link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/pull/2"
+    )
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=closed_link, start_time=now - timedelta(minutes=30), end_time=now
+    )
+    TimeRecord.objects.create(
+        link=open_link, start_time=now - timedelta(minutes=30), end_time=now
+    )
+
+    def fake_status(url, **kwargs):
+        response = MagicMock(status_code=200)
+        state = "closed" if url.endswith("/pulls/1") else "open"
+        response.json = MagicMock(return_value={"state": state})
+        return response
+
+    session = MagicMock()
+    session.get = AsyncMock(side_effect=fake_status)
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("nlnet_rfp_recorder.github.niquests.AsyncSession", return_value=session):
+        report = Report.create(mou)
+        excluded_links = report.add_unreported_time_records()
+        text = report.generate_report()
+
+    assert excluded_links == [open_link]
+    # only the closed PR's time is billed and shown; the open one is excluded
+    assert "10a: 10€" in text
+    assert "Pull Requests:" in text
+    assert "- https://github.com/nlnet/rfp-recorder/pull/1" in text
+    assert "Excluded Pull Requests" not in text
+    assert "- https://github.com/nlnet/rfp-recorder/pull/2" not in text
+
+
+def test_report_generate_report_only_includes_its_own_records():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link_a = Link.objects.create(task=task, url="https://example.com/a")
+    link_b = Link.objects.create(task=task, url="https://example.com/b")
+    now = timezone.now()
+    record_a = TimeRecord.objects.create(
+        link=link_a, start_time=now - timedelta(minutes=10), end_time=now
+    )
+    TimeRecord.objects.create(
+        link=link_b, start_time=now - timedelta(minutes=10), end_time=now
+    )
+    report = Report.create(mou)
+    report.add_time_record(record_a)
+
+    text = report.generate_report()
+
+    assert "https://example.com/a" in text
+    assert "https://example.com/b" not in text
+
+
+def test_report_total_budget_is_zero_without_rfp_euros(settings):
+    settings.RFP_EUROS = None
+    mou = MoU.objects.create(name="nlnet-2026")
+    report = Report.create(mou)
+
+    assert report.total_budget == 0.0
+
+
+def test_report_total_budget_sums_its_own_records(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/a")
+    now = timezone.now()
+    record = TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+    report = Report.create(mou)
+    report.add_time_record(record)
+
+    assert report.total_budget == 20.0

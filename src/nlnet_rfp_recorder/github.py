@@ -9,6 +9,7 @@ from typing import ClassVar
 import niquests
 
 GITHUB_API = "https://api.github.com"
+TIMEOUT_SECONDS = 10
 
 ISSUE_URL = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>\d+)/?$"
@@ -22,6 +23,46 @@ class Status(StrEnum):
     OPEN = "open"
     CLOSED = "closed"
     NONEXISTENT = "nonexistent"
+
+
+def _detail_from_response(response: niquests.Response) -> str | None:
+    """Extract GitHub's own explanation from an error response body, if any."""
+    try:
+        return response.json().get("message")
+    except Exception:
+        return None
+
+
+async def _detail_from_response_async(response: niquests.Response) -> str | None:
+    try:
+        data = response.json()
+        if inspect.isawaitable(data):
+            data = await data
+        return data.get("message")
+    except Exception:
+        return None
+
+
+def _github_error(
+    response: niquests.Response, url: str, detail: str | None
+) -> Exception:
+    suffix = f": {detail}" if detail else ""
+    return niquests.exceptions.HTTPError(
+        f"GitHub rejected the request for {url} ({response.status_code}){suffix}"
+    )
+
+
+def fetch_authenticated_login(token: str) -> str | None:
+    """Return the GitHub login `token` authenticates as, or None if rejected."""
+    response = niquests.get(
+        f"{GITHUB_API}/user",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=TIMEOUT_SECONDS,
+    )
+    if response.status_code == 401:
+        return None
+    response.raise_for_status()
+    return response.json()["login"]
 
 
 @dataclass
@@ -40,10 +81,15 @@ class GitHubReference:
     @property
     def current_status(self) -> Status:
         path = f"repos/{self.owner}/{self.repo}/{self._api_resource}/{self.number}"
-        response = niquests.get(f"{GITHUB_API}/{path}")
+        response = niquests.get(f"{GITHUB_API}/{path}", timeout=TIMEOUT_SECONDS)
         if response.status_code == 404:
             return Status.NONEXISTENT
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except niquests.exceptions.HTTPError as error:
+            raise _github_error(
+                response, self.url, _detail_from_response(response)
+            ) from error
         return Status(response.json()["state"])
 
     async def current_status_async(
@@ -51,10 +97,17 @@ class GitHubReference:
     ) -> Status:
         path = f"repos/{self.owner}/{self.repo}/{self._api_resource}/{self.number}"
         headers = {"Authorization": f"Bearer {token}"} if token else None
-        response = await session.get(f"{GITHUB_API}/{path}", headers=headers)
+        response = await session.get(
+            f"{GITHUB_API}/{path}", headers=headers, timeout=TIMEOUT_SECONDS
+        )
         if response.status_code == 404:
             return Status.NONEXISTENT
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except niquests.exceptions.HTTPError as error:
+            raise _github_error(
+                response, self.url, await _detail_from_response_async(response)
+            ) from error
         data = response.json()
         if inspect.isawaitable(data):
             data = await data
@@ -94,14 +147,26 @@ class PullRequest(GitHubReference):
 async def fetch_statuses_async(
     references: Iterable[GitHubReference], token: str | None = None
 ) -> list[Status]:
-    """Fetch current_status for every reference concurrently, one session."""
+    """Fetch current_status for every reference concurrently, one session.
+
+    Uses return_exceptions=True so a single failing request doesn't leave
+    its siblings orphaned mid-flight when gather re-raises early - closing
+    the session out from under still-running requests deadlocks instead of
+    raising. The first exception (if any) is re-raised once every request
+    has actually finished.
+    """
     async with niquests.AsyncSession() as session:
-        return await asyncio.gather(
+        results = await asyncio.gather(
             *(
                 reference.current_status_async(session, token)
                 for reference in references
-            )
+            ),
+            return_exceptions=True,
         )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
 
 
 def fetch_statuses(

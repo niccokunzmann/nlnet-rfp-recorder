@@ -16,7 +16,7 @@ from nlnet_rfp_recorder.budget import format_duration_hours
 from nlnet_rfp_recorder.timesheet import TimesheetRow, parse_hhmmss
 
 if TYPE_CHECKING:
-    from nlnet_rfp_recorder.timetracking.models import Link, MoU, Task, TimeRecord
+    from nlnet_rfp_recorder.timetracking.models import MoU, Task, TimeRecord
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "nlnet_rfp_recorder.settings")
 
@@ -84,10 +84,6 @@ def _echo_stopped(record: TimeRecord) -> None:
     duration = _format_duration(record.duration)
     url = record.link.url if record.link else ""
     typer.echo(f"Stopped {_task_name(record)} {duration} {url}")
-
-
-def _round10(amount: float) -> int:
-    return round(amount / 10) * 10
 
 
 def _echo_task_status(task: Task) -> None:
@@ -179,17 +175,18 @@ def _complete_backup_name(incomplete: str) -> list[str]:
         return []
 
 
-def _format_link(link: Link) -> str:
-    if link.is_issue:
-        url = link.issue.url
-    elif link.is_pr:
-        url = link.pr.url
-    else:
-        url = link.url
-    extra_tags = [tag.name for tag in link.tags.all() if tag.name != "implementation"]
-    if extra_tags:
-        return f"{url} ({', '.join(extra_tags)})"
-    return url
+def _complete_report_id(incomplete: str) -> list[str]:
+    try:
+        django.setup()
+        from nlnet_rfp_recorder.timetracking.models import Report
+
+        return list(
+            Report.objects.filter(pk__startswith=incomplete).values_list(
+                "pk", flat=True
+            )
+        )
+    except Exception:
+        return []
 
 
 @app.callback()
@@ -237,10 +234,24 @@ def token(
         typer.echo(TOKEN_HELP)
         return
 
+    import niquests
+
+    from nlnet_rfp_recorder.github import fetch_authenticated_login
     from nlnet_rfp_recorder.timetracking.models import GitHubToken
 
+    try:
+        login = fetch_authenticated_login(value)
+    except niquests.exceptions.RequestException as error:
+        _fail(f"Could not verify the GitHub token: {error}")
+
+    if login is None:
+        _fail(
+            "GitHub rejected this token (401 Unauthorized). "
+            "Check that you copied it correctly."
+        )
+
     GitHubToken.set(value)
-    typer.echo("Saved GitHub token.")
+    typer.echo(f"Saved GitHub token for {login}.")
 
 
 mou_app = typer.Typer(help="Manage MoUs.", no_args_is_help=True, cls=AlphabeticalGroup)
@@ -619,7 +630,7 @@ def timesheet_import(
 
     for row in rows:
         try:
-            TimeRecord.apply_row(row)
+            TimeRecord.apply_row(row, allow_create_with_pk=True)
         except ValueError as error:
             _fail(str(error))
 
@@ -795,13 +806,29 @@ def stop(
     _echo_stopped(record)
 
 
-@app.command()
-def report(db: Path | None = DbOption, test: bool = TestOption) -> None:
-    """Print a budget report grouped by task."""
+report_app = typer.Typer(
+    help="Generate and manage reports.", no_args_is_help=True, cls=AlphabeticalGroup
+)
+app.add_typer(report_app, name="report")
+
+
+@report_app.callback()
+def report_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Generate and manage reports."""
+    if test:
+        db = TEST_DB_FILE
+    if db is not None:
+        os.environ["RFP_DB"] = str(db)
+
+
+@report_app.command("create")
+def report_create(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Generate and persist a budget report grouped by task."""
     _setup(db, test)
+    import niquests
     from django.conf import settings
 
-    from nlnet_rfp_recorder.timetracking.models import MoU, Task, TimeRecord
+    from nlnet_rfp_recorder.timetracking.models import MoU, Report, TimeRecord
 
     if settings.RFP_EUROS is None:
         _fail("RFP_EUROS is not set.")
@@ -818,34 +845,160 @@ def report(db: Path | None = DbOption, test: bool = TestOption) -> None:
             "Stop it first (`rfp stop`) to get an accurate report."
         )
 
-    typer.echo(f"MoU: {mou.name}")
-    total = 0.0
-    for task in Task.objects.filter(mou=mou):
-        budget = task.budget or 0.0
-        total += budget
-        typer.echo(f"{task.name}: {_round10(budget)}€")
+    generated = Report.create(mou)
+    try:
+        excluded_links = generated.add_unreported_time_records()
+    except niquests.exceptions.RequestException as error:
+        generated.delete()
+        _fail(f"Could not check GitHub PR status: {error}")
 
-        links = task.billable_links
-        issue_links = [link for link in links if link.is_issue]
-        pr_links = [link for link in links if link.is_pr]
-        other_links = [link for link in links if not link.is_issue and not link.is_pr]
+    if not generated.time_records.exists():
+        generated.delete()
+        _fail(f"No unreported time records for MoU {mou.name}. Nothing to report.")
 
-        if issue_links:
-            typer.echo("  Issues:")
-            for link in issue_links:
-                typer.echo(f"    - {_format_link(link)}")
+    message = (
+        "The report was generated. Run this to view the report:\n\n"
+        f"rfp report print {generated.id}"
+    )
+    excluded_section = Report.format_excluded_links(excluded_links)
+    if excluded_section:
+        message += f"\n\n{excluded_section}"
+    typer.echo(message)
 
-        if pr_links:
-            typer.echo("  Pull Requests:")
-            for link in pr_links:
-                typer.echo(f"    - {_format_link(link)}")
 
-        if other_links:
-            typer.echo("  Links:")
-            for link in other_links:
-                typer.echo(f"    - {_format_link(link)}")
+@report_app.command("print")
+def report_print(
+    report_id: str | None = typer.Argument(None, autocompletion=_complete_report_id),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Print a report by id, or a preview of currently unreported entries."""
+    _setup(db, test)
+    import niquests
 
-    typer.echo(f"Total: {_round10(total)}€")
+    from nlnet_rfp_recorder.timetracking.models import MoU, Report
+
+    if report_id is not None:
+        try:
+            report = Report.objects.get(pk=report_id)
+        except Report.DoesNotExist:
+            _fail(f"No such report: {report_id}")
+        typer.echo(report.generate_report())
+        return
+
+    mou = MoU.get_selected()
+    if mou is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+
+    try:
+        typer.echo(Report.preview(mou))
+    except niquests.exceptions.RequestException as error:
+        _fail(f"Could not check GitHub PR status: {error}")
+
+
+@report_app.command("list")
+def report_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """List reports for the selected MoU: id, creation date, budget used."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import MoU, Report
+
+    mou = MoU.get_selected()
+    if mou is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+
+    reports = Report.objects.filter(mou=mou).order_by("created")
+    if not reports:
+        typer.echo("No reports yet. Run `rfp report create` first.")
+        return
+
+    for report in reports:
+        date = report.created.date().isoformat()
+        budget = round(report.total_budget / 10) * 10
+        typer.echo(f"{report.id} {date} {budget}€")
+
+
+@report_app.command("remove")
+def report_remove(
+    report_id: str = typer.Argument(..., autocompletion=_complete_report_id),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Remove a report."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Report
+
+    deleted, _ = Report.objects.filter(pk=report_id).delete()
+    if deleted == 0:
+        _fail(f"No such report: {report_id}")
+    typer.echo(f"Removed report: {report_id}")
+
+
+@report_app.command("export")
+def report_export(
+    report_id: str = typer.Argument(..., autocompletion=_complete_report_id),
+    path: Path | None = typer.Argument(
+        None,
+        help="Output file listing time record pks, one per line. Omit for stdout.",
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Export a report's time record pks, to edit which records belong to it."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Report
+
+    try:
+        report = Report.objects.get(pk=report_id)
+    except Report.DoesNotExist:
+        _fail(f"No such report: {report_id}")
+
+    pks = list(report.time_records.order_by("pk").values_list("pk", flat=True))
+    text = "".join(f"{pk}\n" for pk in pks)
+    if path is None:
+        typer.echo(text, nl=False)
+    else:
+        path.write_text(text)
+        typer.echo(f"Exported {len(pks)} time record pks to {path}")
+
+
+@report_app.command("import")
+def report_import(
+    report_id: str = typer.Argument(..., autocompletion=_complete_report_id),
+    path: Path = typer.Argument(..., exists=True, dir_okay=False),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Replace a report's time records from a file of pks, one per line."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Report, TimeRecord
+
+    try:
+        report = Report.objects.get(pk=report_id)
+    except Report.DoesNotExist:
+        _fail(f"No such report: {report_id}")
+
+    lines = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    try:
+        wanted_pks = {int(line) for line in lines}
+    except ValueError:
+        _fail(f"Invalid pk in {path}; expected one integer per line.")
+
+    current_pks = set(report.time_records.values_list("pk", flat=True))
+
+    for pk in current_pks - wanted_pks:
+        report.remove_time_record(TimeRecord.objects.get(pk=pk))
+
+    for pk in wanted_pks - current_pks:
+        try:
+            record = TimeRecord.objects.get(pk=pk)
+        except TimeRecord.DoesNotExist:
+            _fail(f"No such time record: {pk}")
+        try:
+            report.add_time_record(record)
+        except ValueError as error:
+            _fail(str(error))
+
+    typer.echo(f"Report {report_id} now has {len(wanted_pks)} time records.")
 
 
 @app.command()

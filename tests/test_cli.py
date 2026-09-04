@@ -1,15 +1,18 @@
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import niquests
 import pytest
 from django.utils import timezone
 from typer.testing import CliRunner
 
 from nlnet_rfp_recorder.cli import app
+from nlnet_rfp_recorder.github import TIMEOUT_SECONDS, Status
 from nlnet_rfp_recorder.timetracking.models import (
     GitHubToken,
     Link,
     MoU,
+    Report,
     Task,
     TimeRecord,
 )
@@ -19,6 +22,22 @@ def _mock_github_session(state: str = "closed"):
     """A mock niquests.AsyncSession() context manager returning `state`."""
     response = MagicMock(status_code=200)
     response.json = MagicMock(return_value={"state": state})
+    session = MagicMock()
+    session.get = AsyncMock(return_value=response)
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    return patch(
+        "nlnet_rfp_recorder.github.niquests.AsyncSession", return_value=session
+    )
+
+
+def _mock_github_error_session(message: str = "the organization forbids this token"):
+    """A mock niquests.AsyncSession() context manager whose requests fail with 403."""
+    response = MagicMock(status_code=403)
+    response.raise_for_status = MagicMock(
+        side_effect=niquests.exceptions.HTTPError("403 Client Error: Forbidden")
+    )
+    response.json = MagicMock(return_value={"message": message})
     session = MagicMock()
     session.get = AsyncMock(return_value=response)
     session.__aenter__ = AsyncMock(return_value=session)
@@ -448,6 +467,23 @@ def test_timesheet_import_creates_entries_from_csv(tmp_path):
     assert record.link.url == "https://example.com/issues/1"
 
 
+def test_timesheet_import_creates_entries_with_an_explicit_new_pk(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    path = tmp_path / "timesheet.csv"
+    path.write_text(
+        "pk,mou,task,start,duration,link,tags\n"
+        "1000,nlnet-2026,10a,2026-09-04T09:00:00,01:00:00,"
+        "https://example.com/issues/1,implementation\n"
+    )
+
+    result = _invoke_timesheet_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get(pk=1000)
+    assert record.link.url == "https://example.com/issues/1"
+
+
 def test_timesheet_import_prompts_to_delete_missing_entries_and_deletes_on_yes(
     tmp_path,
 ):
@@ -628,7 +664,7 @@ def test_mou_add_rejects_a_name_with_spaces():
 def test_report_fails_without_rfp_euros(settings):
     settings.RFP_EUROS = None
 
-    result = runner.invoke(app, ["report"])
+    result = runner.invoke(app, ["report", "create"])
 
     assert result.exit_code != 0
 
@@ -636,7 +672,7 @@ def test_report_fails_without_rfp_euros(settings):
 def test_report_fails_without_a_selected_mou(settings):
     settings.RFP_EUROS = 20.0
 
-    result = runner.invoke(app, ["report"])
+    result = runner.invoke(app, ["report", "create"])
 
     assert result.exit_code != 0
     assert "No MoU selected" in result.output
@@ -661,7 +697,8 @@ def test_report_only_includes_tasks_from_the_selected_mou(settings):
         end_time=timezone.now(),
     )
 
-    result = runner.invoke(app, ["report"])
+    runner.invoke(app, ["report", "create"])
+    result = runner.invoke(app, ["report", "print", "nlnet-2026-1"])
 
     assert result.exit_code == 0, result.output
     assert "MoU: nlnet-2026" in result.output
@@ -691,7 +728,8 @@ def test_report_prints_budget_issues_and_pull_requests(settings):
         )
 
     with _mock_github_session("closed"):
-        result = runner.invoke(app, ["report"])
+        runner.invoke(app, ["report", "create"])
+        result = runner.invoke(app, ["report", "print", "nlnet-2026-1"])
 
     assert result.exit_code == 0, result.output
     assert "10a: 20€" in result.output
@@ -723,15 +761,106 @@ def test_report_includes_open_issues_but_excludes_open_prs(settings):
         )
 
     with _mock_github_session("open"):
-        result = runner.invoke(app, ["report"])
+        create_result = runner.invoke(app, ["report", "create"])
+        result = runner.invoke(app, ["report", "print", "nlnet-2026-1"])
 
     assert result.exit_code == 0, result.output
     assert "Issues:" in result.output
     assert "- https://github.com/nlnet/rfp-recorder/issues/1" in result.output
     assert "Pull Requests:" not in result.output
-    assert "- https://github.com/nlnet/rfp-recorder/pull/2" not in result.output
     # only the issue's 20 minutes count, not the open PR's
     assert "10a: 10€" in result.output
+    # the open PR isn't shown when printing the persisted report - that
+    # info was only ever surfaced once, at create time (never re-checked)
+    assert "Excluded Pull Requests" not in result.output
+    assert "Excluded Pull Requests (not merged):" in create_result.output
+    assert "- https://github.com/nlnet/rfp-recorder/pull/2" in create_result.output
+
+
+def test_report_create_fails_cleanly_when_github_rejects_a_status_check(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/collective/icalendar/pull/1559"
+    )
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(minutes=20), end_time=now
+    )
+
+    with _mock_github_error_session():
+        result = runner.invoke(app, ["report", "create"])
+
+    assert result.exit_code != 0
+    assert "Could not check GitHub PR status" in result.output
+    assert "the organization forbids this token" in result.output
+    # the report created before the failing status check must be rolled back
+    assert Report.objects.count() == 0
+
+
+def test_report_print_preview_fails_cleanly_when_github_rejects_a_status_check(
+    settings,
+):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/collective/icalendar/pull/1559"
+    )
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(minutes=20), end_time=now
+    )
+
+    with _mock_github_error_session():
+        result = runner.invoke(app, ["report", "print"])
+
+    assert result.exit_code != 0
+    assert "Could not check GitHub PR status" in result.output
+    assert "the organization forbids this token" in result.output
+
+
+def test_report_create_and_print_fetch_statuses_once_for_many_tasks(settings):
+    # Report.create batches every task's PR status check into a single
+    # GitHub round trip, and generate_report (used by `report print`) never
+    # hits the network at all - so across many tasks and PRs, the whole
+    # create+print flow should call fetch_statuses_async exactly once.
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    now = timezone.now()
+    for task_index in range(3):
+        task = Task.objects.create(mou=mou, name=f"task-{task_index}")
+        for pr_index in range(4):
+            link = Link.objects.create(
+                task=task,
+                url=(
+                    "https://github.com/nlnet/rfp-recorder/pull/"
+                    f"{task_index * 10 + pr_index}"
+                ),
+            )
+            TimeRecord.objects.create(
+                link=link,
+                start_time=now - timedelta(minutes=30),
+                end_time=now,
+            )
+
+    async def fake_fetch_statuses_async(references, token=None):
+        return [Status.CLOSED for _ in references]
+
+    with patch(
+        "nlnet_rfp_recorder.github.fetch_statuses_async",
+        AsyncMock(side_effect=fake_fetch_statuses_async),
+    ) as mock_fetch:
+        create_result = runner.invoke(app, ["report", "create"])
+        result = runner.invoke(app, ["report", "print", "nlnet-2026-1"])
+
+    assert create_result.exit_code == 0, create_result.output
+    assert result.exit_code == 0, result.output
+    assert mock_fetch.call_count == 1
+    for task_index in range(3):
+        assert f"task-{task_index}: 40€" in result.output
+    assert "Total: 120€" in result.output
 
 
 def test_report_fails_while_something_is_running(settings):
@@ -741,7 +870,7 @@ def test_report_fails_while_something_is_running(settings):
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     TimeRecord.objects.create(link=link, start_time=timezone.now())
 
-    result = runner.invoke(app, ["report"])
+    result = runner.invoke(app, ["report", "create"])
 
     assert result.exit_code != 0
     assert "https://example.com/issues/1" in result.output
@@ -760,10 +889,331 @@ def test_report_shows_review_tag_suffix(settings):
         end_time=timezone.now(),
     )
 
-    result = runner.invoke(app, ["report"])
+    runner.invoke(app, ["report", "create"])
+    result = runner.invoke(app, ["report", "print", "nlnet-2026-1"])
 
     assert result.exit_code == 0, result.output
     assert "- https://example.com/docs/design (review)" in result.output
+
+
+def test_report_create_persists_a_report(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+
+    result = runner.invoke(app, ["report", "create"])
+
+    assert result.exit_code == 0, result.output
+    report = Report.objects.get()
+    assert report.id == "nlnet-2026-1"
+    assert f"rfp report print {report.id}" in result.output
+
+
+def test_report_create_twice_fails_the_second_time_with_nothing_new(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+
+    result = runner.invoke(app, ["report", "create"])
+
+    assert result.exit_code != 0
+    assert "Nothing to report" in result.output
+    # the empty second report must not be left behind
+    assert not Report.objects.filter(id="nlnet-2026-2").exists()
+
+
+def test_report_create_fails_with_no_time_records(settings):
+    settings.RFP_EUROS = 20.0
+    MoU.objects.create(name="nlnet-2026", selected=True)
+
+    result = runner.invoke(app, ["report", "create"])
+
+    assert result.exit_code != 0
+    assert "Nothing to report" in result.output
+    assert Report.objects.count() == 0
+
+
+def test_report_remove_deletes_it(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+
+    result = runner.invoke(app, ["report", "remove", "nlnet-2026-1"])
+
+    assert result.exit_code == 0, result.output
+    assert Report.objects.count() == 0
+
+
+def test_report_print_with_an_explicit_id(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+
+    result = runner.invoke(app, ["report", "print", "nlnet-2026-1"])
+
+    assert result.exit_code == 0, result.output
+    assert "Report: nlnet-2026-1" in result.output
+    assert "10a" in result.output
+
+
+def test_report_print_without_an_id_previews_unreported_entries(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link_a = Link.objects.create(task=task, url="https://example.com/a")
+    TimeRecord.objects.create(
+        link=link_a,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+    link_b = Link.objects.create(task=task, url="https://example.com/b")
+    TimeRecord.objects.create(
+        link=link_b,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+
+    result = runner.invoke(app, ["report", "print"])
+
+    assert result.exit_code == 0, result.output
+    assert "Report: (unreported)" in result.output
+    assert "https://example.com/b" in result.output
+    assert "https://example.com/a" not in result.output
+    assert Report.objects.filter(id__startswith="nlnet-2026").count() == 1
+
+
+def test_report_print_without_an_id_is_empty_with_nothing_unreported(settings):
+    settings.RFP_EUROS = 20.0
+    MoU.objects.create(name="nlnet-2026", selected=True)
+
+    result = runner.invoke(app, ["report", "print"])
+
+    assert result.exit_code == 0, result.output
+    assert "Report: (unreported)" in result.output
+    assert "Total: 0€" in result.output
+
+
+def test_report_print_without_an_id_fails_without_a_selected_mou():
+    result = runner.invoke(app, ["report", "print"])
+
+    assert result.exit_code != 0
+    assert "No MoU selected" in result.output
+
+
+def test_report_print_fails_for_an_unknown_id():
+    result = runner.invoke(app, ["report", "print", "does-not-exist"])
+
+    assert result.exit_code != 0
+    assert "No such report" in result.output
+
+
+def test_report_list_shows_id_date_and_budget_used(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(hours=1),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+    report = Report.objects.get()
+    today = report.created.date().isoformat()
+
+    result = runner.invoke(app, ["report", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert f"{report.id} {today} 20€" in result.output
+
+
+def test_report_list_only_includes_the_selected_mous_reports(settings):
+    settings.RFP_EUROS = 20.0
+    mou_a = MoU.objects.create(name="mou-a", selected=False)
+    task_a = Task.objects.create(mou=mou_a, name="10a")
+    link_a = Link.objects.create(task=task_a, url="https://example.com/a")
+    TimeRecord.objects.create(
+        link=link_a,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    Report.create(mou_a).add_unreported_time_records()
+
+    mou_b = MoU.objects.create(name="mou-b", selected=True)
+    task_b = Task.objects.create(mou=mou_b, name="20b")
+    link_b = Link.objects.create(task=task_b, url="https://example.com/b")
+    TimeRecord.objects.create(
+        link=link_b,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+
+    result = runner.invoke(app, ["report", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "mou-a-1" not in result.output
+    assert "mou-b-1" in result.output
+
+
+def test_report_list_fails_without_a_selected_mou():
+    result = runner.invoke(app, ["report", "list"])
+
+    assert result.exit_code != 0
+    assert "No MoU selected" in result.output
+
+
+def test_report_list_reports_when_there_are_none():
+    MoU.objects.create(name="nlnet-2026", selected=True)
+
+    result = runner.invoke(app, ["report", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "No reports" in result.output
+
+
+def test_report_remove_fails_for_an_unknown_report():
+    result = runner.invoke(app, ["report", "remove", "does-not-exist"])
+
+    assert result.exit_code != 0
+
+
+def test_report_remove_orphans_but_keeps_its_time_records(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+    record = TimeRecord.objects.get()
+    assert record.report_id == "nlnet-2026-1"
+
+    runner.invoke(app, ["report", "remove", "nlnet-2026-1"])
+
+    record.refresh_from_db()
+    assert record.report_id is None
+
+
+def test_report_export_lists_time_record_pks(tmp_path, settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+    record = TimeRecord.objects.get()
+    path = tmp_path / "report.txt"
+
+    result = runner.invoke(app, ["report", "export", "nlnet-2026-1", str(path)])
+
+    assert result.exit_code == 0, result.output
+    assert path.read_text() == f"{record.pk}\n"
+
+
+def test_report_export_fails_for_an_unknown_report():
+    result = runner.invoke(app, ["report", "export", "does-not-exist"])
+
+    assert result.exit_code != 0
+
+
+def test_report_import_removes_a_pk_not_in_the_file(tmp_path, settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+    record = TimeRecord.objects.get()
+    path = tmp_path / "report.txt"
+    path.write_text("")
+
+    result = runner.invoke(app, ["report", "import", "nlnet-2026-1", str(path)])
+
+    assert result.exit_code == 0, result.output
+    record.refresh_from_db()
+    assert record.report_id is None
+
+
+def test_report_import_adds_a_pk_from_the_file(tmp_path, settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    report = Report.create(mou)
+    path = tmp_path / "report.txt"
+    path.write_text(f"{record.pk}\n")
+
+    result = runner.invoke(app, ["report", "import", report.id, str(path)])
+
+    assert result.exit_code == 0, result.output
+    record.refresh_from_db()
+    assert record.report_id == report.id
+
+
+def test_report_import_fails_for_a_pk_of_a_different_mou(tmp_path, settings):
+    settings.RFP_EUROS = 20.0
+    mou_a = MoU.objects.create(name="mou-a")
+    mou_b = MoU.objects.create(name="mou-b", selected=True)
+    task_b = Task.objects.create(mou=mou_b, name="10a")
+    link = Link.objects.create(task=task_b, url="https://example.com/issues/1")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    report_a = Report.create(mou_a)
+    path = tmp_path / "report.txt"
+    path.write_text(f"{record.pk}\n")
+
+    result = runner.invoke(app, ["report", "import", report_a.id, str(path)])
+
+    assert result.exit_code != 0
+    assert "does not belong to MoU" in result.output
 
 
 def test_mou_add_selects_a_mou():
@@ -1008,10 +1458,43 @@ def test_token_without_args_prints_instructions_and_saves_nothing():
 
 
 def test_token_with_a_value_saves_it():
-    result = runner.invoke(app, ["token", "secret"])
+    response = MagicMock(status_code=200)
+    response.json = MagicMock(return_value={"login": "octocat"})
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response) as get:
+        result = runner.invoke(app, ["token", "secret"])
 
     assert result.exit_code == 0, result.output
+    assert "Saved GitHub token for octocat." in result.output
     assert GitHubToken.get() == "secret"
+    get.assert_called_once_with(
+        "https://api.github.com/user",
+        headers={"Authorization": "Bearer secret"},
+        timeout=TIMEOUT_SECONDS,
+    )
+
+
+def test_token_rejects_a_token_github_does_not_recognize():
+    response = MagicMock(status_code=401)
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response):
+        result = runner.invoke(app, ["token", "bad-token"])
+
+    assert result.exit_code != 0
+    assert "401" in result.output
+    assert GitHubToken.objects.count() == 0
+
+
+def test_token_fails_when_github_is_unreachable():
+    with patch(
+        "nlnet_rfp_recorder.github.niquests.get",
+        side_effect=niquests.exceptions.ConnectionError("boom"),
+    ):
+        result = runner.invoke(app, ["token", "secret"])
+
+    assert result.exit_code != 0
+    assert "Could not verify the GitHub token" in result.output
+    assert GitHubToken.objects.count() == 0
 
 
 def test_complete_mou_name_matches_by_prefix():
@@ -1138,6 +1621,15 @@ def test_timesheet_help_lists_subcommands_alphabetically():
 
     assert result.exit_code == 0, result.output
     names = ["edit", "export", "import", "remove", "show"]
+    positions = [result.output.index(f"│ {name} ") for name in names]
+    assert positions == sorted(positions)
+
+
+def test_report_help_lists_subcommands_alphabetically():
+    result = runner.invoke(app, ["report", "--help"])
+
+    assert result.exit_code == 0, result.output
+    names = ["create", "export", "import", "list", "print", "remove"]
     positions = [result.output.index(f"│ {name} ") for name in names]
     assert positions == sorted(positions)
 
