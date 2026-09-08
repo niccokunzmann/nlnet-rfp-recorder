@@ -5,12 +5,20 @@ from datetime import datetime, timedelta
 from functools import cached_property
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
 from django.db import models
 from django.utils import timezone
 
 from nlnet_rfp_recorder.budget import BudgetLine
-from nlnet_rfp_recorder.github import Issue, PullRequest, Status, fetch_statuses
+from nlnet_rfp_recorder.github import (
+    Issue,
+    PullRequest,
+    Status,
+    classify_issue_or_pr,
+    fetch_statuses,
+    parse_repo_url,
+)
 from nlnet_rfp_recorder.mou_budget import parse_milestone_budgets
 from nlnet_rfp_recorder.timesheet import TimesheetRow, format_hhmmss, parse_hhmmss
 from nlnet_rfp_recorder.warnings import TaskWarning
@@ -115,6 +123,13 @@ class MoU(models.Model):
         if total is None:
             return None
         return BudgetLine(used=self.total_used, total=total, rate=settings.RFP_EUROS)
+
+    @property
+    def display_name(self) -> str:
+        """This MoU's name, with its alias appended in parens if it has one."""
+        aliases = Alias.objects.filter(item_type="mou", target=self.name)
+        alias = aliases.order_by("pk").first()
+        return f"{self.name} ({alias.alias})" if alias else self.name
 
     def __str__(self) -> str:
         return self.name
@@ -261,8 +276,148 @@ class Task(models.Model):
             return NotImplemented
         return self.sort_key < other.sort_key
 
+    @property
+    def display_name(self) -> str:
+        """This task's name, with its alias appended in parens if it has one."""
+        aliases = Alias.objects.filter(item_type="task", mou=self.mou, target=self.name)
+        alias = aliases.order_by("pk").first()
+        return f"{self.name} ({alias.alias})" if alias else self.name
+
     def __str__(self) -> str:
         return self.name
+
+
+ALIAS_ITEM_TYPES = ("mou", "task", "url")
+
+alias_validator = RegexValidator(
+    regex=r"^\S+$",
+    message="Alias must not contain spaces.",
+)
+
+
+class Alias(models.Model):
+    """A short nickname for a MoU name, a task code, or a repo base URL.
+
+    Deliberately has no DB-level uniqueness constraint: `mou` is only set
+    for item_type="task" (scoping the alias to the MoU it was created
+    under), and SQL treats every NULL as distinct, so a constraint
+    including `mou` wouldn't actually enforce uniqueness for the mou/url
+    item types where it's always NULL. All uniqueness and format rules are
+    validated in create(), the same way Task.select()/MoU.select() already
+    validate in code rather than relying purely on DB constraints.
+    """
+
+    item_type = models.CharField(
+        max_length=8, choices=[(t, t) for t in ALIAS_ITEM_TYPES]
+    )
+    mou = models.ForeignKey(
+        MoU, null=True, blank=True, on_delete=models.CASCADE, related_name="aliases"
+    )
+    target = models.CharField(max_length=255)
+    alias = models.CharField(max_length=64)
+
+    class Meta:
+        indexes = [models.Index(fields=["item_type", "alias"])]
+
+    @classmethod
+    def create(
+        cls, item_type: str, id_or_target: str, alias: str, mou: MoU | None = None
+    ) -> Alias:
+        if item_type not in ALIAS_ITEM_TYPES:
+            raise ValueError(
+                f"Unknown alias item type {item_type!r}. "
+                f"Must be one of {ALIAS_ITEM_TYPES}."
+            )
+
+        try:
+            alias_validator(alias)
+        except ValidationError as error:
+            raise ValueError("; ".join(error.messages)) from None
+        if item_type == "task" and alias[:1].isdigit():
+            raise ValueError("A task alias must not start with a number.")
+        if item_type == "url" and "://" in alias:
+            raise ValueError("A url alias must not contain '://'.")
+
+        existing_aliases = cls.objects.filter(item_type=item_type)
+        if item_type == "task":
+            existing_aliases = existing_aliases.filter(mou=mou)
+        if existing_aliases.filter(alias=alias).exists():
+            raise ValueError(f"Alias {alias!r} is already used for {item_type}.")
+
+        if item_type == "mou":
+            if MoU.objects.filter(name=alias).exists():
+                raise ValueError(f"Alias {alias!r} is already a MoU name.")
+            if not MoU.objects.filter(name=id_or_target).exists():
+                raise ValueError(f"No such MoU: {id_or_target}")
+            target = id_or_target
+        elif item_type == "task":
+            if mou is None:
+                raise ValueError("No MoU selected. Run `rfp mou add <name>` first.")
+            if Task.objects.filter(mou=mou, name=alias).exists():
+                raise ValueError(f"Alias {alias!r} is already a task name.")
+            if not Task.objects.filter(mou=mou, name=id_or_target).exists():
+                raise ValueError(f"No such task: {id_or_target}")
+            target = id_or_target
+        else:
+            target = id_or_target
+
+        return cls.objects.create(
+            item_type=item_type,
+            mou=mou if item_type == "task" else None,
+            target=target,
+            alias=alias,
+        )
+
+    def __str__(self) -> str:
+        return f"{self.item_type}:{self.alias} -> {self.target}"
+
+
+def resolve_mou_name(raw: str) -> str:
+    """Return the MoU name `raw` refers to, following an alias if it is one."""
+    alias = Alias.objects.filter(item_type="mou", alias=raw).first()
+    return alias.target if alias is not None else raw
+
+
+def resolve_task_name(raw: str, mou: MoU | None) -> str:
+    """Return the task name `raw` refers to within `mou`, following an alias."""
+    if mou is None:
+        return raw
+    alias = Alias.objects.filter(item_type="task", mou=mou, alias=raw).first()
+    return alias.target if alias is not None else raw
+
+
+LINK_ALIAS = re.compile(r"^(?P<alias>[^/]+)/(?P<number>\d+)$")
+
+
+def resolve_link(raw: str, token: str | None = None) -> str:
+    """Expand an "<alias>/<number>" shorthand link into a full GitHub URL.
+
+    Anything already containing "://" (a real URL) or not shaped like
+    "<alias>/<number>" is returned unchanged.
+    """
+    if "://" in raw:
+        return raw
+    match = LINK_ALIAS.match(raw)
+    if match is None:
+        return raw
+
+    alias_name = match["alias"]
+    number = match["number"]
+    alias = Alias.objects.filter(item_type="url", alias=alias_name).first()
+    if alias is None:
+        raise ValueError(
+            f"No alias {alias_name!r} for url. "
+            f"Run `rfp alias set url <repo-url> {alias_name}` first."
+        )
+
+    parsed = parse_repo_url(alias.target)
+    if parsed is None:
+        raise ValueError(
+            f"Alias {alias_name!r} does not point to a GitHub repo URL: {alias.target}"
+        )
+    owner, repo = parsed
+    path = classify_issue_or_pr(owner, repo, int(number), token=token)
+    return f"{alias.target}/{path}/{number}"
 
 
 class Tag(models.Model):
@@ -594,7 +749,7 @@ class Report(models.Model):
         if record_mou is None or record_mou.id != self.mou_id:
             raise ValueError(
                 f"TimeRecord {record.pk} does not belong to MoU "
-                f"{self.mou.name if self.mou else 'none'}."
+                f"{self.mou.display_name if self.mou else 'none'}."
             )
         record.report = self
         record.save(update_fields=["report"])
@@ -659,7 +814,8 @@ class Report(models.Model):
         excluded_links: list[Link],
     ) -> str:
         records = list(records)
-        lines = [f"Report: {title}", f"MoU: {self.mou.name if self.mou else 'none'}"]
+        mou_display = self.mou.display_name if self.mou else "none"
+        lines = [f"Report: {title}", f"MoU: {mou_display}"]
 
         records_by_task: dict[Task | None, list[TimeRecord]] = {}
         for record in records:
@@ -676,9 +832,8 @@ class Report(models.Model):
                 if settings.RFP_EUROS is not None
                 else 0.0
             )
-            lines.append(
-                f"{task.name if task is not None else '?'}: {_round10(budget)}€"
-            )
+            task_display = task.display_name if task is not None else "?"
+            lines.append(f"{task_display}: {_round10(budget)}€")
 
             links = sorted({record.link for record in task_records if record.link})
             issue_links = [link for link in links if link.is_issue]
@@ -716,7 +871,8 @@ class Report(models.Model):
 
         lines = ["Excluded Pull Requests (not merged):"]
         for task in sorted(links_by_task, key=_task_sort_key):
-            lines.append(f"  {task.name if task is not None else '?'}:")
+            task_display = task.display_name if task is not None else "?"
+            lines.append(f"  {task_display}:")
             lines += [
                 f"    - {_format_report_link(link)}" for link in links_by_task[task]
             ]

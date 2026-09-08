@@ -77,7 +77,7 @@ def _format_duration(duration: timedelta) -> str:
 def _task_name(record: TimeRecord) -> str:
     if record.link is None or record.link.task is None:
         return "?"
-    return record.link.task.name
+    return record.link.task.display_name
 
 
 def _echo_stopped(record: TimeRecord) -> None:
@@ -86,12 +86,23 @@ def _echo_stopped(record: TimeRecord) -> None:
     typer.echo(f"Stopped {_task_name(record)} {duration} {url}")
 
 
+def _resolve_link_or_fail(link: str) -> str:
+    from nlnet_rfp_recorder.timetracking.models import GitHubToken, resolve_link
+
+    try:
+        return resolve_link(link, token=GitHubToken.get())
+    except ValueError as error:
+        _fail(str(error))
+
+
 def _echo_task_status(task: Task) -> None:
     # A task's MoU can be None: removing an MoU orphans (not deletes) its
     # tasks, so a still-selected task can outlive its MoU.
-    mou_name = task.mou.name if task.mou is not None else "none (its MoU was removed)"
+    mou_name = (
+        task.mou.display_name if task.mou is not None else "none (its MoU was removed)"
+    )
     typer.echo(f"MoU: {mou_name}")
-    typer.echo(f"Selected task: {task.name}")
+    typer.echo(f"Selected task: {task.display_name}")
     if task.budget_line is not None:
         typer.echo(str(task.budget_line))
 
@@ -119,13 +130,19 @@ def _read_budget_from_stdin() -> str:
 def _complete_mou_name(incomplete: str) -> list[str]:
     try:
         django.setup()
-        from nlnet_rfp_recorder.timetracking.models import MoU
+        from nlnet_rfp_recorder.timetracking.models import Alias, MoU
 
-        return list(
+        names = list(
             MoU.objects.filter(name__startswith=incomplete).values_list(
                 "name", flat=True
             )
         )
+        aliases = list(
+            Alias.objects.filter(
+                item_type="mou", alias__startswith=incomplete
+            ).values_list("alias", flat=True)
+        )
+        return names + aliases
     except Exception:
         return []
 
@@ -133,13 +150,19 @@ def _complete_mou_name(incomplete: str) -> list[str]:
 def _complete_task_name(incomplete: str) -> list[str]:
     try:
         django.setup()
-        from nlnet_rfp_recorder.timetracking.models import Task
+        from nlnet_rfp_recorder.timetracking.models import Alias, Task
 
-        return list(
+        names = list(
             Task.objects.filter(name__startswith=incomplete).values_list(
                 "name", flat=True
             )
         )
+        aliases = list(
+            Alias.objects.filter(
+                item_type="task", alias__startswith=incomplete
+            ).values_list("alias", flat=True)
+        )
+        return names + aliases
     except Exception:
         return []
 
@@ -147,13 +170,41 @@ def _complete_task_name(incomplete: str) -> list[str]:
 def _complete_link_url(incomplete: str) -> list[str]:
     try:
         django.setup()
+        from nlnet_rfp_recorder.timetracking.models import Alias
         from nlnet_rfp_recorder.timetracking.models import Link as LinkModel
 
-        return list(
+        urls = list(
             LinkModel.objects.filter(url__startswith=incomplete).values_list(
                 "url", flat=True
             )
         )
+        shortcuts = [
+            f"{alias}/"
+            for alias in Alias.objects.filter(
+                item_type="url", alias__startswith=incomplete
+            ).values_list("alias", flat=True)
+        ]
+        return urls + shortcuts
+    except Exception:
+        return []
+
+
+def _complete_alias_item(incomplete: str) -> list[str]:
+    from nlnet_rfp_recorder.timetracking.models import ALIAS_ITEM_TYPES
+
+    return [item for item in ALIAS_ITEM_TYPES if item.startswith(incomplete)]
+
+
+def _complete_alias_name(ctx: typer.Context, incomplete: str) -> list[str]:
+    try:
+        django.setup()
+        from nlnet_rfp_recorder.timetracking.models import Alias
+
+        item_type = ctx.params.get("item")
+        query = Alias.objects.filter(alias__startswith=incomplete)
+        if item_type:
+            query = query.filter(item_type=item_type)
+        return list(query.values_list("alias", flat=True))
     except Exception:
         return []
 
@@ -268,7 +319,7 @@ def mou_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
 
 def _echo_mou_status(mou: MoU) -> None:
-    typer.echo(f"MoU: {mou.name}")
+    typer.echo(f"MoU: {mou.display_name}")
     if mou.budget_line is not None:
         typer.echo(str(mou.budget_line))
 
@@ -299,7 +350,7 @@ def mou_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
     for existing in mous:
         marker = "*" if existing.selected else " "
-        typer.echo(f"{marker} {existing.name}")
+        typer.echo(f"{marker} {existing.display_name}")
 
 
 @mou_app.command("add")
@@ -325,14 +376,15 @@ def mou_select(
 ) -> None:
     """Select an existing MoU without creating it."""
     _setup(db, test)
-    from nlnet_rfp_recorder.timetracking.models import MoU
+    from nlnet_rfp_recorder.timetracking.models import MoU, resolve_mou_name
 
+    name = resolve_mou_name(name)
     try:
-        MoU.select_existing(name)
+        selected = MoU.select_existing(name)
     except ValueError as error:
         _fail(str(error))
 
-    typer.echo(f"Selected MoU: {name}")
+    typer.echo(f"Selected MoU: {selected.display_name}")
 
 
 @mou_app.command("remove")
@@ -343,12 +395,15 @@ def mou_remove(
 ) -> None:
     """Remove an MoU."""
     _setup(db, test)
-    from nlnet_rfp_recorder.timetracking.models import MoU
+    from nlnet_rfp_recorder.timetracking.models import MoU, resolve_mou_name
 
-    deleted, _ = MoU.objects.filter(name=name).delete()
-    if deleted == 0:
+    name = resolve_mou_name(name)
+    try:
+        display_name = MoU.objects.get(name=name).display_name
+    except MoU.DoesNotExist:
         _fail(f"No such MoU: {name}")
-    typer.echo(f"Removed MoU: {name}")
+    MoU.objects.filter(name=name).delete()
+    typer.echo(f"Removed MoU: {display_name}")
 
 
 @mou_app.command("import")
@@ -375,11 +430,11 @@ def mou_import(
     _setup(db, test)
     from django.core.exceptions import ValidationError
 
-    from nlnet_rfp_recorder.timetracking.models import MoU
+    from nlnet_rfp_recorder.timetracking.models import MoU, resolve_mou_name
 
     if mou is not None:
         try:
-            selected = MoU.select(mou)
+            selected = MoU.select(resolve_mou_name(mou))
         except ValidationError as error:
             _fail("; ".join(error.messages))
     else:
@@ -387,25 +442,36 @@ def mou_import(
         if selected is None:
             _fail("No MoU selected. Run `rfp mou add <name>` first.")
 
-    typer.echo(f"Current MoU: {selected.name}")
+    typer.echo(f"Current MoU: {selected.display_name}")
 
     text = path.read_text() if path is not None else _read_budget_from_stdin()
     tasks = selected.set_budget(text)
     source = str(path) if path is not None else "stdin"
     typer.echo(
-        f"Imported budget for MoU {selected.name} from {source} ({len(tasks)} tasks)."
+        f"Imported budget for MoU {selected.display_name} from {source} "
+        f"({len(tasks)} tasks)."
     )
 
 
 @mou_app.command("export")
-def mou_export(db: Path | None = DbOption, test: bool = TestOption) -> None:
-    """Print the raw budget text last imported for the selected MoU."""
+def mou_export(
+    name: str | None = typer.Argument(None, autocompletion=_complete_mou_name),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Print the raw budget text last imported for a MoU (default: selected)."""
     _setup(db, test)
-    from nlnet_rfp_recorder.timetracking.models import MoU
+    from nlnet_rfp_recorder.timetracking.models import MoU, resolve_mou_name
 
-    selected = MoU.get_selected()
-    if selected is None:
-        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+    if name is not None:
+        try:
+            selected = MoU.objects.get(name=resolve_mou_name(name))
+        except MoU.DoesNotExist:
+            _fail(f"No such MoU: {name}")
+    else:
+        selected = MoU.get_selected()
+        if selected is None:
+            _fail("No MoU selected. Run `rfp mou add <name>` first.")
 
     typer.echo(selected.budget, nl=False)
 
@@ -465,7 +531,7 @@ def task_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
     for task in tasks:
         marker = "*" if task.selected else " "
-        line = f"{marker} {task.name}"
+        line = f"{marker} {task.display_name}"
         if task.budget_line is not None:
             line += f"  {task.budget_line}"
         typer.echo(line)
@@ -481,12 +547,14 @@ def task_select(
     _setup(db, test)
     from django.core.exceptions import ValidationError
 
-    from nlnet_rfp_recorder.timetracking.models import Task
+    from nlnet_rfp_recorder.timetracking.models import MoU, Task, resolve_task_name
 
+    mou = MoU.get_selected()
+    name = resolve_task_name(name, mou)
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            task = Task.select(name)
+            task = Task.select(name, mou=mou)
     except ValidationError as error:
         _fail("; ".join(error.messages))
     except ValueError as error:
@@ -512,9 +580,10 @@ def task_set(
 ) -> None:
     """Manually set a task's total and/or used budget."""
     _setup(db, test)
-    from nlnet_rfp_recorder.timetracking.models import MoU, Task
+    from nlnet_rfp_recorder.timetracking.models import MoU, Task, resolve_task_name
 
     mou = MoU.get_selected()
+    name = resolve_task_name(name, mou)
     try:
         task = Task.objects.get(mou=mou, name=name)
     except Task.DoesNotExist:
@@ -541,13 +610,16 @@ def task_remove(
 ) -> None:
     """Remove a task from the current MoU."""
     _setup(db, test)
-    from nlnet_rfp_recorder.timetracking.models import MoU, Task
+    from nlnet_rfp_recorder.timetracking.models import MoU, Task, resolve_task_name
 
     mou = MoU.get_selected()
-    deleted, _ = Task.objects.filter(mou=mou, name=name).delete()
-    if deleted == 0:
+    name = resolve_task_name(name, mou)
+    try:
+        display_name = Task.objects.get(mou=mou, name=name).display_name
+    except Task.DoesNotExist:
         _fail(f"No such task: {name}")
-    typer.echo(f"Removed task: {name}")
+    Task.objects.filter(mou=mou, name=name).delete()
+    typer.echo(f"Removed task: {display_name}")
 
 
 timesheet_app = typer.Typer(
@@ -715,7 +787,7 @@ def status(db: Path | None = DbOption, test: bool = TestOption) -> None:
         _echo_task_status(task)
     else:
         mou = MoU.get_selected()
-        typer.echo(f"MoU: {mou.name if mou else 'none selected'}")
+        typer.echo(f"MoU: {mou.display_name if mou else 'none selected'}")
         typer.echo("Task: none selected")
 
     running = TimeRecord.get_running()
@@ -728,6 +800,8 @@ def status(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
 def _start(link: str, tags: str) -> None:
     from nlnet_rfp_recorder.timetracking.models import TimeRecord
+
+    link = _resolve_link_or_fail(link)
 
     stopped = TimeRecord.stop()
     if stopped is not None:
@@ -791,6 +865,7 @@ def edit(
     if link is not None:
         if record.link is None or record.link.task is None:
             _fail("Cannot edit the link: this time entry has no task.")
+        link = _resolve_link_or_fail(link)
         record.link = Link.get_or_create_for_task(link, record.link.task)
         record.save(update_fields=["link"])
 
@@ -813,6 +888,9 @@ def stop(
     """Stop the currently running time entry, optionally replacing its link."""
     _setup(db, test)
     from nlnet_rfp_recorder.timetracking.models import TimeRecord
+
+    if link is not None:
+        link = _resolve_link_or_fail(link)
 
     record = TimeRecord.stop(link)
     if record is None:
@@ -870,7 +948,9 @@ def report_create(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
     if not generated.time_records.exists():
         generated.delete()
-        _fail(f"No unreported time records for MoU {mou.name}. Nothing to report.")
+        _fail(
+            f"No unreported time records for MoU {mou.display_name}. Nothing to report."
+        )
 
     message = (
         "The report was generated. Run this to view the report:\n\n"
@@ -1015,6 +1095,131 @@ def report_import(
             _fail(str(error))
 
     typer.echo(f"Report {report_id} now has {len(wanted_pks)} time records.")
+
+
+alias_app = typer.Typer(
+    help="Manage aliases for MoUs, tasks, and repository URLs.",
+    no_args_is_help=True,
+    cls=AlphabeticalGroup,
+)
+app.add_typer(alias_app, name="alias")
+
+
+@alias_app.callback()
+def alias_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Manage aliases for MoUs, tasks, and repository URLs."""
+    if test:
+        db = TEST_DB_FILE
+    if db is not None:
+        os.environ["RFP_DB"] = str(db)
+
+
+@alias_app.command("set")
+def alias_set(
+    item: str = typer.Argument(..., autocompletion=_complete_alias_item),
+    id: str = typer.Argument(
+        ..., help="mou: MoU name. task: task code. url: repo base URL."
+    ),
+    alias: str = typer.Argument(...),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Give a MoU, task, or repository URL a short alias."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Alias, MoU
+
+    mou = MoU.get_selected() if item == "task" else None
+    try:
+        created = Alias.create(item, id, alias, mou=mou)
+    except ValueError as error:
+        _fail(str(error))
+
+    typer.echo(f"Set alias {created.alias!r} for {item} {created.target!r}.")
+
+
+@alias_app.command("remove")
+def alias_remove(
+    item: str = typer.Argument(..., autocompletion=_complete_alias_item),
+    id_or_alias: str = typer.Argument(
+        ..., autocompletion=_complete_alias_name, help="An alias, or the id it names."
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Remove an alias, identified by its alias or the id it names."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Alias, MoU
+
+    mou = MoU.get_selected() if item == "task" else None
+    query = Alias.objects.filter(item_type=item)
+    if item == "task":
+        query = query.filter(mou=mou)
+
+    matches = list(query.filter(alias=id_or_alias))
+    if not matches:
+        matches = list(query.filter(target=id_or_alias))
+    if not matches:
+        _fail(f"No {item} alias found for {id_or_alias!r}.")
+    if len(matches) > 1:
+        names = ", ".join(repr(match.alias) for match in matches)
+        _fail(f"{id_or_alias!r} matches more than one {item} alias: {names}.")
+
+    matches[0].delete()
+    typer.echo(f"Removed alias {matches[0].alias!r} for {item}.")
+
+
+@alias_app.command("rename")
+def alias_rename(
+    item: str = typer.Argument(..., autocompletion=_complete_alias_item),
+    old_alias: str = typer.Argument(..., autocompletion=_complete_alias_name),
+    new_alias: str = typer.Argument(...),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Rename an existing alias."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Alias, MoU
+
+    mou = MoU.get_selected() if item == "task" else None
+    query = Alias.objects.filter(item_type=item, alias=old_alias)
+    if item == "task":
+        query = query.filter(mou=mou)
+
+    try:
+        existing = query.get()
+    except Alias.DoesNotExist:
+        _fail(f"No {item} alias: {old_alias}")
+
+    try:
+        replacement = Alias.create(item, existing.target, new_alias, mou=mou)
+    except ValueError as error:
+        _fail(str(error))
+    existing.delete()
+
+    typer.echo(f"Renamed alias {old_alias!r} to {replacement.alias!r} for {item}.")
+
+
+@alias_app.command("list")
+def alias_list(
+    item: str | None = typer.Argument(None, autocompletion=_complete_alias_item),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """List aliases, optionally filtered to one item type."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Alias
+
+    aliases = Alias.objects.all()
+    if item is not None:
+        aliases = aliases.filter(item_type=item)
+    aliases = aliases.order_by("item_type", "alias")
+
+    if not aliases:
+        typer.echo("No aliases yet. Run `rfp alias set <item> <id> <alias>` first.")
+        return
+
+    for existing in aliases:
+        typer.echo(f"{existing.item_type}  {existing.target} -> {existing.alias}")
 
 
 @app.command()

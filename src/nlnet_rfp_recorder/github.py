@@ -17,6 +17,15 @@ ISSUE_URL = re.compile(
 PULL_REQUEST_URL = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)/?$"
 )
+REPO_URL = re.compile(r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)/?$")
+
+
+def parse_repo_url(url: str) -> tuple[str, str] | None:
+    """Split a bare repo URL ("https://github.com/OWNER/REPO") into its parts."""
+    match = REPO_URL.match(url)
+    if match is None:
+        return None
+    return match["owner"], match["repo"]
 
 
 class Status(StrEnum):
@@ -63,6 +72,31 @@ def fetch_authenticated_login(token: str) -> str | None:
         return None
     response.raise_for_status()
     return response.json()["login"]
+
+
+def classify_issue_or_pr(
+    owner: str, repo: str, number: int, token: str | None = None
+) -> str:
+    """Return 'pull' or 'issues' - the URL path segment identifying `number`.
+
+    GitHub's /issues/{number} endpoint returns pull requests too (with a
+    "pull_request" key), so one request classifies both. Falls back to
+    "issues" if GitHub can't be reached at all - a network problem shouldn't
+    block recording time against a link.
+    """
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    try:
+        response = niquests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/issues/{number}",
+            headers=headers,
+            timeout=TIMEOUT_SECONDS,
+        )
+    except niquests.exceptions.RequestException:
+        return "issues"
+    if response.status_code == 404:
+        return "issues"
+    response.raise_for_status()
+    return "pull" if "pull_request" in response.json() else "issues"
 
 
 @dataclass

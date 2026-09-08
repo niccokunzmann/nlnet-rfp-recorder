@@ -9,6 +9,7 @@ from django.utils import timezone
 from nlnet_rfp_recorder.github import TIMEOUT_SECONDS, Issue, PullRequest
 from nlnet_rfp_recorder.timesheet import TimesheetRow
 from nlnet_rfp_recorder.timetracking.models import (
+    Alias,
     GitHubToken,
     Link,
     MoU,
@@ -16,6 +17,9 @@ from nlnet_rfp_recorder.timetracking.models import (
     Task,
     TaskWarning,
     TimeRecord,
+    resolve_link,
+    resolve_mou_name,
+    resolve_task_name,
 )
 
 pytestmark = pytest.mark.django_db
@@ -1417,3 +1421,227 @@ def test_report_total_budget_sums_its_own_records(settings):
     report.add_time_record(record)
 
     assert report.total_budget == 20.0
+
+
+def test_alias_create_for_a_mou():
+    MoU.objects.create(name="nlnet-2026")
+
+    alias = Alias.create("mou", "nlnet-2026", "og")
+
+    assert alias.item_type == "mou"
+    assert alias.target == "nlnet-2026"
+    assert alias.alias == "og"
+    assert alias.mou is None
+
+
+def test_alias_create_rejects_an_unknown_item_type():
+    with pytest.raises(ValueError, match="Unknown alias item type"):
+        Alias.create("repo", "x", "y")
+
+
+def test_alias_create_for_a_mou_fails_for_an_unknown_mou():
+    with pytest.raises(ValueError, match="No such MoU: nlnet-2026"):
+        Alias.create("mou", "nlnet-2026", "og")
+
+
+def test_alias_create_for_a_mou_rejects_whitespace():
+    MoU.objects.create(name="nlnet-2026")
+
+    with pytest.raises(ValueError, match="must not contain spaces"):
+        Alias.create("mou", "nlnet-2026", "my alias")
+
+
+def test_alias_create_for_a_mou_rejects_an_existing_mou_name_as_alias():
+    MoU.objects.create(name="nlnet-2026")
+    MoU.objects.create(name="nlnet-2027")
+
+    with pytest.raises(ValueError, match="already a MoU name"):
+        Alias.create("mou", "nlnet-2026", "nlnet-2027")
+
+
+def test_alias_create_for_a_mou_rejects_a_duplicate_alias():
+    MoU.objects.create(name="nlnet-2026")
+    MoU.objects.create(name="nlnet-2027")
+    Alias.create("mou", "nlnet-2026", "og")
+
+    with pytest.raises(ValueError, match="already used for mou"):
+        Alias.create("mou", "nlnet-2027", "og")
+
+
+def test_alias_create_for_a_task():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="10a")
+
+    alias = Alias.create("task", "10a", "lib", mou=mou)
+
+    assert alias.item_type == "task"
+    assert alias.target == "10a"
+    assert alias.mou == mou
+
+
+def test_alias_create_for_a_task_requires_a_mou():
+    with pytest.raises(ValueError, match="No MoU selected"):
+        Alias.create("task", "10a", "lib")
+
+
+def test_alias_create_for_a_task_fails_for_an_unknown_task():
+    mou = MoU.objects.create(name="nlnet-2026")
+
+    with pytest.raises(ValueError, match="No such task: 10a"):
+        Alias.create("task", "10a", "lib", mou=mou)
+
+
+def test_alias_create_for_a_task_rejects_an_alias_starting_with_a_digit():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="10a")
+
+    with pytest.raises(ValueError, match="must not start with a number"):
+        Alias.create("task", "10a", "1lib", mou=mou)
+
+
+def test_alias_create_for_a_task_is_scoped_per_mou():
+    # The same alias can mean a different task under a different MoU.
+    mou_a = MoU.objects.create(name="nlnet-2025")
+    mou_b = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou_a, name="10a")
+    Task.objects.create(mou=mou_b, name="11b")
+
+    Alias.create("task", "10a", "lib", mou=mou_a)
+    alias_b = Alias.create("task", "11b", "lib", mou=mou_b)
+
+    assert alias_b.target == "11b"
+    assert Alias.objects.filter(item_type="task", alias="lib").count() == 2
+
+
+def test_alias_create_for_a_url():
+    alias = Alias.create("url", "https://github.com/collective/icalendar", "ical")
+
+    assert alias.item_type == "url"
+    assert alias.target == "https://github.com/collective/icalendar"
+    assert alias.mou is None
+
+
+def test_alias_create_for_a_url_rejects_an_alias_containing_a_scheme():
+    with pytest.raises(ValueError, match="must not contain '://'"):
+        Alias.create(
+            "url",
+            "https://github.com/collective/icalendar",
+            "https://example.com",
+        )
+
+
+def test_alias_create_for_a_url_rejects_a_duplicate_alias():
+    Alias.create("url", "https://github.com/collective/icalendar", "ical")
+
+    with pytest.raises(ValueError, match="already used for url"):
+        Alias.create("url", "https://github.com/pycalendar/other", "ical")
+
+
+def test_mou_display_name_without_an_alias_is_just_the_name():
+    mou = MoU.objects.create(name="nlnet-2026")
+
+    assert mou.display_name == "nlnet-2026"
+
+
+def test_mou_display_name_appends_its_alias():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Alias.create("mou", "nlnet-2026", "og")
+
+    assert mou.display_name == "nlnet-2026 (og)"
+
+
+def test_task_display_name_without_an_alias_is_just_the_name():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+
+    assert task.display_name == "10a"
+
+
+def test_task_display_name_appends_its_alias():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    Alias.create("task", "10a", "lib", mou=mou)
+
+    assert task.display_name == "10a (lib)"
+
+
+def test_task_display_name_ignores_an_alias_from_a_different_mou():
+    mou_a = MoU.objects.create(name="nlnet-2025")
+    mou_b = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou_a, name="10a")
+    task_b = Task.objects.create(mou=mou_b, name="10a")
+    Alias.create("task", "10a", "lib", mou=mou_a)
+
+    assert task_b.display_name == "10a"
+
+
+def test_resolve_mou_name_follows_an_alias():
+    MoU.objects.create(name="nlnet-2026")
+    Alias.create("mou", "nlnet-2026", "og")
+
+    assert resolve_mou_name("og") == "nlnet-2026"
+
+
+def test_resolve_mou_name_passes_through_an_unaliased_name():
+    assert resolve_mou_name("nlnet-2026") == "nlnet-2026"
+
+
+def test_resolve_task_name_follows_an_alias_scoped_to_its_mou():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="10a")
+    Alias.create("task", "10a", "lib", mou=mou)
+
+    assert resolve_task_name("lib", mou) == "10a"
+
+
+def test_resolve_task_name_ignores_an_alias_from_a_different_mou():
+    mou_a = MoU.objects.create(name="nlnet-2025")
+    mou_b = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou_a, name="10a")
+    Alias.create("task", "10a", "lib", mou=mou_a)
+
+    assert resolve_task_name("lib", mou_b) == "lib"
+
+
+def test_resolve_task_name_with_no_mou_passes_through():
+    assert resolve_task_name("lib", None) == "lib"
+
+
+def test_resolve_link_passes_through_a_real_url():
+    assert (
+        resolve_link("https://example.com/issues/1") == "https://example.com/issues/1"
+    )
+
+
+def test_resolve_link_passes_through_a_string_not_shaped_like_alias_slash_number():
+    assert resolve_link("just-some-text") == "just-some-text"
+
+
+def test_resolve_link_fails_for_an_unregistered_alias():
+    with pytest.raises(ValueError, match="No alias 'ical' for url"):
+        resolve_link("ical/1782")
+
+
+def test_resolve_link_expands_a_registered_alias():
+    Alias.create("url", "https://github.com/collective/icalendar", "ical")
+
+    with patch(
+        "nlnet_rfp_recorder.timetracking.models.classify_issue_or_pr",
+        return_value="pull",
+    ) as classify:
+        result = resolve_link("ical/1782")
+
+    classify.assert_called_once_with("collective", "icalendar", 1782, token=None)
+    assert result == "https://github.com/collective/icalendar/pull/1782"
+
+
+def test_resolve_link_sends_the_token_to_classify_issue_or_pr():
+    Alias.create("url", "https://github.com/collective/icalendar", "ical")
+
+    with patch(
+        "nlnet_rfp_recorder.timetracking.models.classify_issue_or_pr",
+        return_value="issues",
+    ) as classify:
+        resolve_link("ical/1782", token="secret")
+
+    classify.assert_called_once_with("collective", "icalendar", 1782, token="secret")

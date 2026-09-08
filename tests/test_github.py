@@ -8,7 +8,9 @@ from nlnet_rfp_recorder.github import (
     Issue,
     PullRequest,
     Status,
+    classify_issue_or_pr,
     fetch_statuses,
+    parse_repo_url,
 )
 
 
@@ -194,6 +196,93 @@ def test_fetch_statuses_runs_requests_concurrently_in_one_session():
 
     assert statuses == [Status.CLOSED, Status.CLOSED]
     assert session.get.call_count == 2
+
+
+def test_parse_repo_url_splits_owner_and_repo():
+    assert parse_repo_url("https://github.com/collective/icalendar") == (
+        "collective",
+        "icalendar",
+    )
+
+
+def test_parse_repo_url_accepts_a_trailing_slash():
+    assert parse_repo_url("https://github.com/collective/icalendar/") == (
+        "collective",
+        "icalendar",
+    )
+
+
+def test_parse_repo_url_rejects_a_non_repo_url():
+    assert parse_repo_url("https://github.com/collective/icalendar/pull/1") is None
+    assert parse_repo_url("https://example.com/collective/icalendar") is None
+
+
+def test_classify_issue_or_pr_returns_issues_for_a_plain_issue():
+    response = Mock(status_code=200, json=Mock(return_value={"number": 1782}))
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response) as get:
+        result = classify_issue_or_pr("collective", "icalendar", 1782)
+
+    get.assert_called_once_with(
+        "https://api.github.com/repos/collective/icalendar/issues/1782",
+        headers=None,
+        timeout=TIMEOUT_SECONDS,
+    )
+    assert result == "issues"
+
+
+def test_classify_issue_or_pr_returns_pull_when_the_number_is_a_pr():
+    response = Mock(
+        status_code=200, json=Mock(return_value={"number": 1782, "pull_request": {}})
+    )
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response):
+        result = classify_issue_or_pr("collective", "icalendar", 1782)
+
+    assert result == "pull"
+
+
+def test_classify_issue_or_pr_sends_the_token_as_a_bearer_header():
+    response = Mock(status_code=200, json=Mock(return_value={"number": 1}))
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response) as get:
+        classify_issue_or_pr("collective", "icalendar", 1, token="secret")
+
+    get.assert_called_once_with(
+        "https://api.github.com/repos/collective/icalendar/issues/1",
+        headers={"Authorization": "Bearer secret"},
+        timeout=TIMEOUT_SECONDS,
+    )
+
+
+def test_classify_issue_or_pr_assumes_issue_when_not_found():
+    response = Mock(status_code=404)
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response):
+        result = classify_issue_or_pr("collective", "icalendar", 999999)
+
+    assert result == "issues"
+
+
+def test_classify_issue_or_pr_assumes_issue_when_offline():
+    with patch(
+        "nlnet_rfp_recorder.github.niquests.get",
+        side_effect=niquests.exceptions.ConnectionError("no network"),
+    ):
+        result = classify_issue_or_pr("collective", "icalendar", 1782)
+
+    assert result == "issues"
+
+
+def test_classify_issue_or_pr_raises_on_a_real_error():
+    response = Mock(status_code=403)
+    response.raise_for_status = Mock(
+        side_effect=niquests.exceptions.HTTPError("403 Client Error: Forbidden")
+    )
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response):
+        with pytest.raises(niquests.exceptions.HTTPError):
+            classify_issue_or_pr("collective", "icalendar", 1782)
 
 
 def test_fetch_statuses_raises_after_every_request_finishes():

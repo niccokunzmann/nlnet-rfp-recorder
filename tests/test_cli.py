@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 from nlnet_rfp_recorder.cli import app
 from nlnet_rfp_recorder.github import TIMEOUT_SECONDS, Status
 from nlnet_rfp_recorder.timetracking.models import (
+    Alias,
     GitHubToken,
     Link,
     MoU,
@@ -1427,6 +1428,41 @@ def test_mou_export_is_empty_before_anything_was_imported():
     assert result.output == ""
 
 
+def test_mou_export_with_a_name_exports_a_non_selected_mou(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2025"])
+    budget_file = tmp_path / "budget.txt"
+    budget_file.write_text("10a. Do the thing\t€ 500\n")
+    runner.invoke(app, ["mou", "import", str(budget_file)])
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["mou", "export", "nlnet-2025"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output == "10a. Do the thing\t€ 500\n"
+    # exporting a MoU by name must not change which one is selected
+    assert MoU.get_selected().name == "nlnet-2026"
+
+
+def test_mou_export_fails_for_an_unknown_name():
+    result = runner.invoke(app, ["mou", "export", "does-not-exist"])
+
+    assert result.exit_code != 0
+    assert "No such MoU" in result.output
+
+
+def test_mou_export_resolves_an_alias(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2025"])
+    budget_file = tmp_path / "budget.txt"
+    budget_file.write_text("10a. Do the thing\t€ 500\n")
+    runner.invoke(app, ["mou", "import", str(budget_file)])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2025", "og"])
+
+    result = runner.invoke(app, ["mou", "export", "og"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output == "10a. Do the thing\t€ 500\n"
+
+
 def test_start_tags_default_to_implementation():
     Task.objects.create(name="10a")
 
@@ -1642,6 +1678,7 @@ def test_help_lists_commands_alphabetically():
 
     assert result.exit_code == 0, result.output
     assert _subcommand_names() == [
+        "alias",
         "backup",
         "edit",
         "migrate",
@@ -1706,3 +1743,314 @@ def test_task_help_lists_subcommands_alphabetically():
 
     assert result.exit_code == 0, result.output
     assert _subcommand_names("task") == ["list", "remove", "select", "set", "status"]
+
+
+def test_alias_help_lists_subcommands_alphabetically():
+    result = runner.invoke(app, ["alias", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert _subcommand_names("alias") == ["list", "remove", "rename", "set"]
+
+
+def test_alias_set_creates_a_mou_alias():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+
+    assert result.exit_code == 0, result.output
+    assert Alias.objects.get(item_type="mou", alias="og").target == "nlnet-2026"
+
+
+def test_alias_set_creates_a_task_alias_scoped_to_the_selected_mou():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
+
+    assert result.exit_code == 0, result.output
+    task_alias = Alias.objects.get(item_type="task", alias="lib")
+    assert task_alias.target == "10a"
+    assert task_alias.mou == MoU.get_selected()
+
+
+def test_alias_set_creates_a_url_alias():
+    result = runner.invoke(
+        app,
+        [
+            "alias",
+            "set",
+            "url",
+            "https://github.com/collective/icalendar",
+            "ical",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (
+        Alias.objects.get(item_type="url", alias="ical").target
+        == "https://github.com/collective/icalendar"
+    )
+
+
+def test_alias_set_fails_cleanly_on_a_validation_error():
+    result = runner.invoke(app, ["alias", "set", "mou", "does-not-exist", "og"])
+
+    assert result.exit_code != 0
+    assert "No such MoU" in result.output
+
+
+def test_alias_remove_by_alias_name():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+
+    result = runner.invoke(app, ["alias", "remove", "mou", "og"])
+
+    assert result.exit_code == 0, result.output
+    assert Alias.objects.count() == 0
+
+
+def test_alias_remove_by_underlying_id():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+
+    result = runner.invoke(app, ["alias", "remove", "mou", "nlnet-2026"])
+
+    assert result.exit_code == 0, result.output
+    assert Alias.objects.count() == 0
+
+
+def test_alias_remove_fails_for_an_unknown_alias():
+    result = runner.invoke(app, ["alias", "remove", "mou", "does-not-exist"])
+
+    assert result.exit_code != 0
+    assert "No mou alias found" in result.output
+
+
+def test_alias_rename_updates_the_alias():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+
+    result = runner.invoke(app, ["alias", "rename", "mou", "og", "newalias"])
+
+    assert result.exit_code == 0, result.output
+    assert Alias.objects.filter(alias="og").exists() is False
+    renamed = Alias.objects.get(item_type="mou", alias="newalias")
+    assert renamed.target == "nlnet-2026"
+
+
+def test_alias_rename_fails_for_an_unknown_alias():
+    result = runner.invoke(app, ["alias", "rename", "mou", "does-not-exist", "new"])
+
+    assert result.exit_code != 0
+    assert "No mou alias" in result.output
+
+
+def test_alias_rename_rejects_a_collision_with_the_new_name():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["mou", "add", "nlnet-2027"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2027", "new"])
+
+    result = runner.invoke(app, ["alias", "rename", "mou", "og", "new"])
+
+    assert result.exit_code != 0
+    assert "already used for mou" in result.output
+    # the original alias must survive a failed rename
+    assert Alias.objects.filter(item_type="mou", alias="og").exists()
+
+
+def test_alias_list_shows_everything_by_default():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+    runner.invoke(
+        app,
+        ["alias", "set", "url", "https://github.com/collective/icalendar", "ical"],
+    )
+
+    result = runner.invoke(app, ["alias", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "mou  nlnet-2026 -> og" in result.output
+    assert "url  https://github.com/collective/icalendar -> ical" in result.output
+
+
+def test_alias_list_filters_by_item_type():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+    runner.invoke(
+        app,
+        ["alias", "set", "url", "https://github.com/collective/icalendar", "ical"],
+    )
+
+    result = runner.invoke(app, ["alias", "list", "mou"])
+
+    assert result.exit_code == 0, result.output
+    assert "og" in result.output
+    assert "ical" not in result.output
+
+
+def test_alias_list_reports_when_there_are_none():
+    result = runner.invoke(app, ["alias", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "No aliases yet" in result.output
+
+
+def test_mou_select_resolves_an_alias():
+    runner.invoke(app, ["mou", "add", "nlnet-2025"])
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2025", "og"])
+
+    result = runner.invoke(app, ["mou", "select", "og"])
+
+    assert result.exit_code == 0, result.output
+    assert MoU.get_selected().name == "nlnet-2025"
+
+
+def test_mou_remove_resolves_an_alias():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+
+    result = runner.invoke(app, ["mou", "remove", "og"])
+
+    assert result.exit_code == 0, result.output
+    assert MoU.objects.count() == 0
+
+
+def test_task_select_resolves_an_alias():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
+    runner.invoke(app, ["task", "select", "11b"])
+
+    result = runner.invoke(app, ["task", "select", "lib"])
+
+    assert result.exit_code == 0, result.output
+    assert Task.get_selected().name == "10a"
+
+
+def test_task_set_resolves_an_alias():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
+
+    result = runner.invoke(app, ["task", "set", "lib", "--budget", "500"])
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.get(name="10a").max_budget == 500.0
+
+
+def test_task_remove_resolves_an_alias():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
+
+    result = runner.invoke(app, ["task", "remove", "lib"])
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.filter(name="10a").exists() is False
+
+
+def test_start_resolves_a_url_alias(settings):
+    settings.RFP_EUROS = 20.0
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(
+        app,
+        ["alias", "set", "url", "https://github.com/collective/icalendar", "ical"],
+    )
+
+    with patch(
+        "nlnet_rfp_recorder.timetracking.models.classify_issue_or_pr",
+        return_value="pull",
+    ):
+        result = runner.invoke(app, ["start", "ical/1782"])
+
+    assert result.exit_code == 0, result.output
+    link = Link.objects.get()
+    assert link.url == "https://github.com/collective/icalendar/pull/1782"
+
+
+def test_start_fails_cleanly_for_an_unregistered_url_alias(settings):
+    settings.RFP_EUROS = 20.0
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["start", "ical/1782"])
+
+    assert result.exit_code != 0
+    assert "No alias 'ical' for url" in result.output
+
+
+def test_mou_status_shows_the_alias_in_parens():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+
+    result = runner.invoke(app, ["mou", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "MoU: nlnet-2026 (og)" in result.output
+
+
+def test_mou_list_shows_the_alias_in_parens():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+
+    result = runner.invoke(app, ["mou", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "* nlnet-2026 (og)" in result.output
+
+
+def test_task_status_shows_the_alias_in_parens():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
+
+    result = runner.invoke(app, ["task", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Selected task: 10a (lib)" in result.output
+
+
+def test_task_list_shows_the_alias_in_parens():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
+
+    result = runner.invoke(app, ["task", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "* 10a (lib)" in result.output
+
+
+def test_start_shows_the_task_alias_in_confirmation(settings):
+    settings.RFP_EUROS = 20.0
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
+
+    result = runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    assert "Started time entry for task 10a (lib)" in result.output
+
+
+def test_report_print_preview_shows_aliases(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=30),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+    runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
+
+    result = runner.invoke(app, ["report", "print"])
+
+    assert result.exit_code == 0, result.output
+    assert "MoU: nlnet-2026 (og)" in result.output
+    assert "10a (lib): 10€" in result.output
