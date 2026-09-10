@@ -1,3 +1,5 @@
+import csv
+import io
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -15,6 +17,7 @@ from nlnet_rfp_recorder.timetracking.models import (
     Link,
     MoU,
     Report,
+    ReportLine,
     Task,
     TimeRecord,
 )
@@ -24,6 +27,19 @@ def _mock_github_session(state: str = "closed"):
     """A mock niquests.AsyncSession() context manager returning `state`."""
     response = MagicMock(status_code=200)
     response.json = MagicMock(return_value={"state": state})
+    session = MagicMock()
+    session.get = AsyncMock(return_value=response)
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    return patch(
+        "nlnet_rfp_recorder.github.niquests.AsyncSession", return_value=session
+    )
+
+
+def _mock_github_title_session(title: str = "Some title"):
+    """A mock niquests.AsyncSession() context manager returning `title`."""
+    response = MagicMock(status_code=200)
+    response.json = MagicMock(return_value={"title": title})
     session = MagicMock()
     session.get = AsyncMock(return_value=response)
     session.__aenter__ = AsyncMock(return_value=session)
@@ -135,7 +151,7 @@ def test_task_output_shows_budget_without_time_left_when_rfp_euros_is_unset(
     result = runner.invoke(app, ["task", "select", "10a"])
 
     assert result.exit_code == 0, result.output
-    assert "Budget 0€/500€" in result.output
+    assert "0€/500€" in result.output
     assert "left" not in result.output
 
 
@@ -155,7 +171,7 @@ def test_task_output_shows_budget_and_time_left(tmp_path, settings):
     result = runner.invoke(app, ["task", "select", "10a"])
 
     assert result.exit_code == 0, result.output
-    assert "Budget 20€/500€ - 24:00 left" in result.output
+    assert "20€/500€ 24:00 left" in result.output
 
 
 def test_task_rejects_an_invalid_name():
@@ -210,6 +226,29 @@ def test_task_status_subcommand_shows_the_current_task():
     assert "Selected task: 10a" in result.output
 
 
+def test_task_status_shows_the_tasks_description_if_present():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    task = Task.objects.get(name="10a")
+    task.description = "Do the thing"
+    task.save(update_fields=["description"])
+
+    result = runner.invoke(app, ["task", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Do the thing" in result.output
+
+
+def test_task_select_shows_the_tasks_description_if_present():
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a", description="Do the thing")
+
+    result = runner.invoke(app, ["task", "select", "10a"])
+
+    assert result.exit_code == 0, result.output
+    assert "Do the thing" in result.output
+
+
 def test_task_set_updates_budget_and_used():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
@@ -222,7 +261,7 @@ def test_task_set_updates_budget_and_used():
     task = Task.objects.get(name="10a")
     assert task.max_budget == 500.0
     assert task.used_budget == 100.0
-    assert "Budget 100€/500€" in result.output
+    assert "100€/500€" in result.output
 
 
 def test_task_set_fails_for_an_unknown_task():
@@ -257,8 +296,93 @@ def test_task_list_marks_the_selected_task_and_shows_budget():
     result = runner.invoke(app, ["task", "list"])
 
     assert result.exit_code == 0, result.output
-    assert "  10a  Budget 100€/500€" in result.output
+    assert "  10a  100€/500€" in result.output
     assert "* 11b" in result.output
+
+
+def test_task_list_shows_the_description():
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a", description="Do the thing")
+
+    result = runner.invoke(app, ["task", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "10a  Do the thing" in result.output
+
+
+def test_task_list_aligns_descriptions_within_a_task_group_only():
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    # Same group (10): names differ in length, so the description column
+    # only lines up if padded to the widest name in this group.
+    Task.objects.create(mou=mou, name="10a", description="short")
+    Task.objects.create(mou=mou, name="10abc", description="longer name")
+    # A different group (9): its own, unrelated (and shorter) column.
+    Task.objects.create(mou=mou, name="9a", description="other group")
+
+    result = runner.invoke(app, ["task", "list"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.strip("\n").splitlines()
+    assert len(lines) == 3
+    # Groups sort by their number (9 before 10), so 9a lists first.
+    nine_a, ten_a, ten_abc = lines
+    assert ten_a.index("short") == ten_abc.index("longer name")
+    # group 9's single, shorter name doesn't inherit group 10's width.
+    assert nine_a.index("other group") < ten_a.index("short")
+
+
+def test_task_list_description_starts_at_the_same_column_without_a_budget():
+    # A task with no budget of its own still lines its description up
+    # with the rest of its group, wherever the group's budget column
+    # (from a sibling task that does have one) puts it.
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(
+        mou=mou, name="10a", max_budget=500.0, used_budget=20.0, description="has one"
+    )
+    Task.objects.create(mou=mou, name="10b", description="has none")
+
+    result = runner.invoke(app, ["task", "list"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.strip("\n").splitlines()
+    assert len(lines) == 2
+    assert lines[0].index("has one") == lines[1].index("has none")
+
+
+def test_task_list_aligns_time_left_within_a_task_group_only(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    # "20€/500€" (8 chars) vs "100€/500€" (9 chars): without padding the
+    # shorter money figure, their "... left" times wouldn't line up.
+    Task.objects.create(mou=mou, name="10a", max_budget=500.0, used_budget=20.0)
+    Task.objects.create(mou=mou, name="10b", max_budget=500.0, used_budget=100.0)
+
+    result = runner.invoke(app, ["task", "list"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.strip("\n").splitlines()
+    assert len(lines) == 2
+    assert lines[0].index(" left") == lines[1].index(" left")
+    assert " - " not in result.output
+
+
+def test_task_list_right_aligns_the_hour_figure_within_a_task_group(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    # 121:57, 21:57, 1:57 remaining - the hour digits should right-align
+    # on the widest one, like a table of numbers.
+    Task.objects.create(mou=mou, name="10a", max_budget=2439.0)
+    Task.objects.create(mou=mou, name="10b", max_budget=439.0)
+    Task.objects.create(mou=mou, name="10c", max_budget=39.0)
+
+    result = runner.invoke(app, ["task", "list"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.strip("\n").splitlines()
+    assert len(lines) == 3
+    assert "121:57 left" in lines[0]
+    assert " 21:57 left" in lines[1]
+    assert "  1:57 left" in lines[2]
 
 
 def test_task_remove_deletes_it():
@@ -309,6 +433,79 @@ def test_start_prints_the_previous_entry_being_stopped():
     assert "Stopped 10a" in result.output
     assert "https://example.com/issues/1" in result.output
     assert "Started time entry for task 10a" in result.output
+
+
+def test_start_uses_the_time_it_was_called_despite_a_slow_resolution():
+    # If anything after capturing "now" (link resolution, the
+    # implementation/review guess, ...) were to call timezone.now()
+    # again, it would get a later value from this side_effect list -
+    # proving the record's start_time is only ever the very first one.
+    Task.objects.create(name="10a")
+    now = timezone.now()
+    later_values = [now + timedelta(seconds=n) for n in range(1, 6)]
+
+    with patch("django.utils.timezone.now", side_effect=[now, *later_values]):
+        result = runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.start_time == now
+
+
+def test_start_prints_continuing_when_resuming_the_same_link():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    assert "Continuing time entry for task 10a" in result.output
+    assert "Started time entry" not in result.output
+    assert TimeRecord.objects.count() == 1
+
+
+def test_start_with_an_explicit_task_selects_it_first():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["start", "10b", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.link.task.name == "10b"
+    assert Task.objects.get(name="10b").selected is True
+    assert Task.objects.get(name="10a").selected is False
+
+
+def test_start_with_too_many_positional_arguments_fails():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["start", "10a", "extra", "https://example.com/1"])
+
+    assert result.exit_code != 0
+    assert "Usage: rfp start" in result.output
+
+
+def test_start_prints_the_tasks_description_if_present():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    Task.objects.create(mou=MoU.objects.get(), name="10a", description="Do the thing")
+
+    result = runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    assert "Do the thing" in result.output
+
+
+def test_start_prints_nothing_extra_without_a_description():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip().splitlines()[-1].startswith("Started time entry")
 
 
 def test_stop_without_a_running_entry_succeeds():
@@ -734,14 +931,14 @@ def test_report_prints_budget_issues_and_pull_requests(settings):
         result = runner.invoke(app, ["report", "print", "nlnet-2026-1"])
 
     assert result.exit_code == 0, result.output
-    assert "10a: 20€" in result.output
+    assert "10a: 30€" in result.output
     assert "Issues:" in result.output
     assert "- https://github.com/nlnet/rfp-recorder/issues/1" in result.output
     assert "Pull Requests:" in result.output
     assert "- https://github.com/nlnet/rfp-recorder/pull/2" in result.output
     assert "Links:" in result.output
     assert "- https://example.com/docs/design" in result.output
-    assert "Total: 20€" in result.output
+    assert "Total: 30€" in result.output
 
 
 def test_report_includes_open_issues_but_excludes_open_prs(settings):
@@ -895,7 +1092,7 @@ def test_report_shows_review_tag_suffix(settings):
     result = runner.invoke(app, ["report", "print", "nlnet-2026-1"])
 
     assert result.exit_code == 0, result.output
-    assert "- https://example.com/docs/design (review)" in result.output
+    assert "- https://example.com/docs/design - 10€ (review)" in result.output
 
 
 def test_report_create_persists_a_report(settings):
@@ -1120,32 +1317,102 @@ def test_report_remove_orphans_but_keeps_its_time_records(settings):
     )
     runner.invoke(app, ["report", "create"])
     record = TimeRecord.objects.get()
-    assert record.report_id == "nlnet-2026-1"
+    assert record.report_line.report_id == "nlnet-2026-1"
 
     runner.invoke(app, ["report", "remove", "nlnet-2026-1"])
 
     record.refresh_from_db()
-    assert record.report_id is None
+    assert record.report_line_id is None
 
 
-def test_report_export_lists_time_record_pks(tmp_path, settings):
+def _report_csv(*rows: dict) -> str:
+    buffer = io.StringIO()
+    fieldnames = ["task", "link", "budget", "tags", "records"]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return buffer.getvalue()
+
+
+def test_report_export_lists_report_lines_as_csv(tmp_path, settings):
     settings.RFP_EUROS = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    link.add_tag("review")
+    now = timezone.now()
     TimeRecord.objects.create(
-        link=link,
-        start_time=timezone.now() - timedelta(minutes=20),
-        end_time=timezone.now(),
+        link=link, start_time=now - timedelta(minutes=30), end_time=now
     )
     runner.invoke(app, ["report", "create"])
     record = TimeRecord.objects.get()
-    path = tmp_path / "report.txt"
+    path = tmp_path / "report.csv"
 
     result = runner.invoke(app, ["report", "export", "nlnet-2026-1", str(path)])
 
     assert result.exit_code == 0, result.output
-    assert path.read_text() == f"{record.pk}\n"
+    rows = list(csv.DictReader(io.StringIO(path.read_text())))
+    assert rows == [
+        {
+            "task": "10a",
+            "link": "https://example.com/issues/1",
+            "title": "",
+            "budget": "10.0",
+            "tags": "review",
+            "records": str(record.pk),
+        }
+    ]
+
+
+def test_report_export_fetches_and_caches_the_issue_title(tmp_path, settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(minutes=30), end_time=now
+    )
+    runner.invoke(app, ["report", "create"])
+    path = tmp_path / "report.csv"
+
+    with _mock_github_title_session("Fix the thing"):
+        result = runner.invoke(app, ["report", "export", "nlnet-2026-1", str(path)])
+
+    assert result.exit_code == 0, result.output
+    rows = list(csv.DictReader(io.StringIO(path.read_text())))
+    assert rows[0]["title"] == "Fix the thing"
+    link.refresh_from_db()
+    assert link.title == "Fix the thing"
+
+
+def test_report_export_fails_when_github_is_unreachable(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(minutes=30), end_time=now
+    )
+    runner.invoke(app, ["report", "create"])
+
+    session = MagicMock()
+    session.get = AsyncMock(
+        side_effect=niquests.exceptions.ConnectionError("no network")
+    )
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    with patch("nlnet_rfp_recorder.github.niquests.AsyncSession", return_value=session):
+        result = runner.invoke(app, ["report", "export", "nlnet-2026-1"])
+
+    assert result.exit_code != 0
+    assert "Could not fetch issue/PR titles" in result.output
 
 
 def test_report_export_fails_for_an_unknown_report():
@@ -1154,7 +1421,7 @@ def test_report_export_fails_for_an_unknown_report():
     assert result.exit_code != 0
 
 
-def test_report_import_removes_a_pk_not_in_the_file(tmp_path, settings):
+def test_report_import_removes_a_line_not_in_the_file(tmp_path, settings):
     settings.RFP_EUROS = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
@@ -1166,17 +1433,125 @@ def test_report_import_removes_a_pk_not_in_the_file(tmp_path, settings):
     )
     runner.invoke(app, ["report", "create"])
     record = TimeRecord.objects.get()
-    path = tmp_path / "report.txt"
-    path.write_text("")
+    path = tmp_path / "report.csv"
+    path.write_text(_report_csv())
 
-    result = runner.invoke(app, ["report", "import", "nlnet-2026-1", str(path)])
+    result = runner.invoke(
+        app, ["report", "import", "nlnet-2026-1", str(path)], input="1\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No longer in the imported file" in result.output
+    record.refresh_from_db()
+    assert record.report_line is None
+    link.refresh_from_db()
+    assert link.excluded_from_reports is False
+
+
+def test_report_import_remove_choice_2_excludes_the_link_permanently(
+    tmp_path, settings
+):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+    record = TimeRecord.objects.get()
+    path = tmp_path / "report.csv"
+    path.write_text(_report_csv())
+
+    result = runner.invoke(
+        app, ["report", "import", "nlnet-2026-1", str(path)], input="2\n"
+    )
 
     assert result.exit_code == 0, result.output
     record.refresh_from_db()
-    assert record.report_id is None
+    assert record.report_line is None
+    link.refresh_from_db()
+    assert link.excluded_from_reports is True
 
 
-def test_report_import_adds_a_pk_from_the_file(tmp_path, settings):
+def test_report_import_remove_choice_3_keeps_the_line(tmp_path, settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+    record = TimeRecord.objects.get()
+    path = tmp_path / "report.csv"
+    path.write_text(_report_csv())
+
+    result = runner.invoke(
+        app, ["report", "import", "nlnet-2026-1", str(path)], input="3\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    record.refresh_from_db()
+    assert record.report_line is not None
+    assert record.report_line.report_id == "nlnet-2026-1"
+
+
+def test_report_import_removed_link_prompt_shows_the_github_title(tmp_path, settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/collective/icalendar/issues/1"
+    )
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+    path = tmp_path / "report.csv"
+    path.write_text(_report_csv())
+
+    with patch(
+        "nlnet_rfp_recorder.github.fetch_title", return_value="Fix the thing"
+    ) as fetch_title:
+        result = runner.invoke(
+            app, ["report", "import", "nlnet-2026-1", str(path)], input="1\n"
+        )
+
+    fetch_title.assert_called_once_with("collective", "icalendar", 1, token=None)
+    assert result.exit_code == 0, result.output
+    assert "Fix the thing" in result.output
+
+
+def test_report_import_reprompts_on_an_invalid_choice(tmp_path, settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(minutes=20),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+    path = tmp_path / "report.csv"
+    path.write_text(_report_csv())
+
+    result = runner.invoke(
+        app, ["report", "import", "nlnet-2026-1", str(path)], input="bogus\n1\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Please enter 1, 2, or 3." in result.output
+
+
+def test_report_import_adds_a_record_from_the_file(tmp_path, settings):
     settings.RFP_EUROS = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
@@ -1187,35 +1562,185 @@ def test_report_import_adds_a_pk_from_the_file(tmp_path, settings):
         end_time=timezone.now(),
     )
     report = Report.create(mou)
-    path = tmp_path / "report.txt"
-    path.write_text(f"{record.pk}\n")
+    path = tmp_path / "report.csv"
+    path.write_text(
+        _report_csv(
+            {
+                "task": "10a",
+                "link": link.url,
+                "budget": "100",
+                "tags": "review",
+                "records": str(record.pk),
+            }
+        )
+    )
 
     result = runner.invoke(app, ["report", "import", report.id, str(path)])
 
     assert result.exit_code == 0, result.output
     record.refresh_from_db()
-    assert record.report_id == report.id
+    assert record.report_line.report_id == report.id
+    assert record.report_line.budget == 100.0
+    assert record.report_line.tags == "review"
 
 
-def test_report_import_fails_for_a_pk_of_a_different_mou(tmp_path, settings):
+def test_report_import_fails_for_a_link_of_a_different_mou(tmp_path, settings):
     settings.RFP_EUROS = 20.0
     mou_a = MoU.objects.create(name="mou-a")
     mou_b = MoU.objects.create(name="mou-b", selected=True)
     task_b = Task.objects.create(mou=mou_b, name="10a")
     link = Link.objects.create(task=task_b, url="https://example.com/issues/1")
-    record = TimeRecord.objects.create(
+    TimeRecord.objects.create(
         link=link,
         start_time=timezone.now() - timedelta(minutes=20),
         end_time=timezone.now(),
     )
     report_a = Report.create(mou_a)
-    path = tmp_path / "report.txt"
-    path.write_text(f"{record.pk}\n")
+    path = tmp_path / "report.csv"
+    path.write_text(
+        _report_csv(
+            {
+                "task": "10a",
+                "link": link.url,
+                "budget": "100",
+                "tags": "",
+                "records": "",
+            }
+        )
+    )
 
     result = runner.invoke(app, ["report", "import", report_a.id, str(path)])
 
     assert result.exit_code != 0
     assert "does not belong to MoU" in result.output
+
+
+def test_report_import_creates_a_new_link_for_an_unknown_url(tmp_path, settings):
+    # An unknown link is no longer a hard failure - it's created fresh,
+    # with no time records attached (there's nothing to unambiguously
+    # attach it to).
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    report = Report.create(mou)
+    path = tmp_path / "report.csv"
+    path.write_text(
+        _report_csv(
+            {
+                "task": "10a",
+                "link": "https://example.com/issues/999",
+                "budget": "50",
+                "tags": "",
+                "records": "",
+            }
+        )
+    )
+
+    result = runner.invoke(app, ["report", "import", report.id, str(path)])
+
+    assert result.exit_code == 0, result.output
+    link = Link.objects.get(url="https://example.com/issues/999")
+    assert link.task == task
+    report_line = ReportLine.objects.get(report=report, link=link)
+    assert report_line.budget == 50.0
+    assert report_line.time_records.count() == 0
+
+
+def test_report_review_prints_each_task_and_defaults_small_tasks_to_excluded(
+    settings,
+):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    big_task = Task.objects.create(mou=mou, name="10a")
+    small_task = Task.objects.create(mou=mou, name="10b")
+    big_link = Link.objects.create(task=big_task, url="https://example.com/issues/1")
+    small_link = Link.objects.create(
+        task=small_task, url="https://example.com/issues/2"
+    )
+    now = timezone.now()
+    # 3 hours @ 20€/h = 60€ - at/above 50, defaults to included.
+    TimeRecord.objects.create(
+        link=big_link, start_time=now - timedelta(hours=3), end_time=now
+    )
+    # 6 minutes @ 20€/h = 2€ - under 50, defaults to excluded.
+    TimeRecord.objects.create(
+        link=small_link, start_time=now - timedelta(minutes=6), end_time=now
+    )
+    runner.invoke(app, ["report", "create"])
+    small_record = TimeRecord.objects.get(link=small_link)
+
+    # Two task prompts (both blank, accepting their defaults), then an
+    # explicit "y" to the final write confirmation (whose own default is
+    # No, to make actually writing changes an opt-in step).
+    result = runner.invoke(app, ["report", "review", "nlnet-2026-1"], input="\n\ny\n")
+
+    assert result.exit_code == 0, result.output
+    assert "10a: 60€" in result.output
+    assert "10b: 10€" in result.output
+    assert "Included: 10a" in result.output
+    assert "Excluded: 10b" in result.output
+    assert ReportLine.objects.filter(report__id="nlnet-2026-1", link=big_link).exists()
+    assert not ReportLine.objects.filter(
+        report__id="nlnet-2026-1", link=small_link
+    ).exists()
+    small_record.refresh_from_db()
+    assert small_record.report_line is None
+
+
+def test_report_review_leaves_the_report_unchanged_when_cancelled(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    # 6 minutes @ 20€/h = 2€ - defaults to excluded, but we cancel anyway.
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(minutes=6), end_time=now
+    )
+    runner.invoke(app, ["report", "create"])
+    record = TimeRecord.objects.get()
+
+    result = runner.invoke(app, ["report", "review", "nlnet-2026-1"], input="\nn\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Cancelled" in result.output
+    assert ReportLine.objects.filter(report__id="nlnet-2026-1", link=link).exists()
+    record.refresh_from_db()
+    assert record.report_line is not None
+
+
+def test_report_review_with_nothing_excluded_skips_the_write_prompt(settings):
+    settings.RFP_EUROS = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    # 3 hours @ 20€/h = 60€ - defaults to included, so nothing to write.
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=3), end_time=now
+    )
+    runner.invoke(app, ["report", "create"])
+
+    result = runner.invoke(app, ["report", "review", "nlnet-2026-1"], input="\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Nothing to change" in result.output
+    assert ReportLine.objects.filter(report__id="nlnet-2026-1", link=link).exists()
+
+
+def test_report_review_fails_for_an_unknown_report():
+    result = runner.invoke(app, ["report", "review", "does-not-exist"])
+
+    assert result.exit_code != 0
+
+
+def test_report_review_reports_nothing_to_review_for_an_empty_report(settings):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    report = Report.create(mou)
+
+    result = runner.invoke(app, ["report", "review", report.id])
+
+    assert result.exit_code == 0, result.output
+    assert "no lines to review" in result.output
 
 
 def test_mou_add_selects_a_mou():
@@ -1255,7 +1780,7 @@ def test_mou_status_sums_budget_across_tasks(tmp_path, settings):
     assert result.exit_code == 0, result.output
     assert "MoU: nlnet-2026" in result.output
     # 10a is fully used (300), 10b has no tracked time yet (0): 300/500
-    assert "Budget 300€/500€" in result.output
+    assert "300€/500€" in result.output
 
 
 def test_mou_list_reports_when_there_are_none():
@@ -1514,6 +2039,311 @@ def test_review_stops_a_previously_running_entry():
     assert "Stopped 10a" in result.output
 
 
+def test_review_with_an_explicit_task_selects_it_first():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["review", "10b", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.link.task.name == "10b"
+    assert [tag.name for tag in record.link.tags.all()] == ["review"]
+    assert Task.objects.get(name="10b").selected is True
+
+
+def test_review_with_too_many_positional_arguments_fails():
+    Task.objects.create(name="10a")
+
+    result = runner.invoke(app, ["review", "10a", "extra", "https://example.com/1"])
+
+    assert result.exit_code != 0
+    assert "Usage: rfp review" in result.output
+
+
+def test_review_prints_the_tasks_description_if_present():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    Task.objects.create(mou=MoU.objects.get(), name="10a", description="Do the thing")
+
+    result = runner.invoke(app, ["review", "10a", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    assert "Do the thing" in result.output
+
+
+def test_implement_starts_a_time_entry_tagged_implementation():
+    Task.objects.create(name="10a")
+
+    result = runner.invoke(app, ["implement", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.is_running is True
+    link = Link.objects.get()
+    assert [tag.name for tag in link.tags.all()] == ["implementation"]
+    assert "Started time entry for task 10a" in result.output
+
+
+def test_implement_without_a_task_fails():
+    result = runner.invoke(app, ["implement", "https://example.com/issues/1"])
+
+    assert result.exit_code != 0
+
+
+def test_implement_with_an_explicit_task_selects_it_first():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["implement", "10b", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.link.task.name == "10b"
+
+
+def _mock_github_get(responses: dict[str, dict]):
+    """Patch niquests.get to return canned JSON per URL suffix."""
+
+    def fake_get(url, **kwargs):
+        for suffix, data in responses.items():
+            if url.endswith(suffix):
+                return MagicMock(status_code=200, json=MagicMock(return_value=data))
+        raise AssertionError(f"Unexpected GitHub request: {url}")
+
+    return patch("nlnet_rfp_recorder.github.niquests.get", side_effect=fake_get)
+
+
+def test_start_defaults_to_implementation_when_i_authored_the_issue():
+    Task.objects.create(name="10a")
+    GitHubToken.set("secret")
+
+    with _mock_github_get(
+        {
+            "/user": {"login": "octocat"},
+            "/issues/1782": {"user": {"login": "octocat"}},
+        }
+    ):
+        result = runner.invoke(
+            app, ["start", "https://github.com/nlnet/rfp-recorder/issues/1782"]
+        )
+
+    assert result.exit_code == 0, result.output
+    link = Link.objects.get()
+    assert [tag.name for tag in link.tags.all()] == ["implementation"]
+
+
+def test_start_defaults_to_review_when_someone_else_authored_the_issue():
+    Task.objects.create(name="10a")
+    GitHubToken.set("secret")
+
+    with _mock_github_get(
+        {
+            "/user": {"login": "octocat"},
+            "/issues/1782": {"user": {"login": "someone-else"}},
+        }
+    ):
+        result = runner.invoke(
+            app, ["start", "https://github.com/nlnet/rfp-recorder/issues/1782"]
+        )
+
+    assert result.exit_code == 0, result.output
+    link = Link.objects.get()
+    assert [tag.name for tag in link.tags.all()] == ["review"]
+
+
+def test_start_defaults_to_implementation_without_a_saved_token():
+    Task.objects.create(name="10a")
+
+    with patch("nlnet_rfp_recorder.github.niquests.get") as get:
+        result = runner.invoke(
+            app, ["start", "https://github.com/nlnet/rfp-recorder/issues/1782"]
+        )
+
+    assert result.exit_code == 0, result.output
+    get.assert_not_called()
+    link = Link.objects.get()
+    assert [tag.name for tag in link.tags.all()] == ["implementation"]
+
+
+def test_start_defaults_to_implementation_when_github_is_unreachable():
+    Task.objects.create(name="10a")
+    GitHubToken.set("secret")
+
+    with patch(
+        "nlnet_rfp_recorder.github.niquests.get",
+        side_effect=niquests.exceptions.ConnectionError("no network"),
+    ):
+        result = runner.invoke(
+            app, ["start", "https://github.com/nlnet/rfp-recorder/issues/1782"]
+        )
+
+    assert result.exit_code == 0, result.output
+    link = Link.objects.get()
+    assert [tag.name for tag in link.tags.all()] == ["implementation"]
+
+
+def test_start_defaults_to_implementation_for_a_plain_link_even_with_a_token():
+    # No issue/PR to check authorship against, so no GitHub call is made
+    # at all - the previous, unconditional default just applies.
+    Task.objects.create(name="10a")
+    GitHubToken.set("secret")
+
+    with patch("nlnet_rfp_recorder.github.niquests.get") as get:
+        result = runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    get.assert_not_called()
+    link = Link.objects.get()
+    assert [tag.name for tag in link.tags.all()] == ["implementation"]
+
+
+def test_start_asks_before_changing_an_existing_tag():
+    Task.objects.create(name="10a")
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(
+        app,
+        ["start", "https://example.com/issues/1", "--tags", "review"],
+        input="y\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "is tagged 'implementation', but this looks like 'review'" in result.output
+    link = Link.objects.get()
+    assert [tag.name for tag in link.tags.all()] == ["review"]
+
+
+def test_start_declining_the_tag_change_leaves_the_old_tag():
+    Task.objects.create(name="10a")
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(
+        app,
+        ["start", "https://example.com/issues/1", "--tags", "review"],
+        input="n\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    link = Link.objects.get()
+    assert [tag.name for tag in link.tags.all()] == ["implementation"]
+
+
+def test_review_on_an_implementation_tagged_link_asks_before_changing_it():
+    Task.objects.create(name="10a")
+    runner.invoke(app, ["implement", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(app, ["review", "https://example.com/issues/1"], input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert "is tagged 'implementation', but this looks like 'review'" in result.output
+    link = Link.objects.get()
+    assert [tag.name for tag in link.tags.all()] == ["review"]
+
+
+def test_start_does_not_ask_when_the_tag_already_matches():
+    Task.objects.create(name="10a")
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    assert "is tagged" not in result.output
+    link = Link.objects.get()
+    assert [tag.name for tag in link.tags.all()] == ["implementation"]
+
+
+def test_start_asks_before_moving_a_link_to_a_different_task():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(
+        app, ["start", "10b", "https://example.com/issues/1"], input="y\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "is under task 10a, but this looks like 10b" in result.output
+    link = Link.objects.get()
+    assert link.task.name == "10b"
+
+
+def test_start_defaults_to_yes_when_moving_a_link_to_a_different_task():
+    # Blank input accepts the confirm's default - which must be yes here,
+    # unlike the tag question: typing a different task is usually a
+    # deliberate correction, not something to be wary of by default.
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(
+        app, ["start", "10b", "https://example.com/issues/1"], input="\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    link = Link.objects.get()
+    assert link.task.name == "10b"
+
+
+def test_start_declining_the_task_change_leaves_the_old_task():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(
+        app, ["start", "10b", "https://example.com/issues/1"], input="n\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    link = Link.objects.get()
+    assert link.task.name == "10a"
+
+
+def test_start_does_not_ask_when_the_task_already_matches():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    assert "is under task" not in result.output
+
+
+def test_start_assigns_a_taskless_link_without_asking():
+    task = Task.objects.create(name="10a")
+    Link.objects.create(url="https://example.com/issues/1")
+
+    result = runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    assert "is under task" not in result.output
+    link = Link.objects.get()
+    assert link.task == task
+
+
+def test_implement_on_a_different_task_asks_before_moving_it():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["implement", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(
+        app, ["implement", "10b", "https://example.com/issues/1"], input="y\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    link = Link.objects.get()
+    assert link.task.name == "10b"
+
+
 def test_token_without_args_prints_instructions_and_saves_nothing():
     result = runner.invoke(app, ["token"])
 
@@ -1681,6 +2511,7 @@ def test_help_lists_commands_alphabetically():
         "alias",
         "backup",
         "edit",
+        "implement",
         "migrate",
         "mou",
         "report",
@@ -1720,6 +2551,7 @@ def test_report_help_lists_subcommands_alphabetically():
         "list",
         "print",
         "remove",
+        "review",
     ]
 
 
@@ -1799,6 +2631,22 @@ def test_alias_set_fails_cleanly_on_a_validation_error():
     assert "No such MoU" in result.output
 
 
+def test_alias_set_rejects_an_unknown_item_type():
+    result = runner.invoke(app, ["alias", "set", "bogus", "x", "y"])
+
+    assert result.exit_code != 0
+    assert "mou" in result.output
+    assert "task" in result.output
+    assert "url" in result.output
+
+
+def test_alias_set_help_shows_the_item_choices():
+    result = runner.invoke(app, ["alias", "set", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "mou|task|url" in result.output
+
+
 def test_alias_remove_by_alias_name():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
@@ -1845,7 +2693,7 @@ def test_alias_rename_fails_for_an_unknown_alias():
     assert "No mou alias" in result.output
 
 
-def test_alias_rename_rejects_a_collision_with_the_new_name():
+def test_alias_rename_steals_a_collision_with_the_new_name():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["mou", "add", "nlnet-2027"])
     runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
@@ -1853,10 +2701,45 @@ def test_alias_rename_rejects_a_collision_with_the_new_name():
 
     result = runner.invoke(app, ["alias", "rename", "mou", "og", "new"])
 
-    assert result.exit_code != 0
-    assert "already used for mou" in result.output
-    # the original alias must survive a failed rename
-    assert Alias.objects.filter(item_type="mou", alias="og").exists()
+    assert result.exit_code == 0, result.output
+    assert "Replaced alias 'new' (was for mou 'nlnet-2027')" in result.output
+    assert Alias.objects.filter(item_type="mou", alias="og").exists() is False
+    renamed = Alias.objects.get(item_type="mou", alias="new")
+    assert renamed.target == "nlnet-2026"
+
+
+def test_alias_set_prints_when_it_steals_an_alias_from_another_target():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["mou", "add", "nlnet-2027"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+
+    result = runner.invoke(app, ["alias", "set", "mou", "nlnet-2027", "og"])
+
+    assert result.exit_code == 0, result.output
+    assert "Set alias 'og' for mou 'nlnet-2027'." in result.output
+    assert "Replaced alias 'og' (was for mou 'nlnet-2026')" in result.output
+    assert Alias.objects.get(item_type="mou", alias="og").target == "nlnet-2027"
+
+
+def test_alias_set_prints_when_it_replaces_the_targets_existing_alias():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "old"])
+
+    result = runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "new"])
+
+    assert result.exit_code == 0, result.output
+    assert "Set alias 'new' for mou 'nlnet-2026'." in result.output
+    assert "Replaced alias 'old' (was for mou 'nlnet-2026')" in result.output
+    assert Alias.objects.filter(item_type="mou", alias="old").exists() is False
+
+
+def test_alias_set_prints_nothing_extra_when_nothing_was_replaced():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
+
+    assert result.exit_code == 0, result.output
+    assert "Replaced" not in result.output
 
 
 def test_alias_list_shows_everything_by_default():
@@ -1961,7 +2844,7 @@ def test_start_resolves_a_url_alias(settings):
     )
 
     with patch(
-        "nlnet_rfp_recorder.timetracking.models.classify_issue_or_pr",
+        "nlnet_rfp_recorder.timetracking.models.alias.classify_issue_or_pr",
         return_value="pull",
     ):
         result = runner.invoke(app, ["start", "ical/1782"])
@@ -2036,15 +2919,14 @@ def test_start_shows_the_task_alias_in_confirmation(settings):
     assert "Started time entry for task 10a (lib)" in result.output
 
 
-def test_report_print_preview_shows_aliases(settings):
+def test_report_print_preview_shows_no_aliases(settings):
     settings.RFP_EUROS = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
     TimeRecord.objects.create(
-        link=link,
-        start_time=timezone.now() - timedelta(minutes=30),
-        end_time=timezone.now(),
+        link=link, start_time=now - timedelta(minutes=30), end_time=now
     )
     runner.invoke(app, ["alias", "set", "mou", "nlnet-2026", "og"])
     runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
@@ -2052,5 +2934,7 @@ def test_report_print_preview_shows_aliases(settings):
     result = runner.invoke(app, ["report", "print"])
 
     assert result.exit_code == 0, result.output
-    assert "MoU: nlnet-2026 (og)" in result.output
-    assert "10a (lib): 10€" in result.output
+    assert "MoU: nlnet-2026" in result.output
+    assert "10a: 10€" in result.output
+    assert "og" not in result.output
+    assert "lib" not in result.output

@@ -17,6 +17,9 @@ ISSUE_URL = re.compile(
 PULL_REQUEST_URL = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)/?$"
 )
+DISCUSSION_URL = re.compile(
+    r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/discussions/(?P<number>\d+)/?$"
+)
 REPO_URL = re.compile(r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)/?$")
 
 
@@ -99,6 +102,49 @@ def classify_issue_or_pr(
     return "pull" if "pull_request" in response.json() else "issues"
 
 
+def fetch_title(
+    owner: str, repo: str, number: int, token: str | None = None
+) -> str | None:
+    """Fetch an issue or PR's title, or None if it can't be found or reached."""
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    try:
+        response = niquests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/issues/{number}",
+            headers=headers,
+            timeout=TIMEOUT_SECONDS,
+        )
+    except niquests.exceptions.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    return response.json().get("title")
+
+
+def fetch_issue_author(
+    owner: str, repo: str, number: int, token: str | None = None
+) -> str | None:
+    """Fetch an issue or PR's author login, or None if it can't be told.
+
+    None on any failure (offline, not found, unexpected response shape) -
+    the caller decides what to assume when authorship can't be confirmed.
+    """
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    try:
+        response = niquests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/issues/{number}",
+            headers=headers,
+            timeout=TIMEOUT_SECONDS,
+        )
+    except niquests.exceptions.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        return response.json()["user"]["login"]
+    except KeyError, TypeError:
+        return None
+
+
 @dataclass
 class GitHubReference:
     owner: str
@@ -147,6 +193,21 @@ class GitHubReference:
             data = await data
         return Status(data["state"])
 
+    async def current_title_async(
+        self, session: niquests.AsyncSession, token: str | None = None
+    ) -> str | None:
+        path = f"repos/{self.owner}/{self.repo}/{self._api_resource}/{self.number}"
+        headers = {"Authorization": f"Bearer {token}"} if token else None
+        response = await session.get(
+            f"{GITHUB_API}/{path}", headers=headers, timeout=TIMEOUT_SECONDS
+        )
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        if inspect.isawaitable(data):
+            data = await data
+        return data.get("title")
+
 
 @dataclass
 class Issue(GitHubReference):
@@ -171,6 +232,21 @@ class PullRequest(GitHubReference):
     @classmethod
     def from_url(cls, url: str) -> PullRequest | None:
         match = PULL_REQUEST_URL.match(url)
+        if match is None:
+            return None
+        return cls(
+            owner=match["owner"], repo=match["repo"], number=int(match["number"])
+        )
+
+
+@dataclass
+class Discussion(GitHubReference):
+    _api_resource: ClassVar[str] = "discussions"
+    _web_path: ClassVar[str] = "discussions"
+
+    @classmethod
+    def from_url(cls, url: str) -> Discussion | None:
+        match = DISCUSSION_URL.match(url)
         if match is None:
             return None
         return cls(
@@ -208,3 +284,33 @@ def fetch_statuses(
 ) -> list[Status]:
     """Sync entry point for fetch_statuses_async."""
     return asyncio.run(fetch_statuses_async(list(references), token))
+
+
+async def fetch_titles_async(
+    references: Iterable[GitHubReference], token: str | None = None
+) -> list[str | None]:
+    """Fetch current_title_async for every reference concurrently, one session.
+
+    Same return_exceptions=True reasoning as fetch_statuses_async: closing
+    the session out from under still-running requests (because gather
+    re-raised early) deadlocks instead of raising.
+    """
+    async with niquests.AsyncSession() as session:
+        results = await asyncio.gather(
+            *(
+                reference.current_title_async(session, token)
+                for reference in references
+            ),
+            return_exceptions=True,
+        )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
+
+
+def fetch_titles(
+    references: Iterable[GitHubReference], token: str | None = None
+) -> list[str | None]:
+    """Sync entry point for fetch_titles_async."""
+    return asyncio.run(fetch_titles_async(list(references), token))

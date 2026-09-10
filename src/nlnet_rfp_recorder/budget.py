@@ -23,11 +23,24 @@ class BudgetLine:
     def remaining(self) -> float:
         return self.total - self.used
 
-    def __str__(self) -> str:
-        line = f"Budget {self.used:.0f}€/{self.total:.0f}€"
+    @property
+    def money(self) -> str:
+        return f"{self.used:.0f}€/{self.total:.0f}€"
+
+    @property
+    def time_left(self) -> str | None:
+        """Raw 'H:MM' remaining, "DONE" if fully used, or None if the
+        rate (euros/hour) isn't known.
+        """
         if self.rate is None:
-            return line
+            return None
         remaining = format_duration_hours(self.remaining / self.rate)
-        if remaining == "0:00":
-            return f"{line} - DONE"
-        return f"{line} - {remaining} left"
+        return "DONE" if remaining == "0:00" else remaining
+
+    def __str__(self) -> str:
+        time_left = self.time_left
+        if time_left is None:
+            return self.money
+        if time_left == "DONE":
+            return f"{self.money} {time_left}"
+        return f"{self.money} {time_left} left"

@@ -5,11 +5,16 @@ import pytest
 
 from nlnet_rfp_recorder.github import (
     TIMEOUT_SECONDS,
+    Discussion,
     Issue,
     PullRequest,
     Status,
     classify_issue_or_pr,
+    fetch_authenticated_login,
+    fetch_issue_author,
     fetch_statuses,
+    fetch_title,
+    fetch_titles,
     parse_repo_url,
 )
 
@@ -46,6 +51,24 @@ def test_pull_request_from_url_rejects_an_issue_url():
     assert (
         PullRequest.from_url("https://github.com/nlnet/rfp-recorder/issues/7") is None
     )
+
+
+def test_discussion_from_url_parses_owner_repo_and_number():
+    discussion = Discussion.from_url(
+        "https://github.com/nlnet/rfp-recorder/discussions/3"
+    )
+
+    assert discussion == Discussion(owner="nlnet", repo="rfp-recorder", number=3)
+
+
+def test_discussion_from_url_rejects_an_issue_url():
+    assert Discussion.from_url("https://github.com/nlnet/rfp-recorder/issues/3") is None
+
+
+def test_discussion_url_reconstructs_the_web_url():
+    discussion = Discussion(owner="nlnet", repo="rfp-recorder", number=3)
+
+    assert discussion.url == "https://github.com/nlnet/rfp-recorder/discussions/3"
 
 
 def test_issue_current_status_queries_the_github_api():
@@ -198,6 +221,85 @@ def test_fetch_statuses_runs_requests_concurrently_in_one_session():
     assert session.get.call_count == 2
 
 
+@pytest.mark.asyncio
+async def test_current_title_async_queries_the_github_api():
+    issue = Issue(owner="nlnet", repo="rfp-recorder", number=42)
+    response = MagicMock(status_code=200)
+    response.json = MagicMock(return_value={"title": "Fix the thing"})
+    session = MagicMock()
+    session.get = AsyncMock(return_value=response)
+
+    title = await issue.current_title_async(session)
+
+    session.get.assert_called_once_with(
+        "https://api.github.com/repos/nlnet/rfp-recorder/issues/42",
+        headers=None,
+        timeout=TIMEOUT_SECONDS,
+    )
+    assert title == "Fix the thing"
+
+
+@pytest.mark.asyncio
+async def test_current_title_async_returns_none_when_not_found():
+    issue = Issue(owner="nlnet", repo="rfp-recorder", number=999999)
+    response = MagicMock(status_code=404)
+    session = MagicMock()
+    session.get = AsyncMock(return_value=response)
+
+    title = await issue.current_title_async(session)
+
+    assert title is None
+
+
+def test_fetch_titles_runs_requests_concurrently_in_one_session():
+    issue = Issue(owner="nlnet", repo="rfp-recorder", number=1)
+    pr = PullRequest(owner="nlnet", repo="rfp-recorder", number=2)
+    response = MagicMock(status_code=200)
+    response.json = MagicMock(return_value={"title": "Some title"})
+    session = MagicMock()
+    session.get = AsyncMock(return_value=response)
+
+    with patch(
+        "nlnet_rfp_recorder.github.niquests.AsyncSession", return_value=session
+    ) as async_session:
+        async_session.return_value.__aenter__ = AsyncMock(return_value=session)
+        async_session.return_value.__aexit__ = AsyncMock(return_value=False)
+        titles = fetch_titles([issue, pr])
+
+    assert titles == ["Some title", "Some title"]
+    assert session.get.call_count == 2
+
+
+def test_fetch_titles_raises_after_every_request_finishes():
+    # Same deadlock hazard as fetch_statuses: don't close the session
+    # while a sibling request is still in flight because gather()
+    # re-raised the first exception early.
+    issue = Issue(owner="nlnet", repo="rfp-recorder", number=1)
+    forbidden_pr = PullRequest(owner="nlnet", repo="rfp-recorder", number=2)
+    ok_pr = PullRequest(owner="nlnet", repo="rfp-recorder", number=3)
+
+    ok_response = MagicMock(status_code=200)
+    ok_response.json = MagicMock(return_value={"title": "ok"})
+
+    async def fake_get(url, **kwargs):
+        if url.endswith("/pulls/2"):
+            raise niquests.exceptions.HTTPError("boom")
+        return ok_response
+
+    session = MagicMock()
+    session.get = AsyncMock(side_effect=fake_get)
+
+    with patch(
+        "nlnet_rfp_recorder.github.niquests.AsyncSession", return_value=session
+    ) as async_session:
+        async_session.return_value.__aenter__ = AsyncMock(return_value=session)
+        async_session.return_value.__aexit__ = AsyncMock(return_value=False)
+        with pytest.raises(niquests.exceptions.HTTPError):
+            fetch_titles([issue, forbidden_pr, ok_pr])
+
+    assert session.get.call_count == 3
+
+
 def test_parse_repo_url_splits_owner_and_repo():
     assert parse_repo_url("https://github.com/collective/icalendar") == (
         "collective",
@@ -283,6 +385,138 @@ def test_classify_issue_or_pr_raises_on_a_real_error():
     with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response):
         with pytest.raises(niquests.exceptions.HTTPError):
             classify_issue_or_pr("collective", "icalendar", 1782)
+
+
+def test_fetch_title_returns_the_title():
+    response = Mock(status_code=200, json=Mock(return_value={"title": "Fix the thing"}))
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response) as get:
+        result = fetch_title("collective", "icalendar", 1782)
+
+    get.assert_called_once_with(
+        "https://api.github.com/repos/collective/icalendar/issues/1782",
+        headers=None,
+        timeout=TIMEOUT_SECONDS,
+    )
+    assert result == "Fix the thing"
+
+
+def test_fetch_title_sends_the_token_as_a_bearer_header():
+    response = Mock(status_code=200, json=Mock(return_value={"title": "x"}))
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response) as get:
+        fetch_title("collective", "icalendar", 1782, token="secret")
+
+    get.assert_called_once_with(
+        "https://api.github.com/repos/collective/icalendar/issues/1782",
+        headers={"Authorization": "Bearer secret"},
+        timeout=TIMEOUT_SECONDS,
+    )
+
+
+def test_fetch_title_returns_none_when_not_found():
+    response = Mock(status_code=404)
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response):
+        result = fetch_title("collective", "icalendar", 999999)
+
+    assert result is None
+
+
+def test_fetch_title_returns_none_on_a_server_error():
+    response = Mock(status_code=500)
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response):
+        result = fetch_title("collective", "icalendar", 1782)
+
+    assert result is None
+
+
+def test_fetch_title_returns_none_when_offline():
+    with patch(
+        "nlnet_rfp_recorder.github.niquests.get",
+        side_effect=niquests.exceptions.ConnectionError("no network"),
+    ):
+        result = fetch_title("collective", "icalendar", 1782)
+
+    assert result is None
+
+
+def test_fetch_issue_author_returns_the_login():
+    response = Mock(
+        status_code=200, json=Mock(return_value={"user": {"login": "octocat"}})
+    )
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response) as get:
+        result = fetch_issue_author("collective", "icalendar", 1782)
+
+    get.assert_called_once_with(
+        "https://api.github.com/repos/collective/icalendar/issues/1782",
+        headers=None,
+        timeout=TIMEOUT_SECONDS,
+    )
+    assert result == "octocat"
+
+
+def test_fetch_issue_author_sends_the_token_as_a_bearer_header():
+    response = Mock(
+        status_code=200, json=Mock(return_value={"user": {"login": "octocat"}})
+    )
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response) as get:
+        fetch_issue_author("collective", "icalendar", 1782, token="secret")
+
+    get.assert_called_once_with(
+        "https://api.github.com/repos/collective/icalendar/issues/1782",
+        headers={"Authorization": "Bearer secret"},
+        timeout=TIMEOUT_SECONDS,
+    )
+
+
+def test_fetch_issue_author_returns_none_when_not_found():
+    response = Mock(status_code=404)
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response):
+        result = fetch_issue_author("collective", "icalendar", 999999)
+
+    assert result is None
+
+
+def test_fetch_issue_author_returns_none_on_unexpected_response_shape():
+    response = Mock(status_code=200, json=Mock(return_value={"no": "user field"}))
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response):
+        result = fetch_issue_author("collective", "icalendar", 1782)
+
+    assert result is None
+
+
+def test_fetch_issue_author_returns_none_when_offline():
+    with patch(
+        "nlnet_rfp_recorder.github.niquests.get",
+        side_effect=niquests.exceptions.ConnectionError("no network"),
+    ):
+        result = fetch_issue_author("collective", "icalendar", 1782)
+
+    assert result is None
+
+
+def test_fetch_authenticated_login_returns_the_login():
+    response = Mock(status_code=200, json=Mock(return_value={"login": "octocat"}))
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response):
+        result = fetch_authenticated_login("secret")
+
+    assert result == "octocat"
+
+
+def test_fetch_authenticated_login_returns_none_when_rejected():
+    response = Mock(status_code=401)
+
+    with patch("nlnet_rfp_recorder.github.niquests.get", return_value=response):
+        result = fetch_authenticated_login("bad-token")
+
+    assert result is None
 
 
 def test_fetch_statuses_raises_after_every_request_finishes():

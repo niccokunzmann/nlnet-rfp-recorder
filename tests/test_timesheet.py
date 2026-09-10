@@ -75,3 +75,27 @@ def test_read_csv_treats_blank_pk_as_none():
             tags="",
         )
     ]
+
+
+def test_read_csv_skips_blank_and_whitespace_only_lines():
+    text = (
+        "pk,mou,task,start,duration,link,tags\n"
+        "\n"
+        "   \n"
+        ",my-mou,4a,2026-01-01T10:00:00,00:10:00,https://x,\n"
+        "  \t  \n"
+    )
+
+    rows = read_csv(text)
+
+    assert rows == [
+        TimesheetRow(
+            pk=None,
+            mou="my-mou",
+            task="4a",
+            start="2026-01-01T10:00:00",
+            duration="00:10:00",
+            link="https://x",
+            tags="",
+        )
+    ]

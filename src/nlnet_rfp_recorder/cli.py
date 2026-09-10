@@ -12,11 +12,18 @@ import django
 import typer
 from typer.core import TyperGroup
 
+from nlnet_rfp_recorder.alias_types import AliasItemType
 from nlnet_rfp_recorder.budget import format_duration_hours
 from nlnet_rfp_recorder.timesheet import TimesheetRow, parse_hhmmss
 
 if TYPE_CHECKING:
-    from nlnet_rfp_recorder.timetracking.models import MoU, Task, TimeRecord
+    from nlnet_rfp_recorder.timetracking.models import (
+        Link,
+        MoU,
+        ReportLine,
+        Task,
+        TimeRecord,
+    )
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "nlnet_rfp_recorder.settings")
 
@@ -40,7 +47,12 @@ TestOption = typer.Option(
     help="Run against a throwaway database in /tmp, pre-filled with sample data.",
 )
 TagsOption = typer.Option(
-    "implementation", "--tags", help="Comma-separated tags (implementation, review)."
+    None,
+    "--tags",
+    help=(
+        "Tag for this entry (implementation, review). Default: guessed "
+        "from whether your saved GitHub token opened this issue/PR."
+    ),
 )
 
 TEST_DB_FILE = Path(tempfile.gettempdir()) / "rfp-test.sqlite3"
@@ -95,6 +107,118 @@ def _resolve_link_or_fail(link: str) -> str:
         _fail(str(error))
 
 
+def _select_task_or_fail(name: str) -> Task:
+    """Select a task by name/alias, creating it if needed - same as `task select`."""
+    from django.core.exceptions import ValidationError
+
+    from nlnet_rfp_recorder.timetracking.models import MoU, Task, resolve_task_name
+
+    mou = MoU.get_selected()
+    name = resolve_task_name(name, mou)
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            task = Task.select(name, mou=mou)
+    except ValidationError as error:
+        _fail("; ".join(error.messages))
+    except ValueError as error:
+        _fail(str(error))
+
+    for warning in caught:
+        typer.echo(str(warning.message), err=True)
+    return task
+
+
+def _default_tag(link: str) -> str:
+    """ "implementation" if the authenticated GitHub user opened this
+    issue/PR, "review" otherwise - the guess used when --tags isn't given.
+
+    Falls back to "implementation" (the previous, unconditional default)
+    whenever this can't be confirmed: no GitHub token saved, the link
+    isn't an issue/PR, or GitHub can't be reached - a network hiccup
+    should never silently relabel someone's own work as a review.
+    """
+    import niquests
+
+    from nlnet_rfp_recorder.github import (
+        Issue,
+        PullRequest,
+        fetch_authenticated_login,
+        fetch_issue_author,
+    )
+    from nlnet_rfp_recorder.timetracking.models import GitHubToken
+
+    reference = PullRequest.from_url(link) or Issue.from_url(link)
+    token = GitHubToken.get()
+    if reference is None or token is None:
+        return "implementation"
+
+    try:
+        my_login = fetch_authenticated_login(token)
+        author_login = fetch_issue_author(
+            reference.owner, reference.repo, reference.number, token=token
+        )
+    except niquests.exceptions.RequestException:
+        return "implementation"
+
+    if not my_login or not author_login:
+        return "implementation"
+    return "implementation" if my_login.lower() == author_login.lower() else "review"
+
+
+def _apply_start_tag(link: Link, desired_tag: str) -> None:
+    """Classify `link` as `desired_tag` ("implementation" or "review").
+
+    A link with no such tag yet gets it right away - there's nothing to
+    conflict with. One already classified differently is only changed
+    after asking, since a link's tag governs every time entry recorded
+    against it, not just the one just started - which is why this always
+    runs after that entry already exists (see _start): the question can
+    wait, starting the clock can't.
+    """
+    from nlnet_rfp_recorder.timetracking.models import TAG_NAMES, Tag
+
+    current = {tag.name for tag in link.tags.all() if tag.name in TAG_NAMES}
+    if desired_tag in current:
+        return
+    if not current:
+        link.add_tag(desired_tag)
+        return
+
+    old = ", ".join(sorted(current))
+    typer.echo(f"{link.url} is tagged '{old}', but this looks like '{desired_tag}'.")
+    if typer.confirm(f"Change it to '{desired_tag}' for all its time entries?"):
+        link.tags.remove(*Tag.objects.filter(name__in=current))
+        link.add_tag(desired_tag)
+        typer.echo(f"Tag changed to '{desired_tag}'.")
+
+
+def _apply_start_task(link: Link, desired_task: Task) -> None:
+    """Move `link` to `desired_task` if it currently belongs elsewhere.
+
+    A link with no task yet is simply assigned - nothing to ask about.
+    One already under a different task defaults to yes when asked,
+    unlike the tag question: typing a different task while starting,
+    reviewing, or implementing a link is usually a deliberate
+    correction, not a conflict to be wary of.
+    """
+    if link.task_id == desired_task.id:
+        return
+    if link.task_id is None:
+        link.task = desired_task
+        link.save(update_fields=["task"])
+        return
+
+    typer.echo(
+        f"{link.url} is under task {link.task.display_name}, but this "
+        f"looks like {desired_task.display_name}."
+    )
+    if typer.confirm(f"Change it to {desired_task.display_name}?", default=True):
+        link.task = desired_task
+        link.save(update_fields=["task"])
+        typer.echo(f"Task changed to {desired_task.display_name}.")
+
+
 def _echo_task_status(task: Task) -> None:
     # A task's MoU can be None: removing an MoU orphans (not deletes) its
     # tasks, so a still-selected task can outlive its MoU.
@@ -103,6 +227,8 @@ def _echo_task_status(task: Task) -> None:
     )
     typer.echo(f"MoU: {mou_name}")
     typer.echo(f"Selected task: {task.display_name}")
+    if task.description:
+        typer.echo(task.description)
     if task.budget_line is not None:
         typer.echo(str(task.budget_line))
 
@@ -125,6 +251,37 @@ def _read_budget_from_stdin() -> str:
         lines.pop()
     typer.echo("Got it, parsing now - please stop typing.", err=True)
     return "\n".join(lines) + "\n"
+
+
+def _ask_about_removed_report_line(line: ReportLine) -> str:
+    from nlnet_rfp_recorder.github import fetch_title
+    from nlnet_rfp_recorder.timetracking.models import GitHubToken
+
+    link = line.link
+    reference = link.pr or link.issue
+    label = link.url
+    if reference is not None:
+        token = GitHubToken.get()
+        title = fetch_title(
+            reference.owner, reference.repo, reference.number, token=token
+        )
+        if title:
+            label = f"{title} ({link.url})"
+
+    typer.echo(f"\nNo longer in the imported file: {label}", err=True)
+    typer.echo(
+        "  1) remove from this report only - stays reportable later (default)",
+        err=True,
+    )
+    typer.echo("  2) never report this link again", err=True)
+    typer.echo("  3) keep it in this report - don't remove it", err=True)
+
+    while True:
+        choice = typer.prompt("Choice", default="1", err=True).strip()
+        decision = {"1": "remove", "2": "exclude", "3": "keep"}.get(choice)
+        if decision is not None:
+            return decision
+        typer.echo("Please enter 1, 2, or 3.", err=True)
 
 
 def _complete_mou_name(incomplete: str) -> list[str]:
@@ -189,10 +346,24 @@ def _complete_link_url(incomplete: str) -> list[str]:
         return []
 
 
-def _complete_alias_item(incomplete: str) -> list[str]:
-    from nlnet_rfp_recorder.timetracking.models import ALIAS_ITEM_TYPES
+def _complete_task_or_link(incomplete: str) -> list[str]:
+    # [TASK] LINK is variadic (see _parse_task_and_link), so there's no
+    # single positional slot to hang task-only or link-only completion
+    # off of - offer both kinds of candidate together.
+    return _complete_task_name(incomplete) + _complete_link_url(incomplete)
 
-    return [item for item in ALIAS_ITEM_TYPES if item.startswith(incomplete)]
+
+def _parse_task_and_link(args: list[str], command: str) -> tuple[str | None, str]:
+    """Split a review/start [TASK] LINK argument list.
+
+    One argument is just the link (the currently selected task is used,
+    as before); two are the task name/alias followed by the link.
+    """
+    if len(args) == 1:
+        return None, args[0]
+    if len(args) == 2:
+        return args[0], args[1]
+    _fail(f"Usage: rfp {command} [TASK] LINK")
 
 
 def _complete_alias_name(ctx: typer.Context, incomplete: str) -> list[str]:
@@ -524,17 +695,75 @@ def task_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
     if mou is None:
         _fail("No MoU selected. Run `rfp mou add <name>` first.")
 
-    tasks = Task.objects.filter(mou=mou)
+    tasks = sorted(Task.objects.filter(mou=mou), key=lambda task: task.sort_key)
     if not tasks:
         typer.echo("No tasks yet. Run `rfp task select <name>` first.")
         return
 
+    # Columns line up by character position only within their own group
+    # (tasks sharing the same leading number, e.g. 10a/10b/10c) - groups
+    # can otherwise differ a lot in width ("9a" vs "10ab", "20€/500€" vs
+    # "100€/500€"), so one column width shared across all of them would
+    # either waste space or not line up anywhere. Within a group, the
+    # hour figures of "time left" also right-align on their own digits
+    # (" 1:57", "21:57", "121:57"), and the description always starts at
+    # the same character position, whether or not this particular task
+    # has a budget of its own to show before it.
+    def _time_field(task: Task, width: int) -> str:
+        time_left = task.budget_line.time_left if task.budget_line else None
+        if time_left is None:
+            return ""
+        padded = f"{time_left:>{width}}"
+        return padded if time_left == "DONE" else f"{padded} left"
+
+    def _budget_chunk(task: Task, money_width: int, time_width: int) -> str:
+        if task.budget_line is None:
+            return ""
+        money = f"{task.budget_line.money:<{money_width}}"
+        time_field = _time_field(task, time_width)
+        return money if not time_field else f"{money}  {time_field}"
+
+    name_widths: dict[int, int] = {}
+    money_widths: dict[int, int] = {}
+    time_widths: dict[int, int] = {}
+    for task in tasks:
+        group = task.sort_key[0]
+        name_widths[group] = max(name_widths.get(group, 0), len(task.display_name))
+        if task.budget_line is not None:
+            money_widths[group] = max(
+                money_widths.get(group, 0), len(task.budget_line.money)
+            )
+            if task.budget_line.time_left is not None:
+                time_widths[group] = max(
+                    time_widths.get(group, 0), len(task.budget_line.time_left)
+                )
+    chunk_widths: dict[int, int] = {}
+    for task in tasks:
+        group = task.sort_key[0]
+        chunk = _budget_chunk(
+            task, money_widths.get(group, 0), time_widths.get(group, 0)
+        )
+        chunk_widths[group] = max(chunk_widths.get(group, 0), len(chunk))
+
     for task in tasks:
         marker = "*" if task.selected else " "
-        line = f"{marker} {task.display_name}"
-        if task.budget_line is not None:
-            line += f"  {task.budget_line}"
-        typer.echo(line)
+        group = task.sort_key[0]
+        chunk = _budget_chunk(
+            task, money_widths.get(group, 0), time_widths.get(group, 0)
+        )
+
+        columns = []
+        if chunk_widths[group] > 0:
+            columns.append(f"{chunk:<{chunk_widths[group]}}")
+        if task.description:
+            columns.append(task.description)
+
+        if columns:
+            name = f"{task.display_name:<{name_widths[group]}}"
+            line = f"{marker} {name}  " + "  ".join(columns)
+        else:
+            line = f"{marker} {task.display_name}"
+        typer.echo(line.rstrip())
 
 
 @task_app.command("select")
@@ -545,24 +774,7 @@ def task_select(
 ) -> None:
     """Select a task, creating it if it doesn't exist yet."""
     _setup(db, test)
-    from django.core.exceptions import ValidationError
-
-    from nlnet_rfp_recorder.timetracking.models import MoU, Task, resolve_task_name
-
-    mou = MoU.get_selected()
-    name = resolve_task_name(name, mou)
-    try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            task = Task.select(name, mou=mou)
-    except ValidationError as error:
-        _fail("; ".join(error.messages))
-    except ValueError as error:
-        _fail(str(error))
-
-    for warning in caught:
-        typer.echo(str(warning.message), err=True)
-
+    task = _select_task_or_fail(name)
     _echo_task_status(task)
 
 
@@ -798,51 +1010,114 @@ def status(db: Path | None = DbOption, test: bool = TestOption) -> None:
         typer.echo(f"Running: {url} ({_format_duration(running.duration)})")
 
 
-def _start(link: str, tags: str) -> None:
-    from nlnet_rfp_recorder.timetracking.models import TimeRecord
+def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
+    from django.utils import timezone
 
-    link = _resolve_link_or_fail(link)
+    from nlnet_rfp_recorder.timetracking.models import Task, TimeRecord
 
-    stopped = TimeRecord.stop()
-    if stopped is not None:
-        _echo_stopped(stopped)
-
-    tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+    # Captured before anything that might touch the network (link
+    # resolution, and later the implementation/review guess) or ask the
+    # user anything, so none of that latency ever shows up as recorded
+    # time - the entry starts exactly when this command was run.
+    now = timezone.now()
+    resolved_link = _resolve_link_or_fail(link)
+    task = _select_task_or_fail(task_name) if task_name is not None else None
+    effective_task = task or Task.get_selected()
+    previously_running = TimeRecord.get_running()
 
     try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            record = TimeRecord.start(link, tags=tag_list)
+        # A link already under a different task only ever gets a warning
+        # here (never reassigned) - suppressed, since _apply_start_task
+        # below replaces it with a proper question once the entry exists.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            record = TimeRecord.start(resolved_link, task=task, tags=(), start_time=now)
     except ValueError as error:
         _fail(str(error))
 
-    for warning in caught:
-        typer.echo(str(warning.message), err=True)
+    if previously_running is not None and previously_running.pk != record.pk:
+        previously_running.refresh_from_db()
+        _echo_stopped(previously_running)
 
-    typer.echo(f"Started time entry for task {_task_name(record)}: {link}")
+    # A record whose start_time isn't `now` was resumed rather than
+    # freshly created - either it was already running, or the most
+    # recently stopped entry was for this same link and got reopened
+    # instead of fragmenting into a second row (see TimeRecord.start).
+    verb = "Continuing" if record.start_time != now else "Started"
+    typer.echo(f"{verb} time entry for task {_task_name(record)}: {resolved_link}")
+    record_task = record.link.task if record.link else None
+    if record_task is not None and record_task.description:
+        typer.echo(record_task.description)
+
+    # The clock is already running by this point - only now is it worth
+    # spending network time (if tags weren't given) or asking a question
+    # (if the link's task or tag would actually change).
+    if record.link is not None:
+        if effective_task is not None:
+            _apply_start_task(record.link, effective_task)
+        desired_tag = tags if tags is not None else _default_tag(resolved_link)
+        _apply_start_tag(record.link, desired_tag)
 
 
 @app.command()
 def start(
-    link: str = typer.Argument(..., autocompletion=_complete_link_url),
-    tags: str = TagsOption,
+    args: list[str] = typer.Argument(
+        ...,
+        metavar="[TASK] LINK",
+        autocompletion=_complete_task_or_link,
+        help=(
+            "A link to start against the currently selected task, or a "
+            "task (name or alias) followed by a link to select it first."
+        ),
+    ),
+    tags: str | None = TagsOption,
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Start a time entry for the currently selected task."""
+    """Start a time entry, optionally selecting its task first."""
     _setup(db, test)
-    _start(link, tags)
+    task_name, link = _parse_task_and_link(args, "start")
+    _start(link, tags, task_name)
 
 
 @app.command()
 def review(
-    link: str = typer.Argument(..., autocompletion=_complete_link_url),
+    args: list[str] = typer.Argument(
+        ...,
+        metavar="[TASK] LINK",
+        autocompletion=_complete_task_or_link,
+        help=(
+            "A link to review against the currently selected task, or a "
+            "task (name or alias) followed by a link to select it first."
+        ),
+    ),
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Start a time entry tagged 'review' for the currently selected task."""
+    """Start a time entry tagged 'review', optionally selecting its task first."""
     _setup(db, test)
-    _start(link, "review")
+    task_name, link = _parse_task_and_link(args, "review")
+    _start(link, "review", task_name)
+
+
+@app.command()
+def implement(
+    args: list[str] = typer.Argument(
+        ...,
+        metavar="[TASK] LINK",
+        autocompletion=_complete_task_or_link,
+        help=(
+            "A link to implement against the currently selected task, or "
+            "a task (name or alias) followed by a link to select it first."
+        ),
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Start a time entry tagged 'implementation', optionally selecting its task."""
+    _setup(db, test)
+    task_name, link = _parse_task_and_link(args, "implement")
+    _start(link, "implementation", task_name)
 
 
 @app.command()
@@ -901,7 +1176,16 @@ def stop(
 
 
 report_app = typer.Typer(
-    help="Generate and manage reports.", no_args_is_help=True, cls=AlphabeticalGroup
+    help=(
+        "Generate and manage reports.\n\n"
+        "Typical workflow: \n1) create - generate a report from unreported "
+        "time. \n2) export - to a CSV file; review/edit links there if "
+        "needed. \n3) import - load the edited CSV back into the report. "
+        "\n4) review - go task by task, drop what isn't worth reporting "
+        "yet. \n5) print - print the final report and hand it in."
+    ),
+    no_args_is_help=True,
+    cls=AlphabeticalGroup,
 )
 app.add_typer(report_app, name="report")
 
@@ -1034,13 +1318,19 @@ def report_export(
     report_id: str = typer.Argument(..., autocompletion=_complete_report_id),
     path: Path | None = typer.Argument(
         None,
-        help="Output file listing time record pks, one per line. Omit for stdout.",
+        help=(
+            "Output CSV file (task, link, title, budget, tags, records), "
+            "one row per report line, sorted by task then link. Omit for "
+            "stdout."
+        ),
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Export a report's time record pks, to edit which records belong to it."""
+    """Export a report's lines as CSV, to edit budgets, tags, or records."""
     _setup(db, test)
+    import niquests
+
     from nlnet_rfp_recorder.timetracking.models import Report
 
     try:
@@ -1048,13 +1338,18 @@ def report_export(
     except Report.DoesNotExist:
         _fail(f"No such report: {report_id}")
 
-    pks = list(report.time_records.order_by("pk").values_list("pk", flat=True))
-    text = "".join(f"{pk}\n" for pk in pks)
+    try:
+        report.ensure_link_titles()
+    except niquests.exceptions.RequestException as error:
+        _fail(f"Could not fetch issue/PR titles from GitHub: {error}")
+
+    text = report.export_lines()
     if path is None:
         typer.echo(text, nl=False)
     else:
         path.write_text(text)
-        typer.echo(f"Exported {len(pks)} time record pks to {path}")
+        line_count = report.lines.count()
+        typer.echo(f"Exported {line_count} report lines to {path}")
 
 
 @report_app.command("import")
@@ -1064,37 +1359,90 @@ def report_import(
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Replace a report's time records from a file of pks, one per line."""
+    """Replace a report's lines from a CSV file produced by `report export`.
+
+    A line no longer in the file is asked about individually - fetching
+    its issue/PR title from GitHub - so you can choose to just remove it
+    from this report, exclude it from reports permanently, or keep it
+    after all.
+    """
     _setup(db, test)
-    from nlnet_rfp_recorder.timetracking.models import Report, TimeRecord
+    from nlnet_rfp_recorder.timetracking.models import Report
 
     try:
         report = Report.objects.get(pk=report_id)
     except Report.DoesNotExist:
         _fail(f"No such report: {report_id}")
 
-    lines = [line.strip() for line in path.read_text().splitlines() if line.strip()]
     try:
-        wanted_pks = {int(line) for line in lines}
-    except ValueError:
-        _fail(f"Invalid pk in {path}; expected one integer per line.")
+        report.import_lines(path.read_text(), on_remove=_ask_about_removed_report_line)
+    except ValueError as error:
+        _fail(str(error))
 
-    current_pks = set(report.time_records.values_list("pk", flat=True))
+    typer.echo(f"Report {report_id} now has {report.lines.count()} report lines.")
 
-    for pk in current_pks - wanted_pks:
-        report.remove_time_record(TimeRecord.objects.get(pk=pk))
 
-    for pk in wanted_pks - current_pks:
-        try:
-            record = TimeRecord.objects.get(pk=pk)
-        except TimeRecord.DoesNotExist:
-            _fail(f"No such time record: {pk}")
-        try:
-            report.add_time_record(record)
-        except ValueError as error:
-            _fail(str(error))
+# Below this, a task defaults to being excluded when reviewing a report -
+# a few euros usually isn't worth the paperwork of submitting it now,
+# when it can just as well wait and be claimed by a later report.
+REVIEW_DEFAULT_EXCLUDE_BELOW = 50
 
-    typer.echo(f"Report {report_id} now has {len(wanted_pks)} time records.")
+
+@report_app.command("review")
+def report_review(
+    report_id: str = typer.Argument(..., autocompletion=_complete_report_id),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Walk through a report task by task, deciding what actually gets reported.
+
+    Each task is printed exactly as it would appear in the report, then
+    you're asked whether to use it as is (default) or exclude it for now
+    - tasks under 50EUR default to excluded. Excluding a task only
+    detaches its time records from this report; they stay reportable
+    later. Nothing changes until you confirm the summary at the end.
+    """
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Report
+
+    try:
+        report = Report.objects.get(pk=report_id)
+    except Report.DoesNotExist:
+        _fail(f"No such report: {report_id}")
+
+    task_reviews = report.review_tasks()
+    if not task_reviews:
+        typer.echo(f"Report {report_id} has no lines to review.")
+        return
+
+    included: list[Task | None] = []
+    excluded: list[Task | None] = []
+    for task, block, task_total in task_reviews:
+        typer.echo(f"\n{block}")
+        task_display = task.display_name if task is not None else "?"
+        default = task_total >= REVIEW_DEFAULT_EXCLUDE_BELOW
+        use_as_is = typer.confirm(f"Use {task_display} as is?", default=default)
+        (included if use_as_is else excluded).append(task)
+
+    def _names(tasks: list[Task | None]) -> str:
+        names = [task.display_name if task is not None else "?" for task in tasks]
+        return ", ".join(names) if names else "none"
+
+    typer.echo("\nSummary:")
+    typer.echo(f"  Included: {_names(included)}")
+    typer.echo(f"  Excluded: {_names(excluded)}")
+
+    if not excluded:
+        typer.echo("Nothing to change.")
+        return
+
+    if not typer.confirm("Write these changes?"):
+        typer.echo("Cancelled - report left unchanged.")
+        return
+
+    for task in excluded:
+        report.remove_task_lines(task)
+    typer.echo(f"Report {report_id} updated: {len(excluded)} task(s) removed.")
 
 
 alias_app = typer.Typer(
@@ -1116,7 +1464,7 @@ def alias_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
 @alias_app.command("set")
 def alias_set(
-    item: str = typer.Argument(..., autocompletion=_complete_alias_item),
+    item: AliasItemType = typer.Argument(...),
     id: str = typer.Argument(
         ..., help="mou: MoU name. task: task code. url: repo base URL."
     ),
@@ -1129,17 +1477,20 @@ def alias_set(
     from nlnet_rfp_recorder.timetracking.models import Alias, MoU
 
     mou = MoU.get_selected() if item == "task" else None
+    replaced = list(Alias.conflicts_for(item, id, alias, mou))
     try:
         created = Alias.create(item, id, alias, mou=mou)
     except ValueError as error:
         _fail(str(error))
 
     typer.echo(f"Set alias {created.alias!r} for {item} {created.target!r}.")
+    for old in replaced:
+        typer.echo(f"Replaced alias {old.alias!r} (was for {item} {old.target!r}).")
 
 
 @alias_app.command("remove")
 def alias_remove(
-    item: str = typer.Argument(..., autocompletion=_complete_alias_item),
+    item: AliasItemType = typer.Argument(...),
     id_or_alias: str = typer.Argument(
         ..., autocompletion=_complete_alias_name, help="An alias, or the id it names."
     ),
@@ -1170,7 +1521,7 @@ def alias_remove(
 
 @alias_app.command("rename")
 def alias_rename(
-    item: str = typer.Argument(..., autocompletion=_complete_alias_item),
+    item: AliasItemType = typer.Argument(...),
     old_alias: str = typer.Argument(..., autocompletion=_complete_alias_name),
     new_alias: str = typer.Argument(...),
     db: Path | None = DbOption,
@@ -1190,18 +1541,27 @@ def alias_rename(
     except Alias.DoesNotExist:
         _fail(f"No {item} alias: {old_alias}")
 
+    # create() below will also remove `existing` itself (same target) -
+    # only report conflicts beyond that, i.e. new_alias stolen from
+    # something else.
+    replaced = [
+        row
+        for row in Alias.conflicts_for(item, existing.target, new_alias, mou)
+        if row.pk != existing.pk
+    ]
     try:
         replacement = Alias.create(item, existing.target, new_alias, mou=mou)
     except ValueError as error:
         _fail(str(error))
-    existing.delete()
 
     typer.echo(f"Renamed alias {old_alias!r} to {replacement.alias!r} for {item}.")
+    for old in replaced:
+        typer.echo(f"Replaced alias {old.alias!r} (was for {item} {old.target!r}).")
 
 
 @alias_app.command("list")
 def alias_list(
-    item: str | None = typer.Argument(None, autocompletion=_complete_alias_item),
+    item: AliasItemType | None = typer.Argument(None),
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:

@@ -47,10 +47,22 @@ def write_csv(rows: list[TimesheetRow]) -> str:
     return buffer.getvalue()
 
 
+def _is_blank_row(row: dict[str, str | None]) -> bool:
+    """True for a csv.DictReader row from a blank or whitespace-only line.
+
+    csv.DictReader only drops a truly empty line on its own; one with
+    stray whitespace comes back as a row with one None-filled field per
+    extra column instead.
+    """
+    return not any(value and value.strip() for value in row.values())
+
+
 def read_csv(text: str) -> list[TimesheetRow]:
     reader = csv.DictReader(io.StringIO(text))
     rows = []
     for line in reader:
+        if _is_blank_row(line):
+            continue
         pk = line["pk"].strip() if line.get("pk") else ""
         rows.append(
             TimesheetRow(
