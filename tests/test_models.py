@@ -106,7 +106,7 @@ def test_duration_of_a_running_record_counts_up_to_now():
 
 
 def test_budget_is_none_without_rfp_euros(settings):
-    settings.RFP_EUROS = None
+    settings.RFP_EUROS_PER_HOUR = None
     record = TimeRecord.objects.create(
         start_time=datetime(2026, 9, 4, 9, 0),
         end_time=datetime(2026, 9, 4, 10, 30),
@@ -116,7 +116,7 @@ def test_budget_is_none_without_rfp_euros(settings):
 
 
 def test_budget_is_computed_from_rfp_euros(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     record = TimeRecord.objects.create(
         start_time=datetime(2026, 9, 4, 9, 0),
         end_time=datetime(2026, 9, 4, 10, 30),
@@ -266,7 +266,7 @@ def test_task_duration_counts_a_running_record_live():
 
 
 def test_task_budget_is_none_without_rfp_euros(settings):
-    settings.RFP_EUROS = None
+    settings.RFP_EUROS_PER_HOUR = None
     task = Task.objects.create(name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     TimeRecord.objects.create(
@@ -279,7 +279,7 @@ def test_task_budget_is_none_without_rfp_euros(settings):
 
 
 def test_task_budget_is_computed_from_rfp_euros(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     task = Task.objects.create(name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     TimeRecord.objects.create(
@@ -295,7 +295,7 @@ def test_task_budget_includes_reported_lines_plus_live_unreported_time(settings)
     # Once time is part of a report, its contribution comes from the
     # report line's locked-in budget - separately from whatever is still
     # unreported, which is still computed live from time records.
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     reported_link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -316,7 +316,7 @@ def test_task_budget_includes_reported_lines_plus_live_unreported_time(settings)
 def test_task_budget_does_not_double_count_more_time_on_a_reported_link(settings):
     # More time tracked against an already-reported link must not silently
     # inflate the task's budget beyond what the report line locked in.
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -335,7 +335,7 @@ def test_task_budget_does_not_double_count_more_time_on_a_reported_link(settings
 
 
 def test_task_reported_budget_reflects_a_manual_override(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1370,7 +1370,7 @@ def test_report_remove_time_record_rejects_a_record_from_another_report():
 
 
 def test_report_add_time_record_groups_same_link_records_into_one_line(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1393,7 +1393,7 @@ def test_report_add_time_record_groups_same_link_records_into_one_line(settings)
 
 
 def test_report_add_time_record_seeds_line_tags_from_the_link(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1412,7 +1412,7 @@ def test_report_add_time_record_seeds_line_tags_from_the_link(settings):
 
 
 def test_report_line_tags_are_independent_of_the_links_tags(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1436,7 +1436,7 @@ def test_report_line_tags_are_independent_of_the_links_tags(settings):
 
 
 def test_report_remove_time_record_deletes_an_empty_line(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1454,7 +1454,7 @@ def test_report_remove_time_record_deletes_an_empty_line(settings):
 
 
 def test_report_remove_orphans_time_records_when_the_report_is_deleted(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1473,7 +1473,7 @@ def test_report_remove_orphans_time_records_when_the_report_is_deleted(settings)
 
 
 def test_report_review_tasks_matches_generate_report_per_task(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task_a = Task.objects.create(mou=mou, name="10a")
     task_b = Task.objects.create(mou=mou, name="10b")
@@ -1520,7 +1520,7 @@ def test_report_review_tasks_empty_for_a_report_with_no_lines(settings):
 
 
 def test_report_remove_task_lines_detaches_records_but_keeps_them(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1541,7 +1541,7 @@ def test_report_remove_task_lines_detaches_records_but_keeps_them(settings):
 
 
 def test_report_remove_task_lines_only_affects_the_given_task(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task_a = Task.objects.create(mou=mou, name="10a")
     task_b = Task.objects.create(mou=mou, name="10b")
@@ -1570,7 +1570,7 @@ def test_report_remove_task_lines_only_affects_the_given_task(settings):
 
 
 def test_report_remove_task_lines_handles_links_with_no_task(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     link = Link.objects.create(url="https://example.com/issues/1")
     record = TimeRecord.objects.create(
@@ -1591,7 +1591,7 @@ def test_report_remove_task_lines_handles_links_with_no_task(settings):
 
 
 def test_report_total_budget_reflects_a_manual_override(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1610,7 +1610,7 @@ def test_report_total_budget_reflects_a_manual_override(settings):
 
 
 def test_report_export_then_import_round_trips_unchanged(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1630,7 +1630,7 @@ def test_report_export_then_import_round_trips_unchanged(settings):
 
 
 def test_report_export_lines_rounds_budget_to_cents(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1651,7 +1651,7 @@ def test_report_export_lines_rounds_budget_to_cents(settings):
 
 
 def test_report_export_lines_includes_a_links_already_cached_title(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(
@@ -1673,7 +1673,7 @@ def test_report_export_lines_includes_a_links_already_cached_title(settings):
 
 
 def test_report_ensure_link_titles_caches_issue_and_pr_titles(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     issue_link = Link.objects.create(
@@ -1714,7 +1714,7 @@ def test_report_ensure_link_titles_caches_issue_and_pr_titles(settings):
 
 
 def test_report_ensure_link_titles_skips_already_cached_links(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(
@@ -1739,7 +1739,7 @@ def test_report_ensure_link_titles_skips_already_cached_links(settings):
 
 
 def test_report_ensure_link_titles_skips_plain_links(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/not-github")
@@ -1760,7 +1760,7 @@ def test_report_ensure_link_titles_skips_plain_links(settings):
 
 
 def test_report_import_skips_blank_and_whitespace_only_lines(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1786,7 +1786,7 @@ def test_report_import_skips_blank_and_whitespace_only_lines(settings):
 
 
 def test_report_import_budget_column_wins_even_when_records_change(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1815,7 +1815,7 @@ def test_report_import_budget_column_wins_even_when_records_change(settings):
 
 
 def test_report_import_moves_an_existing_link_to_a_different_task(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task_a = Task.objects.create(mou=mou, name="10a")
     task_b = Task.objects.create(mou=mou, name="10b")
@@ -1837,7 +1837,7 @@ def test_report_import_moves_an_existing_link_to_a_different_task(settings):
 
 
 def test_report_import_clears_an_existing_links_task_when_column_is_blank(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1860,7 +1860,7 @@ def test_report_import_moves_a_record_to_a_different_links_task(settings):
     # link moves the record onto that link - not just onto its report
     # line - so its derived task (record.link.task) actually follows,
     # matching what the report now shows it under.
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task_a = Task.objects.create(mou=mou, name="10a")
     task_b = Task.objects.create(mou=mou, name="10b")
@@ -1885,7 +1885,7 @@ def test_report_import_moves_a_record_to_a_different_links_task(settings):
 
 
 def test_report_import_removes_lines_not_present_and_keeps_their_records(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1906,7 +1906,7 @@ def test_report_import_removes_lines_not_present_and_keeps_their_records(setting
 
 
 def test_report_import_on_remove_keep_leaves_the_line_untouched(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1929,7 +1929,7 @@ def test_report_import_on_remove_keep_leaves_the_line_untouched(settings):
 
 
 def test_report_import_on_remove_exclude_marks_the_link(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1953,7 +1953,7 @@ def test_report_import_on_remove_exclude_marks_the_link(settings):
 
 
 def test_report_import_on_remove_gets_the_actual_report_line(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1977,7 +1977,7 @@ def test_report_import_on_remove_gets_the_actual_report_line(settings):
 
 
 def test_report_import_on_remove_rejects_an_invalid_decision(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1996,7 +1996,7 @@ def test_report_import_on_remove_rejects_an_invalid_decision(settings):
 
 
 def test_links_with_unreported_time_excludes_excluded_links(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(
@@ -2015,7 +2015,7 @@ def test_links_with_unreported_time_excludes_excluded_links(settings):
 def test_report_import_renames_the_link_when_records_unambiguously_identify_it(
     settings,
 ):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -2045,7 +2045,7 @@ def test_report_import_renames_the_link_when_records_unambiguously_identify_it(
 
 
 def test_report_import_rename_still_reconciles_other_records_on_the_line(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -2076,7 +2076,7 @@ def test_report_import_rename_still_reconciles_other_records_on_the_line(setting
 
 
 def test_report_import_creates_a_new_link_when_records_are_ambiguous(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link_a = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -2112,7 +2112,7 @@ def test_report_import_creates_a_new_link_when_records_are_ambiguous(settings):
 
 
 def test_report_import_creates_a_new_link_when_records_column_is_empty(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     report = Report.create(mou)
@@ -2129,7 +2129,7 @@ def test_report_import_creates_a_new_link_when_records_column_is_empty(settings)
 
 
 def test_report_import_creates_a_new_link_when_records_do_not_exist(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     report = Report.create(mou)
@@ -2146,7 +2146,7 @@ def test_report_import_creates_a_new_link_when_records_do_not_exist(settings):
 def test_report_import_new_link_has_no_task_when_the_row_task_does_not_resolve(
     settings,
 ):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     report = Report.create(mou)
 
@@ -2159,7 +2159,7 @@ def test_report_import_new_link_has_no_task_when_the_row_task_does_not_resolve(
 
 
 def test_report_import_new_link_has_no_task_when_the_task_column_is_blank(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     report = Report.create(mou)
 
@@ -2172,7 +2172,7 @@ def test_report_import_new_link_has_no_task_when_the_task_column_is_blank(settin
 
 
 def test_report_import_rename_still_validates_mou_ownership(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou_a = MoU.objects.create(name="mou-a")
     mou_b = MoU.objects.create(name="mou-b")
     task_a = Task.objects.create(mou=mou_a, name="10a")
@@ -2196,7 +2196,7 @@ def test_report_import_rename_still_validates_mou_ownership(settings):
 def test_report_import_rename_ignores_records_that_dont_currently_have_a_link(
     settings,
 ):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -2223,7 +2223,7 @@ def test_report_import_rename_ignores_records_that_dont_currently_have_a_link(
 
 
 def test_report_preview_shows_the_links_current_tags(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -2295,7 +2295,7 @@ def test_report_str_is_its_id():
 
 
 def test_report_generate_report_groups_by_task_and_totals(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     issue_link = Link.objects.create(
@@ -2325,7 +2325,7 @@ def test_report_generate_report_groups_by_task_and_totals(settings):
 
 
 def test_report_generate_report_groups_discussions_separately(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     discussion_link = Link.objects.create(
@@ -2352,7 +2352,7 @@ def test_report_generate_report_groups_discussions_separately(settings):
 
 
 def test_report_generate_report_orders_tasks_and_links_and_spaces_them_out(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     # Created out of order, and "9a" would sort after "10a" as plain text -
     # both must be undone by number-then-letter task ordering.
@@ -2390,7 +2390,8 @@ def test_report_generate_report_orders_tasks_and_links_and_spaces_them_out(setti
         "    - https://github.com/nlnet/rfp-recorder/issues/2 - 10€\n"
         "    - https://github.com/nlnet/rfp-recorder/issues/5 - 10€\n"
         "\n"
-        "Total: 30€"
+        "Total: 30€\n"
+        "Total for tasks above 50€: 0€"
     )
 
 
@@ -2436,7 +2437,7 @@ def test_report_generate_report_pools_a_small_link_into_the_task_total(settings)
     # 7€ shows as its own 10€ line; 3€ is too small to show on its own but
     # still counts - pooled and rounded up to 10 - into the task total,
     # rather than vanishing. 12€ shows as its own 15€ line.
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link_a = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -2475,7 +2476,7 @@ def test_report_generate_report_pools_many_small_links_into_one_task_total(setti
     # "I might have a lot of small links and they add up": five links each
     # too small (2€) to show individually still sum to a real 10€ task
     # total, not 0€.
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     for i in range(5):
@@ -2499,7 +2500,7 @@ def test_report_generate_report_pools_many_small_links_into_one_task_total(setti
 
 
 def test_report_generate_report_does_not_show_any_alias(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     Alias.create("mou", "nlnet-2026", "og")
@@ -2521,7 +2522,7 @@ def test_report_generate_report_does_not_show_any_alias(settings):
 
 
 def test_report_preview_does_not_show_any_alias(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     Alias.create("mou", "nlnet-2026", "og")
@@ -2614,7 +2615,7 @@ def test_format_excluded_links_orders_tasks_by_number_then_letter_and_prs_by_num
 
 
 def test_report_add_unreported_time_records_excludes_open_pull_requests(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     closed_link = Link.objects.create(
@@ -2678,7 +2679,7 @@ def test_report_generate_report_only_includes_its_own_records():
 
 
 def test_report_total_budget_is_zero_without_rfp_euros(settings):
-    settings.RFP_EUROS = None
+    settings.RFP_EUROS_PER_HOUR = None
     mou = MoU.objects.create(name="nlnet-2026")
     report = Report.create(mou)
 
@@ -2686,7 +2687,7 @@ def test_report_total_budget_is_zero_without_rfp_euros(settings):
 
 
 def test_report_total_budget_sums_its_own_records(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/a")

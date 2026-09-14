@@ -14,7 +14,14 @@ if _db_override:
 else:
     DATABASE_FILE = Path(XDG_DATA_HOME).expanduser() / APP_NAME / "rfp.db"
 
-RFP_EUROS = env.float("RFP_EUROS", default=50)
+RFP_EUROS_PER_HOUR = env.float("RFP_EUROS_PER_HOUR", default=50)
+
+# Below this, a task defaults to being excluded when `rfp report review`
+# asks about it - a few euros usually isn't worth the paperwork of
+# submitting it now, when it can just as well wait and be claimed by a
+# later report. Also used by `rfp report print` to show a "tasks above
+# X€" subtotal.
+REVIEW_DEFAULT_EXCLUDE_BELOW = env.float("REVIEW_DEFAULT_EXCLUDE_BELOW", default=50)
 
 SECRET_KEY = "django-insecure-not-used-outside-tests"
 DEBUG = False

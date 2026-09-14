@@ -33,13 +33,30 @@ class Alias(models.Model):
     """
 
     item_type = models.CharField(
-        max_length=8, choices=[(t, t) for t in ALIAS_ITEM_TYPES]
+        max_length=8,
+        choices=[(t, t) for t in ALIAS_ITEM_TYPES],
+        help_text="What kind of thing this alias names: 'mou', 'task', or 'url'.",
     )
     mou = models.ForeignKey(
-        MoU, null=True, blank=True, on_delete=models.CASCADE, related_name="aliases"
+        MoU,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="aliases",
+        help_text=(
+            "The MoU this alias is scoped to - only set for "
+            "item_type='task', since task codes can repeat across MoUs."
+        ),
     )
-    target = models.CharField(max_length=255)
-    alias = models.CharField(max_length=64)
+    target = models.CharField(
+        max_length=255,
+        help_text=(
+            "The real MoU name, task code, or repo base URL this alias stands in for."
+        ),
+    )
+    alias = models.CharField(
+        max_length=64, help_text="The short nickname typed instead of `target`."
+    )
 
     class Meta:
         indexes = [models.Index(fields=["item_type", "alias"])]

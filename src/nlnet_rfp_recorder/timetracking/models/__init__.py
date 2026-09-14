@@ -11,7 +11,7 @@ from .alias import (
 )
 from .github_token import GitHubToken
 from .link import Link
-from .mou import MoU, mou_name_validator
+from .mou import TASK_CSV_FIELDNAMES, MoU, mou_name_validator
 from .report import (
     REPORT_LINE_FIELDNAMES,
     Report,
@@ -26,6 +26,7 @@ __all__ = [
     "LINK_ALIAS",
     "REPORT_LINE_FIELDNAMES",
     "TAG_NAMES",
+    "TASK_CSV_FIELDNAMES",
     "Alias",
     "GitHubToken",
     "Link",

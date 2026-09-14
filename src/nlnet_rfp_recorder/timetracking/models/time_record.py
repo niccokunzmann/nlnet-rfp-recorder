@@ -26,15 +26,26 @@ class TimeRecord(models.Model):
         blank=True,
         on_delete=models.SET_NULL,
         related_name="time_records",
+        help_text=(
+            "The link this time entry was tracked against, or None if it has none."
+        ),
     )
-    start_time = models.DateTimeField()
-    end_time = models.DateTimeField(null=True, blank=True)
+    start_time = models.DateTimeField(help_text="When this time entry started.")
+    end_time = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When this time entry stopped, or None while it's still running.",
+    )
     report_line = models.ForeignKey(
         "ReportLine",
         null=True,
         blank=True,
         on_delete=models.SET_NULL,
         related_name="time_records",
+        help_text=(
+            "The report line this time entry has been claimed by, or "
+            "None if unreported."
+        ),
     )
 
     objects = TimeRecordManager()
@@ -123,9 +134,9 @@ class TimeRecord(models.Model):
 
     @property
     def budget(self) -> float | None:
-        if settings.RFP_EUROS is None:
+        if settings.RFP_EUROS_PER_HOUR is None:
             return None
-        return self.duration.total_seconds() / 3600 * settings.RFP_EUROS
+        return self.duration.total_seconds() / 3600 * settings.RFP_EUROS_PER_HOUR
 
     @property
     def row(self) -> TimesheetRow:

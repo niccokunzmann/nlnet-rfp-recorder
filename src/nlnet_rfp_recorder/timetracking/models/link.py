@@ -12,18 +12,47 @@ from .task import Task
 
 class Link(models.Model):
     task = models.ForeignKey(
-        Task, null=True, blank=True, on_delete=models.SET_NULL, related_name="links"
+        Task,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="links",
+        help_text=(
+            "The task this link's tracked time counts toward, or None if unassigned."
+        ),
     )
-    url = models.URLField(unique=True)
-    tags = models.ManyToManyField(Tag, related_name="links", blank=True)
-    # Set when the user decides, on removing this link from a report during
-    # `report import`, that its time should never be offered for a report
-    # again - not merely "not yet reported". See Task.links_with_unreported_time.
-    excluded_from_reports = models.BooleanField(default=False)
-    # Cached issue/PR title, fetched from GitHub once (see
-    # Report.ensure_link_titles) and kept indefinitely - blank means not
-    # fetched yet (or not an issue/PR), not "known to have no title".
-    title = models.CharField(max_length=255, blank=True, default="")
+    url = models.URLField(
+        unique=True,
+        help_text=(
+            "The issue/PR/discussion URL (or other link) time was tracked against."
+        ),
+    )
+    tags = models.ManyToManyField(
+        Tag,
+        related_name="links",
+        blank=True,
+        help_text="How this link's time counts, e.g. 'implementation' or 'review'.",
+    )
+    excluded_from_reports = models.BooleanField(
+        default=False,
+        help_text=(
+            "Set when the user decides, on removing this link from a "
+            "report during `report import`, that its time should never be "
+            "offered for a report again - not merely 'not yet reported'. "
+            "See Task.links_with_unreported_time."
+        ),
+    )
+    title = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text=(
+            "Cached issue/PR title, fetched from GitHub once (see "
+            "Report.ensure_link_titles) and kept indefinitely - blank "
+            "means not fetched yet (or not an issue/PR), not 'known to "
+            "have no title'."
+        ),
+    )
 
     @classmethod
     def get_or_create_for_task(cls, url: str, task: Task) -> Link:

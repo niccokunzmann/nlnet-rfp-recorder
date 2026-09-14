@@ -4,7 +4,13 @@ from django.db import models
 
 
 class GitHubToken(models.Model):
-    token = models.CharField(max_length=255)
+    token = models.CharField(
+        max_length=255,
+        help_text=(
+            "A GitHub personal access token, used to raise the API rate "
+            "limit for issue/PR status checks. Set via `rfp token`."
+        ),
+    )
 
     @classmethod
     def set(cls, token: str) -> GitHubToken:

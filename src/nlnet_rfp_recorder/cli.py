@@ -768,12 +768,26 @@ def task_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
 @task_app.command("select")
 def task_select(
-    name: str = typer.Argument(..., autocompletion=_complete_task_name),
+    name: str | None = typer.Argument(None, autocompletion=_complete_task_name),
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Select a task, creating it if it doesn't exist yet."""
+    """Select a task, creating it if it doesn't exist yet.
+
+    Run without a name to deselect the current task instead.
+    """
     _setup(db, test)
+    if name is None:
+        from nlnet_rfp_recorder.timetracking.models import Task
+
+        current = Task.get_selected()
+        Task.objects.filter(selected=True).update(selected=False)
+        if current is None:
+            typer.echo("No task was selected.")
+        else:
+            typer.echo(f"Deselected task: {current.display_name}")
+        return
+
     task = _select_task_or_fail(name)
     _echo_task_status(task)
 
@@ -782,7 +796,12 @@ def task_select(
 def task_set(
     name: str = typer.Argument(..., autocompletion=_complete_task_name),
     budget: float | None = typer.Option(
-        None, "--budget", help="Set the task's total budget."
+        None,
+        "--budget",
+        help=(
+            "Set the task's personal budget, up to its maximum (defaults "
+            "to the maximum budget if left unset)."
+        ),
     ),
     used: float | None = typer.Option(
         None, "--used", help="Set the task's used budget baseline."
@@ -803,8 +822,16 @@ def task_set(
 
     fields = []
     if budget is not None:
-        task.max_budget = budget
-        fields.append("max_budget")
+        if budget < 0:
+            _fail("Task budget cannot be negative.")
+        if task.max_budget is not None and budget > task.max_budget:
+            _fail(f"Task budget cannot exceed the maximum of {task.max_budget:.0f}€.")
+        task.personal_budget = budget
+        fields.append("personal_budget")
+        if task.max_budget is None:
+            # Preserve the old behavior for tasks that have no imported maximum.
+            task.max_budget = budget
+            fields.append("max_budget")
     if used is not None:
         task.used_budget = used
         fields.append("used_budget")
@@ -832,6 +859,92 @@ def task_remove(
         _fail(f"No such task: {name}")
     Task.objects.filter(mou=mou, name=name).delete()
     typer.echo(f"Removed task: {display_name}")
+
+
+@task_app.command("export")
+def task_export(
+    path: Path | None = typer.Argument(
+        None,
+        help=(
+            "Output CSV file (id, alias, personal_budget, max_budget, "
+            "used_budget, description), one row per task. Omit for stdout."
+        ),
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Export the current MoU's tasks as CSV."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import MoU
+
+    mou = MoU.get_selected()
+    if mou is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+
+    text = mou.export_tasks()
+    if path is None:
+        typer.echo(text, nl=False)
+    else:
+        path.write_text(text)
+        typer.echo(f"Exported {mou.tasks.count()} tasks to {path}")
+
+
+@task_app.command("import")
+def task_import(
+    path: Path = typer.Argument(..., exists=True, dir_okay=False),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Assume yes: remove missing tasks and unused aliases without asking.",
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Import tasks from a CSV file produced by `task export`, creating or
+    updating by id.
+
+    This import is the source of truth for task aliases: a row's alias
+    is assigned even if another task held it before. A task id, or a
+    task alias, no longer implied by the file is asked about
+    individually - by default it's kept; confirming removes it.
+    """
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Alias, MoU, Task
+
+    mou = MoU.get_selected()
+    if mou is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+
+    _, backup_file = _backup_database()
+    typer.echo(f"Backed up database to {backup_file}")
+
+    try:
+        imported, missing_names, unused_aliases = mou.import_tasks(path.read_text())
+    except ValueError as error:
+        _fail(str(error))
+
+    if missing_names:
+        names = ", ".join(missing_names)
+        if yes or typer.confirm(
+            f"{len(missing_names)} existing task(s) are missing from {path} "
+            f"({names}). Remove them?"
+        ):
+            deleted, _ = Task.objects.filter(mou=mou, name__in=missing_names).delete()
+            typer.echo(f"Deleted {deleted} tasks.")
+
+    if unused_aliases:
+        names = ", ".join(unused_aliases)
+        if yes or typer.confirm(
+            f"{len(unused_aliases)} task alias(es) are no longer used "
+            f"({names}). Delete them?"
+        ):
+            deleted, _ = Alias.objects.filter(
+                item_type="task", mou=mou, alias__in=unused_aliases
+            ).delete()
+            typer.echo(f"Deleted {deleted} aliases.")
+
+    typer.echo(f"Imported {len(imported)} tasks from {path}")
 
 
 timesheet_app = typer.Typer(
@@ -1208,8 +1321,8 @@ def report_create(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
     from nlnet_rfp_recorder.timetracking.models import MoU, Report, TimeRecord
 
-    if settings.RFP_EUROS is None:
-        _fail("RFP_EUROS is not set.")
+    if settings.RFP_EUROS_PER_HOUR is None:
+        _fail("RFP_EUROS_PER_HOUR is not set.")
 
     mou = MoU.get_selected()
     if mou is None:
@@ -1382,12 +1495,6 @@ def report_import(
     typer.echo(f"Report {report_id} now has {report.lines.count()} report lines.")
 
 
-# Below this, a task defaults to being excluded when reviewing a report -
-# a few euros usually isn't worth the paperwork of submitting it now,
-# when it can just as well wait and be claimed by a later report.
-REVIEW_DEFAULT_EXCLUDE_BELOW = 50
-
-
 @report_app.command("review")
 def report_review(
     report_id: str = typer.Argument(..., autocompletion=_complete_report_id),
@@ -1398,11 +1505,14 @@ def report_review(
 
     Each task is printed exactly as it would appear in the report, then
     you're asked whether to use it as is (default) or exclude it for now
-    - tasks under 50EUR default to excluded. Excluding a task only
-    detaches its time records from this report; they stay reportable
-    later. Nothing changes until you confirm the summary at the end.
+    - tasks under REVIEW_DEFAULT_EXCLUDE_BELOW default to excluded.
+    Excluding a task only detaches its time records from this report;
+    they stay reportable later. Nothing changes until you confirm the
+    summary at the end.
     """
     _setup(db, test)
+    from django.conf import settings
+
     from nlnet_rfp_recorder.timetracking.models import Report
 
     try:
@@ -1420,7 +1530,7 @@ def report_review(
     for task, block, task_total in task_reviews:
         typer.echo(f"\n{block}")
         task_display = task.display_name if task is not None else "?"
-        default = task_total >= REVIEW_DEFAULT_EXCLUDE_BELOW
+        default = task_total >= settings.REVIEW_DEFAULT_EXCLUDE_BELOW
         use_as_is = typer.confirm(f"Use {task_display} as is?", default=default)
         (included if use_as_is else excluded).append(task)
 

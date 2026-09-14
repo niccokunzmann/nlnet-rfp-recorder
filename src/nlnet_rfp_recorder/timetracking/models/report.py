@@ -212,11 +212,25 @@ def _billable_and_excluded_links(mou: MoU) -> tuple[list[TimeRecord], list[Link]
 
 
 class Report(models.Model):
-    id = models.CharField(max_length=80, primary_key=True, editable=False)
-    mou = models.ForeignKey(
-        MoU, null=True, blank=True, on_delete=models.SET_NULL, related_name="reports"
+    id = models.CharField(
+        max_length=80,
+        primary_key=True,
+        editable=False,
+        help_text="This report's id, '<MoU name>-<n>', numbered per MoU starting at 1.",
     )
-    created = models.DateTimeField(auto_now_add=True)
+    mou = models.ForeignKey(
+        MoU,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reports",
+        help_text=(
+            "The MoU this report was generated for, or None if its MoU was removed."
+        ),
+    )
+    created = models.DateTimeField(
+        auto_now_add=True, help_text="When this report was generated."
+    )
 
     @classmethod
     def create(cls, mou: MoU) -> Report:
@@ -284,10 +298,10 @@ class Report(models.Model):
 
     @staticmethod
     def _budget_for(records: Iterable[TimeRecord]) -> float:
-        if settings.RFP_EUROS is None:
+        if settings.RFP_EUROS_PER_HOUR is None:
             return 0.0
         duration = sum((record.duration for record in records), timedelta())
-        return duration.total_seconds() / 3600 * settings.RFP_EUROS
+        return duration.total_seconds() / 3600 * settings.RFP_EUROS_PER_HOUR
 
     @property
     def total_budget(self) -> float:
@@ -368,16 +382,23 @@ class Report(models.Model):
             task = report_line.link.task if report_line.link else None
             report_lines_by_task.setdefault(task, []).append(report_line)
 
+        threshold = settings.REVIEW_DEFAULT_EXCLUDE_BELOW
         report_total = 0
+        above_threshold_total = 0
         for index, task in enumerate(sorted(report_lines_by_task, key=_task_sort_key)):
             if index > 0:
                 lines.append("")
             block, task_total = _format_task_block(task, report_lines_by_task[task])
             report_total += task_total
+            if task_total >= threshold:
+                above_threshold_total += task_total
             lines += block
 
         lines.append("")
         lines.append(f"Total: {report_total}€")
+        lines.append(
+            f"Total for tasks above {threshold:.0f}€: {above_threshold_total}€"
+        )
 
         excluded_section = Report.format_excluded_links(excluded_links)
         if excluded_section:
@@ -612,12 +633,35 @@ class ReportLine(models.Model):
     `report import`) without affecting the link's tags anywhere else.
     """
 
-    report = models.ForeignKey(Report, on_delete=models.CASCADE, related_name="lines")
-    link = models.ForeignKey(
-        Link, on_delete=models.CASCADE, related_name="report_lines"
+    report = models.ForeignKey(
+        Report,
+        on_delete=models.CASCADE,
+        related_name="lines",
+        help_text="The report this line belongs to.",
     )
-    budget = models.FloatField(default=0.0)
-    tags = models.CharField(max_length=255, blank=True, default="")
+    link = models.ForeignKey(
+        Link,
+        on_delete=models.CASCADE,
+        related_name="report_lines",
+        help_text="The link (issue/PR/etc.) this line reports on.",
+    )
+    budget = models.FloatField(
+        default=0.0,
+        help_text=(
+            "This line's locked-in budget (EUR), snapshotted from tracked "
+            "time when added and editable via `report import`."
+        ),
+    )
+    tags = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text=(
+            "This line's tags, a snapshot of the link's tags taken when "
+            "it was added - a report-scoped copy, editable independently "
+            "via `report import` without affecting the link's own tags."
+        ),
+    )
 
     class Meta:
         constraints = [

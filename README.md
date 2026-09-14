@@ -52,6 +52,7 @@ Example report:
     - https://github.com/collective/icalendar/discussions/1673 - 30€ (review)
 
 Total: 630€
+Total for tasks above 50€: 630€
 
 ```
 
@@ -76,10 +77,16 @@ rfp report
 
 - `rfp review <link>` instead of `rfp start`: tags the entry as review, not implementation.
 - `rfp status` / `rfp task` / `rfp mou status`: check where things stand.
-- `RFP_EUROS` env var: hourly rate, needed to compute budgets.
 - `rfp report` counts issues once finished regardless of GitHub status, but only counts a PR once it's closed (checked live against GitHub).
 - `rfp token <token>` (`rfp token` alone for setup steps): avoids the unauthenticated GitHub API rate limit, which the report can hit quickly.
 - `rfp --test <command>`: try things against a disposable database instead of your real one.
+
+## Environment variables
+
+- `RFP_EUROS_PER_HOUR` (default `50`): hourly rate, needed to compute budgets. Leave unset to disable money/time-left figures entirely.
+- `REVIEW_DEFAULT_EXCLUDE_BELOW` (default `50`): tasks totalling less than this (EUR) default to excluded in `rfp report review`, and get their own subtotal line in `rfp report print`.
+- `RFP_DB` (default: see `XDG_DATA_HOME` below): path to the sqlite database file. Same as passing `--db`.
+- `XDG_DATA_HOME` (default `~/.local/share`): base directory for the default database, used as `$XDG_DATA_HOME/nlnet-rfp-recorder/rfp.db` when `RFP_DB` isn't set.
 
 ## Development
 

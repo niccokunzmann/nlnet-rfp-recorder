@@ -35,13 +35,63 @@ task_name_validator = RegexValidator(
 
 class Task(models.Model):
     mou = models.ForeignKey(
-        MoU, null=True, blank=True, on_delete=models.SET_NULL, related_name="tasks"
+        MoU,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="tasks",
+        help_text="The MoU this task belongs to, or None if its MoU was removed.",
     )
-    name = models.CharField(max_length=16, validators=[task_name_validator])
-    selected = models.BooleanField(default=True)
-    max_budget = models.FloatField(null=True, blank=True)
-    used_budget = models.FloatField(default=0.0)
-    description = models.TextField(blank=True, default="")
+    name = models.CharField(
+        max_length=16,
+        validators=[task_name_validator],
+        help_text=(
+            "The task's code as used in the MoU budget, e.g. '10a' (a "
+            "number followed by letters)."
+        ),
+    )
+    selected = models.BooleanField(
+        default=True,
+        help_text=(
+            "Whether this is the currently selected task (`rfp task "
+            "select`) - at most one task is selected at a time."
+        ),
+    )
+    max_budget = models.FloatField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The maximum amount (EUR) the MoU allows for this task, e.g. "
+            "as imported from a milestone budget table."
+        ),
+    )
+    used_budget = models.FloatField(
+        default=0.0,
+        help_text=(
+            "Budget (EUR) already spent on this task before this tool "
+            "started tracking it, e.g. from an earlier milestone report. "
+            "Set via `rfp mou import` or `rfp task set --used`."
+        ),
+    )
+    personal_budget = models.FloatField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The amount (EUR) you've personally decided to spend on this "
+            "task, up to max_budget - used as the budget_line total for "
+            "completion/time-left purposes. Set via `rfp task set "
+            "--budget`. Falls back to max_budget when unset - see "
+            "effective_personal_budget."
+        ),
+    )
+    description = models.TextField(
+        blank=True,
+        default="",
+        help_text=(
+            "Free-text description of the task, shown by `rfp task "
+            "status`/`select` and `rfp task list`."
+        ),
+    )
 
     class Meta:
         constraints = [
@@ -159,23 +209,34 @@ class Task(models.Model):
         """Budget already locked in by report lines for this task's links."""
         from .report import ReportLine
 
-        if settings.RFP_EUROS is None:
+        if settings.RFP_EUROS_PER_HOUR is None:
             return 0.0
         return sum(line.budget for line in ReportLine.objects.filter(link__task=self))
 
     @property
     def budget(self) -> float | None:
-        if settings.RFP_EUROS is None:
+        if settings.RFP_EUROS_PER_HOUR is None:
             return None
-        live = self.duration.total_seconds() / 3600 * settings.RFP_EUROS
+        live = self.duration.total_seconds() / 3600 * settings.RFP_EUROS_PER_HOUR
         return live + self.reported_budget
 
     @property
+    def effective_personal_budget(self) -> float | None:
+        """personal_budget, falling back to max_budget when unset."""
+        if self.personal_budget is not None:
+            return self.personal_budget
+        return self.max_budget
+
+    @property
     def budget_line(self) -> BudgetLine | None:
-        if self.max_budget is None:
+        """Completion (money used/total, and time left) against the
+        effective personal budget - see effective_personal_budget.
+        """
+        total = self.effective_personal_budget
+        if total is None:
             return None
         used = self.used_budget + (self.budget or 0.0)
-        return BudgetLine(used=used, total=self.max_budget, rate=settings.RFP_EUROS)
+        return BudgetLine(used=used, total=total, rate=settings.RFP_EUROS_PER_HOUR)
 
     @property
     def issues(self) -> list[Issue]:

@@ -120,6 +120,38 @@ def test_task_selects_a_task():
     assert task.selected is True
 
 
+def test_task_select_without_a_name_deselects_the_current_task():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["task", "select"])
+
+    assert result.exit_code == 0, result.output
+    assert "Deselected task: 10a" in result.output
+    assert Task.objects.get(name="10a").selected is False
+    assert Task.get_selected() is None
+
+
+def test_task_select_without_a_name_reports_when_nothing_was_selected():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["task", "select"])
+
+    assert result.exit_code == 0, result.output
+    assert "No task was selected." in result.output
+
+
+def test_task_bare_fails_after_select_deselects_the_current_task():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["task", "select"])
+
+    result = runner.invoke(app, ["task"])
+
+    assert result.exit_code != 0
+    assert "No task selected" in result.output
+
+
 def test_task_output_mentions_the_mou():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     result = runner.invoke(app, ["task", "select", "10a"])
@@ -142,7 +174,7 @@ def test_task_output_has_no_budget_line_when_no_max_budget_is_set():
 def test_task_output_shows_budget_without_time_left_when_rfp_euros_is_unset(
     tmp_path, settings
 ):
-    settings.RFP_EUROS = None
+    settings.RFP_EUROS_PER_HOUR = None
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
@@ -156,7 +188,7 @@ def test_task_output_shows_budget_without_time_left_when_rfp_euros_is_unset(
 
 
 def test_task_output_shows_budget_and_time_left(tmp_path, settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
@@ -350,7 +382,7 @@ def test_task_list_description_starts_at_the_same_column_without_a_budget():
 
 
 def test_task_list_aligns_time_left_within_a_task_group_only(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     # "20€/500€" (8 chars) vs "100€/500€" (9 chars): without padding the
     # shorter money figure, their "... left" times wouldn't line up.
@@ -367,7 +399,7 @@ def test_task_list_aligns_time_left_within_a_task_group_only(settings):
 
 
 def test_task_list_right_aligns_the_hour_figure_within_a_task_group(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     # 121:57, 21:57, 1:57 remaining - the hour digits should right-align
     # on the widest one, like a table of numbers.
@@ -401,6 +433,386 @@ def test_task_remove_fails_for_an_unknown_task():
     result = runner.invoke(app, ["task", "remove", "does-not-exist"])
 
     assert result.exit_code != 0
+
+
+def test_task_set_personal_budget_drives_the_budget_line():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    # A max budget that the personal budget below overrides for
+    # completion/time-left purposes.
+    runner.invoke(app, ["task", "set", "10a", "--budget", "500"])
+
+    result = runner.invoke(app, ["task", "set", "10a", "--budget", "200"])
+
+    assert result.exit_code == 0, result.output
+    task = Task.objects.get(name="10a")
+    assert task.personal_budget == 200.0
+    assert "0€/200€" in result.output
+    assert "4:00 left" in result.output
+
+
+def test_task_status_budget_line_falls_back_to_max_budget():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["task", "set", "10a", "--budget", "500"])
+
+    result = runner.invoke(app, ["task", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "0€/500€" in result.output
+    assert "10:00 left" in result.output
+
+
+def test_task_status_shows_no_budget_line_when_nothing_is_set():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["task", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "€" not in result.output
+
+
+def _invoke_task_import(*args: str, input: str | None = None):
+    # The pytest-django test database is ":memory:", which shutil.copy2
+    # can't back up - that path is covered for real in
+    # test_cli_db_option.py via a real subprocess against a file-backed db.
+    with patch("nlnet_rfp_recorder.cli.shutil.copy2"):
+        return runner.invoke(app, ["task", "import", *args], input=input)
+
+
+def test_task_export_writes_a_csv_row_per_task(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(
+        mou=mou,
+        name="10a",
+        personal_budget=200.0,
+        max_budget=500.0,
+        used_budget=50.0,
+        description="Do the thing",
+    )
+    Alias.create("task", "10a", "thing", mou=mou)
+    path = tmp_path / "tasks.csv"
+
+    result = runner.invoke(app, ["task", "export", str(path)])
+
+    assert result.exit_code == 0, result.output
+    rows = list(csv.DictReader(io.StringIO(path.read_text())))
+    assert rows == [
+        {
+            "id": "10a",
+            "alias": "thing",
+            "personal_budget": "200.0",
+            "max_budget": "500.0",
+            "used_budget": "50.0",
+            "description": "Do the thing",
+        }
+    ]
+
+
+def test_task_export_falls_back_to_max_budget_when_personal_budget_is_unset(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a", max_budget=500.0)
+    path = tmp_path / "tasks.csv"
+
+    result = runner.invoke(app, ["task", "export", str(path)])
+
+    assert result.exit_code == 0, result.output
+    row = next(csv.DictReader(io.StringIO(path.read_text())))
+    assert row["personal_budget"] == "500.0"
+    assert row["max_budget"] == "500.0"
+
+
+def test_task_export_leaves_personal_budget_blank_without_a_max_budget_either(
+    tmp_path,
+):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a")
+    path = tmp_path / "tasks.csv"
+
+    result = runner.invoke(app, ["task", "export", str(path)])
+
+    assert result.exit_code == 0, result.output
+    row = next(csv.DictReader(io.StringIO(path.read_text())))
+    assert row["personal_budget"] == ""
+    assert row["max_budget"] == ""
+
+
+def test_task_export_fails_without_a_selected_mou():
+    result = runner.invoke(app, ["task", "export"])
+
+    assert result.exit_code != 0
+
+
+def test_task_import_creates_tasks_from_csv(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n"
+        "10a,thing,200,500,50,Do the thing\n"
+    )
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    task = Task.objects.get(name="10a")
+    assert task.personal_budget == 200.0
+    assert task.max_budget == 500.0
+    assert task.description == "Do the thing"
+    alias = Alias.objects.get(item_type="task", alias="thing")
+    assert alias.target == "10a"
+
+
+def test_task_import_treats_personal_budget_equal_to_max_budget_as_unset(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a", personal_budget=200.0, max_budget=500.0)
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n10a,,500,500,,\n"
+    )
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    task = Task.objects.get(name="10a")
+    assert task.personal_budget is None
+    assert task.max_budget == 500.0
+
+
+def test_task_import_keeps_personal_budget_that_differs_from_max_budget(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a")
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n10a,,200,500,,\n"
+    )
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    task = Task.objects.get(name="10a")
+    assert task.personal_budget == 200.0
+    assert task.max_budget == 500.0
+
+
+def test_task_import_clears_personal_budget_when_the_column_is_blank(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a", personal_budget=200.0, max_budget=500.0)
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n10a,,,500,,\n"
+    )
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    task = Task.objects.get(name="10a")
+    assert task.personal_budget is None
+    assert task.max_budget == 500.0
+
+
+def test_task_import_ignores_the_used_budget_column(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a", used_budget=99.0)
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n10a,,,,999,\n"
+    )
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    task = Task.objects.get(name="10a")
+    assert task.used_budget == 99.0
+
+
+def test_task_import_updates_an_existing_task(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a", max_budget=100.0)
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n"
+        "10a,,,300,,Updated\n"
+    )
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.count() == 1
+    task = Task.objects.get(name="10a")
+    assert task.max_budget == 300.0
+    assert task.description == "Updated"
+
+
+def test_task_import_prompts_to_remove_missing_tasks_and_deletes_on_yes(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a")
+    path = tmp_path / "tasks.csv"
+    path.write_text("id,alias,personal_budget,max_budget,used_budget,description\n")
+
+    result = _invoke_task_import(str(path), input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Remove them?" in result.output
+    assert Task.objects.count() == 0
+
+
+def test_task_import_prompts_to_remove_missing_tasks_and_keeps_on_no(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a")
+    path = tmp_path / "tasks.csv"
+    path.write_text("id,alias,personal_budget,max_budget,used_budget,description\n")
+
+    result = _invoke_task_import(str(path), input="n\n")
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.count() == 1
+
+
+def test_task_import_does_not_prompt_when_nothing_is_missing(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a")
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n10a,,,,,\n"
+    )
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    assert "Remove them?" not in result.output
+    assert Task.objects.count() == 1
+
+
+def test_task_import_steals_an_alias_already_used_by_another_task(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a")
+    Task.objects.create(mou=mou, name="11b")
+    Alias.create("task", "10a", "thing", mou=mou)
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n"
+        "10a,,,,,\n"
+        "11b,thing,,,,\n"
+    )
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    assert Alias.objects.get(item_type="task", alias="thing").target == "11b"
+
+
+def test_task_import_prompts_to_delete_unused_aliases_and_deletes_on_yes(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a")
+    Alias.create("task", "10a", "thing", mou=mou)
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n10a,,,,,\n"
+    )
+
+    result = _invoke_task_import(str(path), input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert "task alias(es) are no longer used" in result.output
+    assert not Alias.objects.filter(item_type="task", alias="thing").exists()
+
+
+def test_task_import_prompts_to_delete_unused_aliases_and_keeps_on_no(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a")
+    Alias.create("task", "10a", "thing", mou=mou)
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n10a,,,,,\n"
+    )
+
+    result = _invoke_task_import(str(path), input="n\n")
+
+    assert result.exit_code == 0, result.output
+    assert Alias.objects.filter(item_type="task", alias="thing").exists()
+
+
+def test_task_import_does_not_prompt_when_the_alias_is_reconfirmed(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a")
+    Alias.create("task", "10a", "thing", mou=mou)
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n10a,thing,,,,\n"
+    )
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    assert "no longer used" not in result.output
+
+
+def test_task_import_yes_flag_skips_both_prompts(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a")
+    Task.objects.create(mou=mou, name="99z")
+    Alias.create("task", "99z", "thing", mou=mou)
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n10a,,,,,\n"
+    )
+
+    result = _invoke_task_import(str(path), "--yes")
+
+    assert result.exit_code == 0, result.output
+    assert "Remove them?" not in result.output
+    assert "Delete them?" not in result.output
+    assert Task.objects.filter(name="99z").exists() is False
+    assert not Alias.objects.filter(item_type="task", alias="thing").exists()
+
+
+def test_task_import_rejects_an_invalid_id_without_writing_it(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\nnot-a-task,,,,,\n"
+    )
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code != 0
+    assert not Task.objects.filter(mou=mou, name="not-a-task").exists()
+
+
+def test_task_import_fails_without_a_selected_mou(tmp_path):
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n10a,,,,,\n"
+    )
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code != 0
+
+
+def test_task_export_import_round_trips_all_fields(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(
+        mou=mou,
+        name="10a",
+        personal_budget=200.0,
+        max_budget=500.0,
+        used_budget=50.0,
+        description="Do the thing",
+    )
+    Alias.create("task", "10a", "thing", mou=mou)
+    exported = runner.invoke(app, ["task", "export"])
+    assert exported.exit_code == 0, exported.output
+    path = tmp_path / "tasks.csv"
+    path.write_text(exported.output)
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    reexported = runner.invoke(app, ["task", "export"])
+    assert reexported.exit_code == 0, reexported.output
+    assert reexported.output == exported.output
 
 
 def test_start_without_a_task_fails():
@@ -861,7 +1273,7 @@ def test_mou_add_rejects_a_name_with_spaces():
 
 
 def test_report_fails_without_rfp_euros(settings):
-    settings.RFP_EUROS = None
+    settings.RFP_EUROS_PER_HOUR = None
 
     result = runner.invoke(app, ["report", "create"])
 
@@ -869,7 +1281,7 @@ def test_report_fails_without_rfp_euros(settings):
 
 
 def test_report_fails_without_a_selected_mou(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
 
     result = runner.invoke(app, ["report", "create"])
 
@@ -878,7 +1290,7 @@ def test_report_fails_without_a_selected_mou(settings):
 
 
 def test_report_only_includes_tasks_from_the_selected_mou(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     other_mou = MoU.objects.create(name="other-mou", selected=False)
     other_task = Task.objects.create(mou=other_mou, name="99z")
     other_link = Link.objects.create(task=other_task, url="https://example.com/other")
@@ -908,7 +1320,7 @@ def test_report_only_includes_tasks_from_the_selected_mou(settings):
 
 
 def test_report_prints_budget_issues_and_pull_requests(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     now = timezone.now()
@@ -942,7 +1354,7 @@ def test_report_prints_budget_issues_and_pull_requests(settings):
 
 
 def test_report_includes_open_issues_but_excludes_open_prs(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     now = timezone.now()
@@ -977,7 +1389,7 @@ def test_report_includes_open_issues_but_excludes_open_prs(settings):
 
 
 def test_report_create_fails_cleanly_when_github_rejects_a_status_check(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(
@@ -1001,7 +1413,7 @@ def test_report_create_fails_cleanly_when_github_rejects_a_status_check(settings
 def test_report_print_preview_fails_cleanly_when_github_rejects_a_status_check(
     settings,
 ):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(
@@ -1025,7 +1437,7 @@ def test_report_create_and_print_fetch_statuses_once_for_many_tasks(settings):
     # GitHub round trip, and generate_report (used by `report print`) never
     # hits the network at all - so across many tasks and PRs, the whole
     # create+print flow should call fetch_statuses_async exactly once.
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     now = timezone.now()
     for task_index in range(3):
@@ -1063,7 +1475,7 @@ def test_report_create_and_print_fetch_statuses_once_for_many_tasks(settings):
 
 
 def test_report_fails_while_something_is_running(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1077,7 +1489,7 @@ def test_report_fails_while_something_is_running(settings):
 
 
 def test_report_shows_review_tag_suffix(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/docs/design")
@@ -1096,7 +1508,7 @@ def test_report_shows_review_tag_suffix(settings):
 
 
 def test_report_create_persists_a_report(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1115,7 +1527,7 @@ def test_report_create_persists_a_report(settings):
 
 
 def test_report_create_twice_fails_the_second_time_with_nothing_new(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1135,7 +1547,7 @@ def test_report_create_twice_fails_the_second_time_with_nothing_new(settings):
 
 
 def test_report_create_fails_with_no_time_records(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     MoU.objects.create(name="nlnet-2026", selected=True)
 
     result = runner.invoke(app, ["report", "create"])
@@ -1146,7 +1558,7 @@ def test_report_create_fails_with_no_time_records(settings):
 
 
 def test_report_remove_deletes_it(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1164,7 +1576,7 @@ def test_report_remove_deletes_it(settings):
 
 
 def test_report_print_with_an_explicit_id(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1183,7 +1595,7 @@ def test_report_print_with_an_explicit_id(settings):
 
 
 def test_report_print_without_an_id_previews_unreported_entries(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link_a = Link.objects.create(task=task, url="https://example.com/a")
@@ -1210,7 +1622,7 @@ def test_report_print_without_an_id_previews_unreported_entries(settings):
 
 
 def test_report_print_without_an_id_is_empty_with_nothing_unreported(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     MoU.objects.create(name="nlnet-2026", selected=True)
 
     result = runner.invoke(app, ["report", "print"])
@@ -1235,7 +1647,7 @@ def test_report_print_fails_for_an_unknown_id():
 
 
 def test_report_list_shows_id_date_and_budget_used(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1255,7 +1667,7 @@ def test_report_list_shows_id_date_and_budget_used(settings):
 
 
 def test_report_list_only_includes_the_selected_mous_reports(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou_a = MoU.objects.create(name="mou-a", selected=False)
     task_a = Task.objects.create(mou=mou_a, name="10a")
     link_a = Link.objects.create(task=task_a, url="https://example.com/a")
@@ -1306,7 +1718,7 @@ def test_report_remove_fails_for_an_unknown_report():
 
 
 def test_report_remove_orphans_but_keeps_its_time_records(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1336,7 +1748,7 @@ def _report_csv(*rows: dict) -> str:
 
 
 def test_report_export_lists_report_lines_as_csv(tmp_path, settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1366,7 +1778,7 @@ def test_report_export_lists_report_lines_as_csv(tmp_path, settings):
 
 
 def test_report_export_fetches_and_caches_the_issue_title(tmp_path, settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(
@@ -1390,7 +1802,7 @@ def test_report_export_fetches_and_caches_the_issue_title(tmp_path, settings):
 
 
 def test_report_export_fails_when_github_is_unreachable(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(
@@ -1422,7 +1834,7 @@ def test_report_export_fails_for_an_unknown_report():
 
 
 def test_report_import_removes_a_line_not_in_the_file(tmp_path, settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1451,7 +1863,7 @@ def test_report_import_removes_a_line_not_in_the_file(tmp_path, settings):
 def test_report_import_remove_choice_2_excludes_the_link_permanently(
     tmp_path, settings
 ):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1477,7 +1889,7 @@ def test_report_import_remove_choice_2_excludes_the_link_permanently(
 
 
 def test_report_import_remove_choice_3_keeps_the_line(tmp_path, settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1502,7 +1914,7 @@ def test_report_import_remove_choice_3_keeps_the_line(tmp_path, settings):
 
 
 def test_report_import_removed_link_prompt_shows_the_github_title(tmp_path, settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(
@@ -1530,7 +1942,7 @@ def test_report_import_removed_link_prompt_shows_the_github_title(tmp_path, sett
 
 
 def test_report_import_reprompts_on_an_invalid_choice(tmp_path, settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1552,7 +1964,7 @@ def test_report_import_reprompts_on_an_invalid_choice(tmp_path, settings):
 
 
 def test_report_import_adds_a_record_from_the_file(tmp_path, settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1585,7 +1997,7 @@ def test_report_import_adds_a_record_from_the_file(tmp_path, settings):
 
 
 def test_report_import_fails_for_a_link_of_a_different_mou(tmp_path, settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou_a = MoU.objects.create(name="mou-a")
     mou_b = MoU.objects.create(name="mou-b", selected=True)
     task_b = Task.objects.create(mou=mou_b, name="10a")
@@ -1648,7 +2060,7 @@ def test_report_import_creates_a_new_link_for_an_unknown_url(tmp_path, settings)
 def test_report_review_prints_each_task_and_defaults_small_tasks_to_excluded(
     settings,
 ):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     big_task = Task.objects.create(mou=mou, name="10a")
     small_task = Task.objects.create(mou=mou, name="10b")
@@ -1687,7 +2099,7 @@ def test_report_review_prints_each_task_and_defaults_small_tasks_to_excluded(
 
 
 def test_report_review_leaves_the_report_unchanged_when_cancelled(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1709,7 +2121,7 @@ def test_report_review_leaves_the_report_unchanged_when_cancelled(settings):
 
 
 def test_report_review_with_nothing_excluded_skips_the_write_prompt(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -1769,7 +2181,7 @@ def test_mou_status_shows_no_budget_line_when_no_tasks_have_a_max_budget():
 
 
 def test_mou_status_sums_budget_across_tasks(tmp_path, settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("(DONE) 10a. Already done\t€ 300\n10b. Still open\t€ 200\n")
@@ -2574,7 +2986,15 @@ def test_task_help_lists_subcommands_alphabetically():
     result = runner.invoke(app, ["task", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert _subcommand_names("task") == ["list", "remove", "select", "set", "status"]
+    assert _subcommand_names("task") == [
+        "export",
+        "import",
+        "list",
+        "remove",
+        "select",
+        "set",
+        "status",
+    ]
 
 
 def test_alias_help_lists_subcommands_alphabetically():
@@ -2835,7 +3255,7 @@ def test_task_remove_resolves_an_alias():
 
 
 def test_start_resolves_a_url_alias(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
     runner.invoke(
@@ -2855,7 +3275,7 @@ def test_start_resolves_a_url_alias(settings):
 
 
 def test_start_fails_cleanly_for_an_unregistered_url_alias(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
 
@@ -2908,7 +3328,7 @@ def test_task_list_shows_the_alias_in_parens():
 
 
 def test_start_shows_the_task_alias_in_confirmation(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
     runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
@@ -2920,7 +3340,7 @@ def test_start_shows_the_task_alias_in_confirmation(settings):
 
 
 def test_report_print_preview_shows_no_aliases(settings):
-    settings.RFP_EUROS = 20.0
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
