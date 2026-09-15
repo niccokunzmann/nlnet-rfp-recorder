@@ -19,7 +19,7 @@ from .report import (
 )
 from .tag import TAG_NAMES, Tag
 from .task import Task, task_name_validator
-from .time_record import TimeRecord, TimeRecordManager
+from .time_record import TimeRecord, TimeRecordManager, TimeSpan
 
 __all__ = [
     "ALIAS_ITEM_TYPES",
@@ -38,6 +38,7 @@ __all__ = [
     "TaskWarning",
     "TimeRecord",
     "TimeRecordManager",
+    "TimeSpan",
     "alias_validator",
     "mou_name_validator",
     "resolve_link",

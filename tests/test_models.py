@@ -1,7 +1,7 @@
 import csv
 import io
 import warnings
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -123,6 +123,108 @@ def test_budget_is_computed_from_rfp_euros(settings):
     )
 
     assert record.budget == 30.0
+
+
+def test_get_statistics_includes_a_record_fully_inside_the_window():
+    record = TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 15, 9, 0),
+        end_time=datetime(2026, 9, 15, 10, 0),
+    )
+
+    spans = TimeRecord.get_statistics(
+        start=datetime(2026, 9, 15, 0, 0), end=datetime(2026, 9, 16, 0, 0)
+    )
+
+    assert len(spans) == 1
+    assert spans[0].record == record
+    assert spans[0].start == datetime(2026, 9, 15, 9, 0)
+    assert spans[0].end == datetime(2026, 9, 15, 10, 0)
+    assert spans[0].duration == timedelta(hours=1)
+
+
+def test_get_statistics_excludes_a_record_entirely_outside_the_window():
+    TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 10, 9, 0), end_time=datetime(2026, 9, 10, 10, 0)
+    )
+
+    spans = TimeRecord.get_statistics(
+        start=datetime(2026, 9, 15, 0, 0), end=datetime(2026, 9, 16, 0, 0)
+    )
+
+    assert spans == []
+
+
+def test_get_statistics_clips_a_record_that_starts_before_the_window():
+    TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 14, 22, 0), end_time=datetime(2026, 9, 15, 1, 0)
+    )
+
+    spans = TimeRecord.get_statistics(
+        start=datetime(2026, 9, 15, 0, 0), end=datetime(2026, 9, 16, 0, 0)
+    )
+
+    assert len(spans) == 1
+    assert spans[0].start == datetime(2026, 9, 15, 0, 0)
+    assert spans[0].end == datetime(2026, 9, 15, 1, 0)
+    assert spans[0].duration == timedelta(hours=1)
+
+
+def test_get_statistics_splits_a_record_crossing_midnight_between_two_windows():
+    TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 14, 23, 0), end_time=datetime(2026, 9, 15, 1, 0)
+    )
+
+    day_before = TimeRecord.get_statistics(
+        start=date(2026, 9, 14), end=date(2026, 9, 15)
+    )
+    day_of = TimeRecord.get_statistics(start=date(2026, 9, 15), end=date(2026, 9, 16))
+
+    assert len(day_before) == 1
+    assert day_before[0].duration == timedelta(hours=1)
+    assert day_before[0].end == datetime(2026, 9, 15, 0, 0)
+
+    assert len(day_of) == 1
+    assert day_of[0].duration == timedelta(hours=1)
+    assert day_of[0].start == datetime(2026, 9, 15, 0, 0)
+
+
+def test_get_statistics_clips_a_still_running_record_to_now():
+    now = datetime(2026, 9, 15, 12, 0)
+    TimeRecord.objects.create(start_time=datetime(2026, 9, 15, 10, 0))
+
+    with patch("django.utils.timezone.now", return_value=now):
+        spans = TimeRecord.get_statistics(start=date(2026, 9, 15))
+
+    assert len(spans) == 1
+    assert spans[0].end == now
+    assert spans[0].duration == timedelta(hours=2)
+
+
+def test_get_statistics_end_none_means_up_to_now():
+    now = datetime(2026, 9, 15, 12, 0)
+    TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 15, 9, 0), end_time=datetime(2026, 9, 15, 11, 0)
+    )
+    TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 15, 13, 0), end_time=datetime(2026, 9, 15, 14, 0)
+    )
+
+    with patch("django.utils.timezone.now", return_value=now):
+        spans = TimeRecord.get_statistics(start=date(2026, 9, 15))
+
+    assert len(spans) == 1
+    assert spans[0].end == datetime(2026, 9, 15, 11, 0)
+
+
+def test_get_statistics_start_none_is_unbounded():
+    TimeRecord.objects.create(
+        start_time=datetime(2020, 1, 1, 9, 0), end_time=datetime(2020, 1, 1, 10, 0)
+    )
+
+    spans = TimeRecord.get_statistics(end=datetime(2026, 1, 1))
+
+    assert len(spans) == 1
+    assert spans[0].start == datetime(2020, 1, 1, 9, 0)
 
 
 def test_link_belongs_to_a_task():
@@ -643,6 +745,46 @@ def test_stop_ends_the_most_recently_started_record():
     stopped = TimeRecord.stop()
 
     assert stopped.pk == later.pk
+
+
+def test_continue_last_fails_without_any_previous_record():
+    with pytest.raises(ValueError, match="No previous time entry"):
+        TimeRecord.continue_last()
+
+
+def test_continue_last_fails_while_a_record_is_running():
+    Task.objects.create(name="10a")
+    TimeRecord.start("https://example.com/issues/1")
+
+    with pytest.raises(ValueError, match="already running"):
+        TimeRecord.continue_last()
+
+
+def test_continue_last_creates_a_new_record_for_the_same_link():
+    task = Task.objects.create(name="10a")
+    started = TimeRecord.start("https://example.com/issues/1")
+    stopped = TimeRecord.stop()
+
+    resumed = TimeRecord.continue_last()
+
+    assert resumed.pk != stopped.pk
+    assert resumed.link == stopped.link
+    assert resumed.link.task == task
+    assert resumed.is_running is True
+    stopped.refresh_from_db()
+    assert stopped.is_running is False
+    assert stopped.pk == started.pk
+
+
+def test_continue_last_uses_the_given_start_time():
+    Task.objects.create(name="10a")
+    TimeRecord.start("https://example.com/issues/1")
+    TimeRecord.stop()
+    start_time = datetime(2026, 9, 15, 9, 0)
+
+    resumed = TimeRecord.continue_last(start_time=start_time)
+
+    assert resumed.start_time == start_time
 
 
 def test_mou_select_creates_and_selects():

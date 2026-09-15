@@ -17,6 +17,7 @@ from nlnet_rfp_recorder.budget import format_duration_hours
 from nlnet_rfp_recorder.timesheet import TimesheetRow, parse_hhmmss
 
 if TYPE_CHECKING:
+    from nlnet_rfp_recorder.statistics import Statistics
     from nlnet_rfp_recorder.timetracking.models import (
         Link,
         MoU,
@@ -615,6 +616,9 @@ def mou_import(
 
     typer.echo(f"Current MoU: {selected.display_name}")
 
+    _, backup_file = _backup_database("mou-import")
+    typer.echo(f"Backed up database to {backup_file}")
+
     text = path.read_text() if path is not None else _read_budget_from_stdin()
     tasks = selected.set_budget(text)
     source = str(path) if path is not None else "stdin"
@@ -916,7 +920,7 @@ def task_import(
     if mou is None:
         _fail("No MoU selected. Run `rfp mou add <name>` first.")
 
-    _, backup_file = _backup_database()
+    _, backup_file = _backup_database("task-import")
     typer.echo(f"Backed up database to {backup_file}")
 
     try:
@@ -1033,10 +1037,23 @@ def timesheet_import(
     from nlnet_rfp_recorder.timesheet import read_csv
     from nlnet_rfp_recorder.timetracking.models import TimeRecord
 
-    _, backup_file = _backup_database()
+    rows = read_csv(path.read_text())
+
+    pk_counts: dict[int, int] = {}
+    for row in rows:
+        if row.pk is not None:
+            pk_counts[row.pk] = pk_counts.get(row.pk, 0) + 1
+    duplicate_pks = sorted(pk for pk, count in pk_counts.items() if count > 1)
+    if duplicate_pks:
+        ids = ", ".join(str(pk) for pk in duplicate_pks)
+        _fail(
+            f"Duplicate pk(s) in {path}: {ids}. Check for a copy-paste error "
+            "and fix the file before importing."
+        )
+
+    _, backup_file = _backup_database("timesheet-import")
     typer.echo(f"Backed up database to {backup_file}")
 
-    rows = read_csv(path.read_text())
     imported_pks = {row.pk for row in rows if row.pk is not None}
     existing_pks = set(TimeRecord.objects.values_list("pk", flat=True))
     missing_pks = sorted(existing_pks - imported_pks)
@@ -1123,58 +1140,33 @@ def status(db: Path | None = DbOption, test: bool = TestOption) -> None:
         typer.echo(f"Running: {url} ({_format_duration(running.duration)})")
 
 
-def _echo_stats(since: datetime) -> None:
-    """Print time and budget tracked since `since`, per task and in total.
+def _echo_stats(stats: Statistics) -> None:
+    """Print a Statistics result: per-task time/budget, then a total line.
 
     Covers every task across every MoU, not just the selected one - this
-    is a personal "how much did I work" view, not a report. Scoped by
-    start_time, so a record already running when `since` was reached
-    counts in full (see TimeRecord.duration), but one still running from
-    before `since` is not split - it's simply outside the window.
+    is a personal "how much did I work" view, not a report.
     """
-    from django.conf import settings
-
-    from nlnet_rfp_recorder.timetracking.models import TimeRecord
-
-    records = TimeRecord.objects.filter(start_time__gte=since).select_related(
-        "link__task"
-    )
-    durations: dict[Task | None, timedelta] = {}
-    for record in records:
-        task = record.link.task if record.link else None
-        durations[task] = durations.get(task, timedelta()) + record.duration
-
-    if not durations:
+    if not stats.per_task:
         typer.echo("No time tracked in this period.")
         return
 
-    def _sort_key(task: Task | None) -> tuple:
-        # Untracked time (no task) sorts last, after every real task in
-        # number-then-letter order.
-        return (1,) if task is None else (0, task.sort_key)
-
-    rate = settings.RFP_EUROS_PER_HOUR
-    tasks = sorted(durations, key=_sort_key)
-    names = [task.display_name if task is not None else "?" for task in tasks]
+    names = [
+        ts.task.display_name if ts.task is not None else "?" for ts in stats.per_task
+    ]
     name_width = max(len(name) for name in names)
-    times = [_format_duration(durations[task]) for task in tasks]
+    times = [_format_duration(ts.duration) for ts in stats.per_task]
     time_width = max(len(time) for time in times)
 
-    def _budget(duration: timedelta) -> float:
-        return duration.total_seconds() / 3600 * rate
-
-    for task, name, time_str in zip(tasks, names, times, strict=True):
+    for ts, name, time_str in zip(stats.per_task, names, times, strict=True):
         line = f"{name:<{name_width}}  {time_str:>{time_width}}"
-        if rate is not None:
-            line += f"  {_budget(durations[task]):.0f}€"
+        if ts.budget is not None:
+            line += f"  {ts.budget:.0f}€"
         typer.echo(line)
 
-    total_duration = sum(durations.values(), timedelta())
-    total_line = (
-        f"{'Total':<{name_width}}  {_format_duration(total_duration):>{time_width}}"
-    )
-    if rate is not None:
-        total_line += f"  {_budget(total_duration):.0f}€"
+    total_time = _format_duration(stats.total_duration)
+    total_line = f"{'Total':<{name_width}}  {total_time:>{time_width}}"
+    if stats.total_budget is not None:
+        total_line += f"  {stats.total_budget:.0f}€"
     typer.echo(total_line)
 
 
@@ -1197,10 +1189,9 @@ def stats_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
 def stats_today(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Show time and budget worked today, per task and in total."""
     _setup(db, test)
-    from django.utils import timezone
+    from nlnet_rfp_recorder.statistics import Statistics
 
-    since = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    _echo_stats(since)
+    _echo_stats(Statistics.today())
 
 
 @stats_app.command("days")
@@ -1211,13 +1202,13 @@ def stats_days(
 ) -> None:
     """Show time and budget worked in the last N days, per task and in total."""
     _setup(db, test)
-    from django.utils import timezone
+    from nlnet_rfp_recorder.statistics import Statistics
 
-    if n <= 0:
-        _fail("Number of days must be positive.")
-
-    since = timezone.now() - timedelta(days=n)
-    _echo_stats(since)
+    try:
+        stats = Statistics.days(n)
+    except ValueError as error:
+        _fail(str(error))
+    _echo_stats(stats)
 
 
 def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
@@ -1383,6 +1374,42 @@ def stop(
         return
 
     _echo_stopped(record)
+
+
+@app.command("continue")
+def continue_(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Start a new time entry for the same link as the last stopped one.
+
+    Unlike `rfp start` on that same link - which reopens the existing
+    entry - this always creates a fresh time entry, so a new work
+    session becomes its own report line instead of merging into the last.
+
+    If a time entry is already running, nothing is created or stopped -
+    that entry is already "continuing" - this just reports it instead.
+    """
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import TimeRecord
+
+    running = TimeRecord.get_running()
+    if running is not None:
+        url = running.link.url if running.link else ""
+        typer.echo(
+            f"Already running task {_task_name(running)}: {url} "
+            f"({_format_duration(running.duration)})"
+        )
+        return
+
+    try:
+        record = TimeRecord.continue_last()
+    except ValueError as error:
+        _fail(str(error))
+
+    typer.echo(
+        f"Continuing task {_task_name(record)} as a new entry: {record.link.url}"
+    )
+    task = record.link.task
+    if task is not None and task.description:
+        typer.echo(task.description)
 
 
 report_app = typer.Typer(
@@ -1583,6 +1610,9 @@ def report_import(
         report = Report.objects.get(pk=report_id)
     except Report.DoesNotExist:
         _fail(f"No such report: {report_id}")
+
+    _, backup_file = _backup_database("report-import")
+    typer.echo(f"Backed up database to {backup_file}")
 
     try:
         report.import_lines(path.read_text(), on_remove=_ask_about_removed_report_line)
@@ -1798,18 +1828,28 @@ def migrate(db: Path | None = DbOption, test: bool = TestOption) -> None:
     typer.echo(f"Migrated {settings.DATABASES['default']['NAME']}")
 
 
-def _backup_database() -> tuple[Path, Path]:
+def _backup_database(action: str) -> tuple[Path, Path]:
+    """Copy the database file next to itself, named after `action` and now.
+
+    `action` identifies what's about to happen, e.g. "timesheet-import" -
+    the resulting name (rfp-2026-09-15_07-51_timesheet-import.db) says
+    both when and why the backup was made, so a folder of backups reads
+    as a history of bulk edits rather than an anonymous timestamp list.
+    """
     from django.conf import settings
 
     database_file = Path(settings.DATABASES["default"]["NAME"])
-    # Microsecond precision: two backups within the same second (e.g.
-    # `restore` backing up the current database right after a `backup` a
-    # moment earlier) would otherwise collide on the same filename, and the
-    # second copy would silently overwrite - and corrupt - the first.
-    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
-    backup_file = database_file.with_name(
-        f"{database_file.stem}-{timestamp}{database_file.suffix}"
-    )
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    stem = f"{database_file.stem}-{timestamp}_{action}"
+    backup_file = database_file.with_name(f"{stem}{database_file.suffix}")
+    # Minute precision means two backups for the same action within the
+    # same minute (e.g. running the same import twice in a row) would
+    # otherwise collide on the same filename - number them instead of
+    # silently overwriting an earlier backup.
+    suffix = 2
+    while backup_file.exists():
+        backup_file = database_file.with_name(f"{stem}-{suffix}{database_file.suffix}")
+        suffix += 1
     shutil.copy2(database_file, backup_file)
     return database_file, backup_file
 
@@ -1818,7 +1858,7 @@ def _backup_database() -> tuple[Path, Path]:
 def backup(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Copy the database file, timestamped, next to itself."""
     _setup(db, test)
-    database_file, backup_file = _backup_database()
+    database_file, backup_file = _backup_database("backup")
     typer.echo(f"Backed up {database_file} to {backup_file}")
 
 
@@ -1840,7 +1880,7 @@ def restore(
     if not backup_file.is_file():
         _fail(f"No such backup: {backup_file}")
 
-    _, safety_backup = _backup_database()
+    _, safety_backup = _backup_database("restore")
     shutil.copy2(backup_file, database_file)
     typer.echo(f"Backed up current database to {safety_backup}")
     typer.echo(f"Restored {database_file} from {backup_file}")

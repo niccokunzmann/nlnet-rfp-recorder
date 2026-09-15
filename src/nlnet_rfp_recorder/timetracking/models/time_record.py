@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
 
 from django.conf import settings
 from django.db import models
@@ -12,6 +13,37 @@ from nlnet_rfp_recorder.timesheet import TimesheetRow, format_hhmmss, parse_hhmm
 from .link import Link
 from .mou import MoU
 from .task import Task
+
+
+def _window_bound(value: date | datetime | None) -> datetime | None:
+    """Normalize a get_statistics() `start`/`end` bound to a datetime.
+
+    A bare date means midnight of that day; a datetime passes through
+    unchanged; None stays unbounded (the caller decides what that means
+    on each side).
+    """
+    if value is None or isinstance(value, datetime):
+        return value
+    return datetime.combine(value, time.min)
+
+
+@dataclass
+class TimeSpan:
+    """One TimeRecord's overlap with a get_statistics() window.
+
+    `start`/`end` are the record's own start_time/end_time clipped to the
+    window, not copies of the raw fields - a session that runs across the
+    window's edge (e.g. over midnight) contributes only the part that
+    actually falls inside it, via this span's own `duration`.
+    """
+
+    record: TimeRecord
+    start: datetime
+    end: datetime
+
+    @property
+    def duration(self) -> timedelta:
+        return self.end - self.start
 
 
 class TimeRecordManager(models.Manager):
@@ -123,6 +155,78 @@ class TimeRecord(models.Model):
         record.end_time = end_time or timezone.now()
         record.save()
         return record
+
+    @classmethod
+    def continue_last(cls, start_time: datetime | None = None) -> TimeRecord:
+        """Start a brand new time entry for the same link as the most
+        recently stopped one.
+
+        Unlike start() called again on that same link - which reopens
+        the existing entry (see start()'s docstring) - this always
+        creates a fresh row, e.g. so a new work session becomes its own
+        report line instead of merging into the last one.
+        """
+        last = cls.get_last()
+        if last is None:
+            raise ValueError("No previous time entry to continue.")
+        if last.is_running:
+            raise ValueError(
+                "A time entry is already running. Stop it first (`rfp stop`)."
+            )
+        if last.link is None:
+            raise ValueError("The last time entry has no link to continue.")
+
+        return cls.objects.create(
+            link=last.link, start_time=start_time or timezone.now()
+        )
+
+    @classmethod
+    def get_statistics(
+        cls,
+        start: date | datetime | None = None,
+        end: date | datetime | None = None,
+    ) -> list[TimeSpan]:
+        """Every time entry overlapping [start, end), clipped to it.
+
+        The base method behind all stats computation - see
+        nlnet_rfp_recorder.statistics.Statistics, which groups and sums
+        these spans per task.
+
+        `start`/`end` each accept a date (midnight of that day), an exact
+        datetime, or None - `start=None` is unbounded (from the
+        beginning), `end=None` means "now" (also what a still-running
+        entry's live end is treated as).
+
+        An entry doesn't have to fall entirely inside the window to be
+        included: one that started earlier, or is still running past
+        `end`, is returned with its start/end clipped to the window - so
+        a session that crosses midnight splits correctly between, say,
+        `Statistics.today()` and the day before, instead of being
+        dropped or counted in full on just one side.
+        """
+        window_start = _window_bound(start)
+        window_end = _window_bound(end) or timezone.now()
+
+        records = cls.objects.filter(start_time__lt=window_end).select_related(
+            "link__task"
+        )
+        if window_start is not None:
+            records = records.filter(
+                models.Q(end_time__gt=window_start) | models.Q(end_time__isnull=True)
+            )
+
+        spans = []
+        for record in records:
+            record_end = record.end_time or timezone.now()
+            entry_start = (
+                max(record.start_time, window_start)
+                if window_start is not None
+                else record.start_time
+            )
+            entry_end = min(record_end, window_end)
+            if entry_end > entry_start:
+                spans.append(TimeSpan(record=record, start=entry_start, end=entry_end))
+        return spans
 
     @property
     def is_running(self) -> bool:

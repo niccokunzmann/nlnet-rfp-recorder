@@ -1,6 +1,8 @@
 import csv
 import io
+import re
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import niquests
@@ -76,6 +78,18 @@ def _invoke_timesheet_import(*args: str, input: str | None = None):
     # test_cli_db_option.py via a real subprocess against a file-backed db.
     with patch("nlnet_rfp_recorder.cli.shutil.copy2"):
         return runner.invoke(app, ["timesheet", "import", *args], input=input)
+
+
+def _invoke_report_import(*args: str, input: str | None = None):
+    # See _invoke_timesheet_import: ":memory:" can't be backed up for real.
+    with patch("nlnet_rfp_recorder.cli.shutil.copy2"):
+        return runner.invoke(app, ["report", "import", *args], input=input)
+
+
+def _invoke_mou_import(*args: str, input: str | None = None):
+    # See _invoke_timesheet_import: ":memory:" can't be backed up for real.
+    with patch("nlnet_rfp_recorder.cli.shutil.copy2"):
+        return runner.invoke(app, ["mou", "import", *args], input=input)
 
 
 def test_no_args_shows_help():
@@ -178,7 +192,7 @@ def test_task_output_shows_budget_without_time_left_when_rfp_euros_is_unset(
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
-    runner.invoke(app, ["mou", "import", str(budget_file)])
+    _invoke_mou_import(str(budget_file))
 
     result = runner.invoke(app, ["task", "select", "10a"])
 
@@ -192,7 +206,7 @@ def test_task_output_shows_budget_and_time_left(tmp_path, settings):
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
-    runner.invoke(app, ["mou", "import", str(budget_file)])
+    _invoke_mou_import(str(budget_file))
     task = Task.objects.get(name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     now = timezone.now()
@@ -950,6 +964,60 @@ def test_stop_with_a_url_replaces_the_running_records_link():
     assert "https://example.com/issues/right" in result.output
 
 
+def test_continue_fails_without_any_previous_time_entry():
+    result = runner.invoke(app, ["continue"])
+
+    assert result.exit_code != 0
+    assert "No previous time entry" in result.output
+
+
+def test_continue_reports_instead_of_failing_while_a_time_entry_is_running():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    result = runner.invoke(app, ["continue"])
+
+    assert result.exit_code == 0, result.output
+    assert "Already running" in result.output
+    assert "https://example.com/issues/1" in result.output
+    assert TimeRecord.objects.count() == 1
+
+
+def test_continue_creates_a_new_time_entry_for_the_same_link():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    stopped_pk = TimeRecord.objects.get().pk
+
+    result = runner.invoke(app, ["continue"])
+
+    assert result.exit_code == 0, result.output
+    assert TimeRecord.objects.count() == 2
+    new_record = TimeRecord.objects.exclude(pk=stopped_pk).get()
+    assert new_record.link.url == "https://example.com/issues/1"
+    assert new_record.is_running is True
+    old_record = TimeRecord.objects.get(pk=stopped_pk)
+    assert old_record.is_running is False
+    assert "https://example.com/issues/1" in result.output
+
+
+def test_continue_shows_the_tasks_description_if_present():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    task = Task.objects.get(name="10a")
+    task.description = "Do the thing"
+    task.save(update_fields=["description"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(app, ["continue"])
+
+    assert result.exit_code == 0, result.output
+    assert "Do the thing" in result.output
+
+
 def test_edit_without_any_time_entries_fails():
     result = runner.invoke(app, ["edit", "https://example.com/issues/1"])
 
@@ -1093,6 +1161,62 @@ def test_timesheet_import_creates_entries_with_an_explicit_new_pk(tmp_path):
     assert result.exit_code == 0, result.output
     record = TimeRecord.objects.get(pk=1000)
     assert record.link.url == "https://example.com/issues/1"
+
+
+def test_timesheet_import_aborts_on_a_duplicate_pk(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    path = tmp_path / "timesheet.csv"
+    path.write_text(
+        "pk,mou,task,start,duration,link,tags\n"
+        "1000,nlnet-2026,10a,2026-09-04T09:00:00,01:00:00,"
+        "https://example.com/issues/1,implementation\n"
+        "1000,nlnet-2026,10a,2026-09-04T10:00:00,01:00:00,"
+        "https://example.com/issues/2,implementation\n"
+    )
+
+    result = _invoke_timesheet_import(str(path))
+
+    assert result.exit_code != 0
+    assert "Duplicate pk" in result.output
+    assert "1000" in result.output
+    assert TimeRecord.objects.count() == 0
+
+
+def test_timesheet_import_aborts_before_backing_up_on_a_duplicate_pk(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    path = tmp_path / "timesheet.csv"
+    path.write_text(
+        "pk,mou,task,start,duration,link,tags\n"
+        "1000,nlnet-2026,10a,2026-09-04T09:00:00,01:00:00,"
+        "https://example.com/issues/1,implementation\n"
+        "1000,nlnet-2026,10a,2026-09-04T10:00:00,01:00:00,"
+        "https://example.com/issues/2,implementation\n"
+    )
+
+    result = _invoke_timesheet_import(str(path))
+
+    assert result.exit_code != 0
+    assert "Backed up" not in result.output
+
+
+def test_timesheet_import_allows_multiple_blank_pks(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    path = tmp_path / "timesheet.csv"
+    path.write_text(
+        "pk,mou,task,start,duration,link,tags\n"
+        ",nlnet-2026,10a,2026-09-04T09:00:00,01:00:00,"
+        "https://example.com/issues/1,implementation\n"
+        ",nlnet-2026,10a,2026-09-04T10:00:00,01:00:00,"
+        "https://example.com/issues/2,implementation\n"
+    )
+
+    result = _invoke_timesheet_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    assert TimeRecord.objects.count() == 2
 
 
 def test_timesheet_import_prompts_to_delete_missing_entries_and_deletes_on_yes(
@@ -1848,9 +1972,7 @@ def test_report_import_removes_a_line_not_in_the_file(tmp_path, settings):
     path = tmp_path / "report.csv"
     path.write_text(_report_csv())
 
-    result = runner.invoke(
-        app, ["report", "import", "nlnet-2026-1", str(path)], input="1\n"
-    )
+    result = _invoke_report_import("nlnet-2026-1", str(path), input="1\n")
 
     assert result.exit_code == 0, result.output
     assert "No longer in the imported file" in result.output
@@ -1877,9 +1999,7 @@ def test_report_import_remove_choice_2_excludes_the_link_permanently(
     path = tmp_path / "report.csv"
     path.write_text(_report_csv())
 
-    result = runner.invoke(
-        app, ["report", "import", "nlnet-2026-1", str(path)], input="2\n"
-    )
+    result = _invoke_report_import("nlnet-2026-1", str(path), input="2\n")
 
     assert result.exit_code == 0, result.output
     record.refresh_from_db()
@@ -1903,9 +2023,7 @@ def test_report_import_remove_choice_3_keeps_the_line(tmp_path, settings):
     path = tmp_path / "report.csv"
     path.write_text(_report_csv())
 
-    result = runner.invoke(
-        app, ["report", "import", "nlnet-2026-1", str(path)], input="3\n"
-    )
+    result = _invoke_report_import("nlnet-2026-1", str(path), input="3\n")
 
     assert result.exit_code == 0, result.output
     record.refresh_from_db()
@@ -1932,9 +2050,7 @@ def test_report_import_removed_link_prompt_shows_the_github_title(tmp_path, sett
     with patch(
         "nlnet_rfp_recorder.github.fetch_title", return_value="Fix the thing"
     ) as fetch_title:
-        result = runner.invoke(
-            app, ["report", "import", "nlnet-2026-1", str(path)], input="1\n"
-        )
+        result = _invoke_report_import("nlnet-2026-1", str(path), input="1\n")
 
     fetch_title.assert_called_once_with("collective", "icalendar", 1, token=None)
     assert result.exit_code == 0, result.output
@@ -1955,9 +2071,7 @@ def test_report_import_reprompts_on_an_invalid_choice(tmp_path, settings):
     path = tmp_path / "report.csv"
     path.write_text(_report_csv())
 
-    result = runner.invoke(
-        app, ["report", "import", "nlnet-2026-1", str(path)], input="bogus\n1\n"
-    )
+    result = _invoke_report_import("nlnet-2026-1", str(path), input="bogus\n1\n")
 
     assert result.exit_code == 0, result.output
     assert "Please enter 1, 2, or 3." in result.output
@@ -1987,7 +2101,7 @@ def test_report_import_adds_a_record_from_the_file(tmp_path, settings):
         )
     )
 
-    result = runner.invoke(app, ["report", "import", report.id, str(path)])
+    result = _invoke_report_import(report.id, str(path))
 
     assert result.exit_code == 0, result.output
     record.refresh_from_db()
@@ -2021,7 +2135,7 @@ def test_report_import_fails_for_a_link_of_a_different_mou(tmp_path, settings):
         )
     )
 
-    result = runner.invoke(app, ["report", "import", report_a.id, str(path)])
+    result = _invoke_report_import(report_a.id, str(path))
 
     assert result.exit_code != 0
     assert "does not belong to MoU" in result.output
@@ -2047,7 +2161,7 @@ def test_report_import_creates_a_new_link_for_an_unknown_url(tmp_path, settings)
         )
     )
 
-    result = runner.invoke(app, ["report", "import", report.id, str(path)])
+    result = _invoke_report_import(report.id, str(path))
 
     assert result.exit_code == 0, result.output
     link = Link.objects.get(url="https://example.com/issues/999")
@@ -2185,7 +2299,7 @@ def test_mou_status_sums_budget_across_tasks(tmp_path, settings):
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("(DONE) 10a. Already done\t€ 300\n10b. Still open\t€ 200\n")
-    runner.invoke(app, ["mou", "import", str(budget_file)])
+    _invoke_mou_import(str(budget_file))
 
     result = runner.invoke(app, ["mou", "status"])
 
@@ -2262,7 +2376,7 @@ def test_mou_import_prints_the_current_mou(tmp_path):
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
 
-    result = runner.invoke(app, ["mou", "import", str(budget_file)])
+    result = _invoke_mou_import(str(budget_file))
 
     assert result.exit_code == 0, result.output
     assert "Current MoU: nlnet-2026" in result.output
@@ -2272,7 +2386,7 @@ def test_mou_import_fails_without_a_selected_mou(tmp_path):
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
 
-    result = runner.invoke(app, ["mou", "import", str(budget_file)])
+    result = _invoke_mou_import(str(budget_file))
 
     assert result.exit_code != 0
 
@@ -2282,7 +2396,7 @@ def test_mou_import_caps_matching_tasks(tmp_path):
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
 
-    result = runner.invoke(app, ["mou", "import", str(budget_file)])
+    result = _invoke_mou_import(str(budget_file))
 
     assert result.exit_code == 0, result.output
     mou = MoU.objects.get()
@@ -2296,9 +2410,7 @@ def test_mou_import_with_mou_option_creates_and_selects_it(tmp_path):
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
 
-    result = runner.invoke(
-        app, ["mou", "import", str(budget_file), "--mou", "nlnet-2026"]
-    )
+    result = _invoke_mou_import(str(budget_file), "--mou", "nlnet-2026")
 
     assert result.exit_code == 0, result.output
     mou = MoU.objects.get()
@@ -2315,9 +2427,7 @@ def test_mou_import_with_mou_option_selects_an_existing_mou(tmp_path):
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
 
-    result = runner.invoke(
-        app, ["mou", "import", str(budget_file), "--mou", "nlnet-2025"]
-    )
+    result = _invoke_mou_import(str(budget_file), "--mou", "nlnet-2025")
 
     assert result.exit_code == 0, result.output
     assert MoU.objects.count() == 2
@@ -2327,9 +2437,7 @@ def test_mou_import_with_mou_option_selects_an_existing_mou(tmp_path):
 def test_mou_import_from_stdin_notifies_when_parsing_starts():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
 
-    result = runner.invoke(
-        app, ["mou", "import"], input="10a. Do the thing\t€ 500\n\n\n\n"
-    )
+    result = _invoke_mou_import(input="10a. Do the thing\t€ 500\n\n\n\n")
 
     assert result.exit_code == 0, result.output
     assert "stop typing" in result.stderr.lower()
@@ -2341,7 +2449,7 @@ def test_mou_export_prints_the_raw_imported_text(tmp_path):
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
-    runner.invoke(app, ["mou", "import", str(budget_file)])
+    _invoke_mou_import(str(budget_file))
 
     result = runner.invoke(app, ["mou", "export"])
 
@@ -2369,7 +2477,7 @@ def test_mou_export_with_a_name_exports_a_non_selected_mou(tmp_path):
     runner.invoke(app, ["mou", "add", "nlnet-2025"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
-    runner.invoke(app, ["mou", "import", str(budget_file)])
+    _invoke_mou_import(str(budget_file))
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
 
     result = runner.invoke(app, ["mou", "export", "nlnet-2025"])
@@ -2391,7 +2499,7 @@ def test_mou_export_resolves_an_alias(tmp_path):
     runner.invoke(app, ["mou", "add", "nlnet-2025"])
     budget_file = tmp_path / "budget.txt"
     budget_file.write_text("10a. Do the thing\t€ 500\n")
-    runner.invoke(app, ["mou", "import", str(budget_file)])
+    _invoke_mou_import(str(budget_file))
     runner.invoke(app, ["alias", "set", "mou", "nlnet-2025", "og"])
 
     result = runner.invoke(app, ["mou", "export", "og"])
@@ -3068,6 +3176,83 @@ def test_restore_fails_for_an_unknown_backup_name():
     assert "No such backup" in result.output
 
 
+BACKUP_NAME_RE = re.compile(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}_([a-z-]+)$")
+
+
+def _backup_action(output: str) -> str:
+    """Pull the action label out of a "Backed up ... to ...-<action>" line."""
+    match = re.search(r"Backed up .*? to (\S+)", output)
+    assert match, output
+    name_match = BACKUP_NAME_RE.search(Path(match.group(1)).stem)
+    assert name_match, match.group(1)
+    return name_match.group(1)
+
+
+def test_backup_labels_the_backup_as_backup():
+    result = runner.invoke(app, ["backup"])
+
+    assert result.exit_code == 0, result.output
+    assert _backup_action(result.output) == "backup"
+
+
+def test_restore_labels_its_safety_backup_as_restore():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    backup_result = runner.invoke(app, ["backup"])
+    backup_name = re.search(r"to (\S+)", backup_result.output).group(1)
+
+    result = runner.invoke(app, ["restore", Path(backup_name).stem])
+
+    assert result.exit_code == 0, result.output
+    assert _backup_action(result.output) == "restore"
+
+
+def test_timesheet_import_labels_its_backup_as_timesheet_import(tmp_path):
+    path = tmp_path / "timesheet.csv"
+    path.write_text("pk,mou,task,start,duration,link,tags\n")
+
+    result = _invoke_timesheet_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    assert _backup_action(result.output) == "timesheet-import"
+
+
+def test_task_import_labels_its_backup_as_task_import(tmp_path):
+    MoU.objects.create(name="nlnet-2026", selected=True)
+    path = tmp_path / "tasks.csv"
+    path.write_text(
+        "id,alias,personal_budget,max_budget,used_budget,description\n10a,,,,,\n"
+    )
+
+    result = _invoke_task_import(str(path))
+
+    assert result.exit_code == 0, result.output
+    assert _backup_action(result.output) == "task-import"
+
+
+def test_mou_import_labels_its_backup_as_mou_import(tmp_path):
+    MoU.objects.create(name="nlnet-2026", selected=True)
+    budget_file = tmp_path / "budget.txt"
+    budget_file.write_text("10a. Do the thing\t€ 500\n")
+
+    result = _invoke_mou_import(str(budget_file))
+
+    assert result.exit_code == 0, result.output
+    assert _backup_action(result.output) == "mou-import"
+
+
+def test_report_import_labels_its_backup_as_report_import(tmp_path):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    Task.objects.create(mou=mou, name="10a")
+    report = Report.create(mou)
+    path = tmp_path / "report.csv"
+    path.write_text(_report_csv())
+
+    result = _invoke_report_import(report.id, str(path))
+
+    assert result.exit_code == 0, result.output
+    assert _backup_action(result.output) == "report-import"
+
+
 def _subcommand_names(*group_path: str) -> list[str]:
     # Ask Click's own list_commands() - the exact hook it uses to order the
     # rendered --help panel - instead of parsing rendered/wrapped Rich
@@ -3090,6 +3275,7 @@ def test_help_lists_commands_alphabetically():
     assert _subcommand_names() == [
         "alias",
         "backup",
+        "continue",
         "edit",
         "implement",
         "migrate",
