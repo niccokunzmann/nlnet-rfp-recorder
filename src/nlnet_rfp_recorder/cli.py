@@ -1123,6 +1123,103 @@ def status(db: Path | None = DbOption, test: bool = TestOption) -> None:
         typer.echo(f"Running: {url} ({_format_duration(running.duration)})")
 
 
+def _echo_stats(since: datetime) -> None:
+    """Print time and budget tracked since `since`, per task and in total.
+
+    Covers every task across every MoU, not just the selected one - this
+    is a personal "how much did I work" view, not a report. Scoped by
+    start_time, so a record already running when `since` was reached
+    counts in full (see TimeRecord.duration), but one still running from
+    before `since` is not split - it's simply outside the window.
+    """
+    from django.conf import settings
+
+    from nlnet_rfp_recorder.timetracking.models import TimeRecord
+
+    records = TimeRecord.objects.filter(start_time__gte=since).select_related(
+        "link__task"
+    )
+    durations: dict[Task | None, timedelta] = {}
+    for record in records:
+        task = record.link.task if record.link else None
+        durations[task] = durations.get(task, timedelta()) + record.duration
+
+    if not durations:
+        typer.echo("No time tracked in this period.")
+        return
+
+    def _sort_key(task: Task | None) -> tuple:
+        # Untracked time (no task) sorts last, after every real task in
+        # number-then-letter order.
+        return (1,) if task is None else (0, task.sort_key)
+
+    rate = settings.RFP_EUROS_PER_HOUR
+    tasks = sorted(durations, key=_sort_key)
+    names = [task.display_name if task is not None else "?" for task in tasks]
+    name_width = max(len(name) for name in names)
+    times = [_format_duration(durations[task]) for task in tasks]
+    time_width = max(len(time) for time in times)
+
+    def _budget(duration: timedelta) -> float:
+        return duration.total_seconds() / 3600 * rate
+
+    for task, name, time_str in zip(tasks, names, times, strict=True):
+        line = f"{name:<{name_width}}  {time_str:>{time_width}}"
+        if rate is not None:
+            line += f"  {_budget(durations[task]):.0f}€"
+        typer.echo(line)
+
+    total_duration = sum(durations.values(), timedelta())
+    total_line = (
+        f"{'Total':<{name_width}}  {_format_duration(total_duration):>{time_width}}"
+    )
+    if rate is not None:
+        total_line += f"  {_budget(total_duration):.0f}€"
+    typer.echo(total_line)
+
+
+stats_app = typer.Typer(
+    help="Show time/budget statistics.", no_args_is_help=True, cls=AlphabeticalGroup
+)
+app.add_typer(stats_app, name="stats")
+
+
+@stats_app.callback()
+def stats_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Show time/budget statistics."""
+    if test:
+        db = TEST_DB_FILE
+    if db is not None:
+        os.environ["RFP_DB"] = str(db)
+
+
+@stats_app.command("today")
+def stats_today(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Show time and budget worked today, per task and in total."""
+    _setup(db, test)
+    from django.utils import timezone
+
+    since = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    _echo_stats(since)
+
+
+@stats_app.command("days")
+def stats_days(
+    n: int = typer.Argument(..., help="How many days back to look, including today."),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Show time and budget worked in the last N days, per task and in total."""
+    _setup(db, test)
+    from django.utils import timezone
+
+    if n <= 0:
+        _fail("Number of days must be positive.")
+
+    since = timezone.now() - timedelta(days=n)
+    _echo_stats(since)
+
+
 def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
     from django.utils import timezone
 

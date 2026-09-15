@@ -2861,6 +2861,174 @@ def test_status_shows_running_time_entry_and_duration():
     assert "Running: https://example.com/issues/1" in result.output
 
 
+def test_stats_today_reports_no_time_when_nothing_tracked():
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    assert "No time tracked in this period." in result.output
+
+
+def test_stats_today_shows_per_task_time_and_budget_and_total(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link,
+        start_time=now - timedelta(hours=1),
+        end_time=now,
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    assert "10a" in result.output
+    assert "1:00" in result.output
+    assert "20€" in result.output
+    assert "Total" in result.output
+
+
+def test_stats_today_excludes_records_from_before_today(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    yesterday = timezone.now() - timedelta(days=1)
+    TimeRecord.objects.create(
+        link=link,
+        start_time=yesterday - timedelta(hours=1),
+        end_time=yesterday,
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    assert "No time tracked in this period." in result.output
+
+
+def test_stats_days_includes_records_within_the_window(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    two_days_ago = timezone.now() - timedelta(days=2)
+    TimeRecord.objects.create(
+        link=link,
+        start_time=two_days_ago,
+        end_time=two_days_ago + timedelta(hours=1),
+    )
+
+    result = runner.invoke(app, ["stats", "days", "3"])
+
+    assert result.exit_code == 0, result.output
+    assert "10a" in result.output
+    assert "1:00" in result.output
+
+
+def test_stats_days_excludes_records_outside_the_window(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    ten_days_ago = timezone.now() - timedelta(days=10)
+    TimeRecord.objects.create(
+        link=link,
+        start_time=ten_days_ago,
+        end_time=ten_days_ago + timedelta(hours=1),
+    )
+
+    result = runner.invoke(app, ["stats", "days", "3"])
+
+    assert result.exit_code == 0, result.output
+    assert "No time tracked in this period." in result.output
+
+
+def test_stats_days_rejects_a_non_positive_n():
+    result = runner.invoke(app, ["stats", "days", "0"])
+
+    assert result.exit_code != 0
+    assert "must be positive" in result.output
+
+
+def test_stats_sums_multiple_records_per_task(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link_a = Link.objects.create(task=task, url="https://example.com/issues/1")
+    link_b = Link.objects.create(task=task, url="https://example.com/issues/2")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link_a, start_time=now - timedelta(hours=1), end_time=now
+    )
+    TimeRecord.objects.create(
+        link=link_b,
+        start_time=now - timedelta(minutes=30),
+        end_time=now,
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    assert "1:30" in result.output
+
+
+def test_stats_groups_two_tasks_separately_with_a_total(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task_a = Task.objects.create(mou=mou, name="10a")
+    task_b = Task.objects.create(mou=mou, name="11b")
+    link_a = Link.objects.create(task=task_a, url="https://example.com/issues/1")
+    link_b = Link.objects.create(task=task_b, url="https://example.com/issues/2")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link_a, start_time=now - timedelta(hours=1), end_time=now
+    )
+    TimeRecord.objects.create(
+        link=link_b, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    assert "10a" in result.output
+    assert "11b" in result.output
+    assert "Total" in result.output
+    assert "2:00" in result.output
+    assert "40€" in result.output
+
+
+def test_stats_groups_time_with_no_task_under_a_question_mark(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    link = Link.objects.create(url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    assert "?" in result.output
+
+
+def test_stats_hides_budget_when_rfp_euros_per_hour_is_unset(settings):
+    settings.RFP_EUROS_PER_HOUR = None
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    assert "1:00" in result.output
+    assert "€" not in result.output
+
+
 def test_complete_link_url_matches_by_prefix():
     from nlnet_rfp_recorder.cli import _complete_link_url
 
@@ -2930,6 +3098,7 @@ def test_help_lists_commands_alphabetically():
         "restore",
         "review",
         "start",
+        "stats",
         "status",
         "stop",
         "task",
@@ -2950,6 +3119,13 @@ def test_timesheet_help_lists_subcommands_alphabetically():
         "remove",
         "show",
     ]
+
+
+def test_stats_help_lists_subcommands_alphabetically():
+    result = runner.invoke(app, ["stats", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert _subcommand_names("stats") == ["days", "today"]
 
 
 def test_report_help_lists_subcommands_alphabetically():
