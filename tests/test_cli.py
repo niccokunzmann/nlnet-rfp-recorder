@@ -3075,6 +3075,53 @@ def test_stats_days_rejects_a_non_positive_n():
     assert "must be positive" in result.output
 
 
+def test_stats_total_reports_no_time_when_nothing_tracked():
+    result = runner.invoke(app, ["stats", "total"])
+
+    assert result.exit_code == 0, result.output
+    assert "No time tracked in this period." in result.output
+
+
+def test_stats_total_includes_records_regardless_of_age(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    long_ago = timezone.now() - timedelta(days=3650)
+    TimeRecord.objects.create(
+        link=link, start_time=long_ago, end_time=long_ago + timedelta(hours=1)
+    )
+
+    result = runner.invoke(app, ["stats", "total"])
+
+    assert result.exit_code == 0, result.output
+    assert "10a" in result.output
+    assert "1:00" in result.output
+    assert "20€" in result.output
+
+
+def test_stats_total_sums_records_across_different_days(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link_a = Link.objects.create(task=task, url="https://example.com/issues/1")
+    link_b = Link.objects.create(task=task, url="https://example.com/issues/2")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link_a,
+        start_time=now - timedelta(days=30),
+        end_time=now - timedelta(days=30) + timedelta(hours=1),
+    )
+    TimeRecord.objects.create(
+        link=link_b, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "total"])
+
+    assert result.exit_code == 0, result.output
+    assert "2:00" in result.output
+
+
 def test_stats_sums_multiple_records_per_task(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
@@ -3496,7 +3543,7 @@ def test_stats_help_lists_subcommands_alphabetically():
     result = runner.invoke(app, ["stats", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert _subcommand_names("stats") == ["days", "today"]
+    assert _subcommand_names("stats") == ["days", "today", "total"]
 
 
 def test_report_help_lists_subcommands_alphabetically():

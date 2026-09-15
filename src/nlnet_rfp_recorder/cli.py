@@ -1278,6 +1278,15 @@ def stats_days(
     _echo_stats(stats)
 
 
+@stats_app.command("total")
+def stats_total(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Show time and budget worked across all recorded time, per task and in total."""
+    _setup(db, test)
+    from nlnet_rfp_recorder.statistics import Statistics
+
+    _echo_stats(Statistics.total())
+
+
 def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
     from django.utils import timezone
 

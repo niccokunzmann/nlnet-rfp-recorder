@@ -132,3 +132,8 @@ class Statistics:
             raise ValueError("Number of days must be positive.")
         since = timezone.now().date() - timedelta(days=n - 1)
         return cls._for_window(since, None)
+
+    @classmethod
+    def total(cls) -> Statistics:
+        """Time tracked across all recorded history, through now."""
+        return cls._for_window(None, None)

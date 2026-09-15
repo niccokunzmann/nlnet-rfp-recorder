@@ -172,6 +172,34 @@ def test_statistics_days_rejects_a_non_positive_n():
         Statistics.days(0)
 
 
+def test_statistics_total_includes_records_regardless_of_age():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2010, 1, 1, 9, 0),
+        end_time=datetime(2010, 1, 1, 10, 0),
+    )
+
+    with _now(datetime(2026, 9, 15, 12, 0)):
+        stats = Statistics.total()
+
+    assert stats.total_duration == timedelta(hours=1)
+
+
+def test_statistics_total_stops_clipping_at_now():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(link=link, start_time=datetime(2026, 9, 15, 10, 0))
+
+    with _now(datetime(2026, 9, 15, 12, 0)):
+        stats = Statistics.total()
+
+    assert stats.total_duration == timedelta(hours=2)
+
+
 def test_statistics_sorts_tasks_and_puts_untracked_time_last():
     mou = MoU.objects.create(name="nlnet-2026")
     task_10a = Task.objects.create(mou=mou, name="10a")
