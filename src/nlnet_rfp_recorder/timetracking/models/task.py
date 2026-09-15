@@ -271,13 +271,19 @@ class Task(models.Model):
         return self.sort_key < other.sort_key
 
     @property
-    def display_name(self) -> str:
-        """This task's name, with its alias appended in parens if it has one."""
+    def alias(self) -> str | None:
+        """This task's alias, or None if it has none."""
         from .alias import Alias
 
         aliases = Alias.objects.filter(item_type="task", mou=self.mou, target=self.name)
         alias = aliases.order_by("pk").first()
-        return f"{self.name} ({alias.alias})" if alias else self.name
+        return alias.alias if alias else None
+
+    @property
+    def display_name(self) -> str:
+        """This task's name, with its alias appended in parens if it has one."""
+        alias = self.alias
+        return f"{self.name} ({alias})" if alias else self.name
 
     def __str__(self) -> str:
         return self.name

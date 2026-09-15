@@ -1141,33 +1141,100 @@ def status(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
 
 def _echo_stats(stats: Statistics) -> None:
-    """Print a Statistics result: per-task time/budget, then a total line.
+    """Print a Statistics result as a table: id, alias, time, Euro, new,
+    <threshold>+ - then a Total row (skipped when there's only one task,
+    since that row already is the total).
 
     Covers every task across every MoU, not just the selected one - this
-    is a personal "how much did I work" view, not a report.
+    is a personal "how much did I work" view, not a report. The alias
+    column is dropped entirely when no task in the result has one; the
+    money columns (Euro, new, <threshold>+) are dropped together when the
+    hourly rate is unknown. A task's "new" cell is its budget not yet
+    claimed by any report line; "<threshold>+" repeats that same figure
+    only when it's at least REVIEW_DEFAULT_EXCLUDE_BELOW (the same
+    threshold `rfp report review` uses) - both blank (not "0€") rather
+    than showing zero/below-threshold. Every money value is already
+    rounded to the whole euro in Statistics, Total included, so the
+    printed Total always matches adding up the rows above it.
     """
     if not stats.per_task:
         typer.echo("No time tracked in this period.")
         return
 
-    names = [
-        ts.task.display_name if ts.task is not None else "?" for ts in stats.per_task
-    ]
-    name_width = max(len(name) for name in names)
-    times = [_format_duration(ts.duration) for ts in stats.per_task]
-    time_width = max(len(time) for time in times)
+    show_alias = any(ts.task is not None and ts.task.alias for ts in stats.per_task)
+    show_money = stats.total_budget is not None
+    threshold_header = f"{stats.threshold:g}+"
 
-    for ts, name, time_str in zip(stats.per_task, names, times, strict=True):
-        line = f"{name:<{name_width}}  {time_str:>{time_width}}"
-        if ts.budget is not None:
-            line += f"  {ts.budget:.0f}€"
-        typer.echo(line)
+    def _euro(value: int | None) -> str:
+        return "" if value is None else f"{value}€"
 
-    total_time = _format_duration(stats.total_duration)
-    total_line = f"{'Total':<{name_width}}  {total_time:>{time_width}}"
-    if stats.total_budget is not None:
-        total_line += f"  {stats.total_budget:.0f}€"
-    typer.echo(total_line)
+    def _new_euro(value: int | None) -> str:
+        return "" if not value else f"{value}€"
+
+    def _row(
+        id_: str,
+        task: Task | None,
+        duration: timedelta,
+        budget: int | None,
+        new: int | None,
+        new_above_threshold: int | None,
+    ) -> list[str]:
+        row = [id_]
+        if show_alias:
+            row.append((task.alias if task is not None else None) or "")
+        row.append(_format_duration(duration))
+        if show_money:
+            row += [
+                _euro(budget),
+                _new_euro(new),
+                _new_euro(new_above_threshold),
+            ]
+        return row
+
+    headers = ["ID"]
+    if show_alias:
+        headers.append("alias")
+    headers.append("time")
+    if show_money:
+        headers += ["Euro", "new", threshold_header]
+
+    rows = [headers]
+    for ts in stats.per_task:
+        id_ = ts.task.name if ts.task is not None else "?"
+        rows.append(
+            _row(
+                id_,
+                ts.task,
+                ts.duration,
+                ts.budget,
+                ts.new_budget,
+                ts.new_above_threshold,
+            )
+        )
+    if len(stats.per_task) > 1:
+        # A single task's row already is the total - repeating it would
+        # be redundant.
+        rows.append(
+            _row(
+                "Total",
+                None,
+                stats.total_duration,
+                stats.total_budget,
+                stats.total_new_budget,
+                stats.total_new_above_threshold,
+            )
+        )
+
+    left_aligned = {"ID", "alias"}
+    widths = [max(len(row[i]) for row in rows) for i in range(len(headers))]
+    for row in rows:
+        cells = [
+            f"{cell:<{widths[i]}}"
+            if headers[i] in left_aligned
+            else f"{cell:>{widths[i]}}"
+            for i, cell in enumerate(row)
+        ]
+        typer.echo("  ".join(cells).rstrip())
 
 
 stats_app = typer.Typer(

@@ -2976,7 +2976,7 @@ def test_stats_today_reports_no_time_when_nothing_tracked():
     assert "No time tracked in this period." in result.output
 
 
-def test_stats_today_shows_per_task_time_and_budget_and_total(settings):
+def test_stats_today_shows_per_task_time_and_budget(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
@@ -2994,7 +2994,23 @@ def test_stats_today_shows_per_task_time_and_budget_and_total(settings):
     assert "10a" in result.output
     assert "1:00" in result.output
     assert "20€" in result.output
-    assert "Total" in result.output
+
+
+def test_stats_hides_the_total_row_with_only_one_task(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    assert "Total" not in result.output
+    assert len(result.output.splitlines()) == 2
 
 
 def test_stats_today_excludes_records_from_before_today(settings):
@@ -3135,6 +3151,175 @@ def test_stats_hides_budget_when_rfp_euros_per_hour_is_unset(settings):
     assert result.exit_code == 0, result.output
     assert "1:00" in result.output
     assert "€" not in result.output
+
+
+def test_stats_has_a_header_row_with_id_time_euro_new(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    header = result.output.splitlines()[0].split()
+    assert header == ["ID", "time", "Euro", "new", "50+"]
+
+
+def test_stats_header_omits_euro_and_new_when_rate_is_unset(settings):
+    settings.RFP_EUROS_PER_HOUR = None
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    header = result.output.splitlines()[0].split()
+    assert header == ["ID", "time"]
+
+
+def test_stats_shows_an_alias_column_when_a_task_has_one(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    Alias.create("task", "10a", "foo", mou=mou)
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[0].split() == ["ID", "alias", "time", "Euro", "new", "50+"]
+    assert "foo" in lines[1]
+
+
+def test_stats_omits_the_alias_column_when_no_task_has_one(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    header = result.output.splitlines()[0].split()
+    assert "alias" not in header
+
+
+def test_stats_new_column_shows_unclaimed_budget(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[1].split() == ["10a", "1:00", "20€", "20€"]
+
+
+def test_stats_new_column_is_blank_once_claimed_by_a_report(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    record = TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+    report = Report.create(mou)
+    report.add_time_record(record)
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[1].split() == ["10a", "1:00", "20€"]
+
+
+def test_stats_threshold_column_shows_new_budget_at_or_above_the_threshold(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    settings.REVIEW_DEFAULT_EXCLUDE_BELOW = 50
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=3), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[0].split()[-1] == "50+"
+    assert lines[1].split() == ["10a", "3:00", "60€", "60€", "60€"]
+
+
+def test_stats_threshold_column_is_blank_below_the_threshold(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    settings.REVIEW_DEFAULT_EXCLUDE_BELOW = 50
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[1].split() == ["10a", "1:00", "20€", "20€"]
+
+
+def test_stats_threshold_column_totals_only_qualifying_tasks(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    settings.REVIEW_DEFAULT_EXCLUDE_BELOW = 50
+    mou = MoU.objects.create(name="nlnet-2026")
+    task_a = Task.objects.create(mou=mou, name="10a")
+    task_b = Task.objects.create(mou=mou, name="11b")
+    link_a = Link.objects.create(task=task_a, url="https://example.com/issues/1")
+    link_b = Link.objects.create(task=task_b, url="https://example.com/issues/2")
+    now = timezone.now()
+    # 10a: 3h = 60€ (qualifies); 11b: 1h = 20€ (does not).
+    TimeRecord.objects.create(
+        link=link_a, start_time=now - timedelta(hours=3), end_time=now
+    )
+    TimeRecord.objects.create(
+        link=link_b, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[1].split() == ["10a", "3:00", "60€", "60€", "60€"]
+    assert lines[2].split() == ["11b", "1:00", "20€", "20€"]
+    assert lines[3].split() == ["Total", "4:00", "80€", "80€", "60€"]
 
 
 def test_complete_link_url_matches_by_prefix():

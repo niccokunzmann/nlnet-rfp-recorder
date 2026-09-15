@@ -15,11 +15,24 @@ if TYPE_CHECKING:
 class TaskStatistics:
     """One task's tracked time (and budget, if the hourly rate is known)
     within a Statistics window.
+
+    budget/new_budget/new_above_threshold are pre-rounded to the nearest
+    whole euro - the same figure is used for display, for the threshold
+    check, and for summing into Statistics.total_* (see there), so a
+    printed total always matches adding up the rows printed above it.
     """
 
     task: Task | None
     duration: timedelta
-    budget: float | None
+    budget: int | None
+    # The portion of `budget` for time not yet claimed by any report line -
+    # i.e. still available to be reported. None alongside `budget` when
+    # the hourly rate is unknown.
+    new_budget: int | None
+    # `new_budget`, but only when it's at least Statistics.threshold -
+    # None below that (including when new_budget itself is None) - see
+    # the REVIEW_DEFAULT_EXCLUDE_BELOW setting.
+    new_above_threshold: int | None
 
 
 @dataclass
@@ -33,7 +46,13 @@ class Statistics:
 
     per_task: list[TaskStatistics]
     total_duration: timedelta
-    total_budget: float | None
+    # Each total_* is the sum of the matching (already-rounded) per_task
+    # values, not independently recomputed from total_duration - so it
+    # always equals adding up the rows shown above it.
+    total_budget: int | None
+    total_new_budget: int | None
+    total_new_above_threshold: int | None
+    threshold: float
 
     @classmethod
     def _for_window(cls, start: date | None, end: date | None) -> Statistics:
@@ -41,33 +60,62 @@ class Statistics:
 
         spans = TimeRecord.get_statistics(start=start, end=end)
         rate = settings.RFP_EUROS_PER_HOUR
+        threshold = settings.REVIEW_DEFAULT_EXCLUDE_BELOW
 
         durations: dict[Task | None, timedelta] = {}
+        new_durations: dict[Task | None, timedelta] = {}
         for span in spans:
             task = span.record.link.task if span.record.link else None
             durations[task] = durations.get(task, timedelta()) + span.duration
+            if span.record.report_line_id is None:
+                new_durations[task] = (
+                    new_durations.get(task, timedelta()) + span.duration
+                )
 
         def _sort_key(task: Task | None) -> tuple:
             # Untracked time (no task) sorts last, after every real task
             # in number-then-letter order.
             return (1,) if task is None else (0, task.sort_key)
 
-        def _budget(duration: timedelta) -> float | None:
+        def _budget(duration: timedelta) -> int | None:
             if rate is None:
                 return None
-            return duration.total_seconds() / 3600 * rate
+            return round(duration.total_seconds() / 3600 * rate)
 
-        per_task = [
-            TaskStatistics(
-                task=task, duration=durations[task], budget=_budget(durations[task])
+        def _above_threshold(value: int | None) -> int | None:
+            if value is None or value < threshold:
+                return None
+            return value
+
+        per_task = []
+        for task in sorted(durations, key=_sort_key):
+            new_budget = _budget(new_durations.get(task, timedelta()))
+            per_task.append(
+                TaskStatistics(
+                    task=task,
+                    duration=durations[task],
+                    budget=_budget(durations[task]),
+                    new_budget=new_budget,
+                    new_above_threshold=_above_threshold(new_budget),
+                )
             )
-            for task in sorted(durations, key=_sort_key)
-        ]
+
         total_duration = sum(durations.values(), timedelta())
+
+        def _total(values: list[int | None]) -> int | None:
+            if rate is None:
+                return None
+            return sum(value for value in values if value is not None)
+
         return cls(
             per_task=per_task,
             total_duration=total_duration,
-            total_budget=_budget(total_duration),
+            total_budget=_total([ts.budget for ts in per_task]),
+            total_new_budget=_total([ts.new_budget for ts in per_task]),
+            total_new_above_threshold=_total(
+                [ts.new_above_threshold for ts in per_task]
+            ),
+            threshold=threshold,
         )
 
     @classmethod

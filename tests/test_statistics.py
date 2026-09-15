@@ -190,3 +190,116 @@ def test_statistics_sorts_tasks_and_puts_untracked_time_last():
         stats = Statistics.today()
 
     assert [ts.task for ts in stats.per_task] == [task_9a, task_10a, None]
+
+
+def test_statistics_new_above_threshold_is_set_when_new_budget_qualifies(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    settings.REVIEW_DEFAULT_EXCLUDE_BELOW = 50
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 15, 6, 0),
+        end_time=datetime(2026, 9, 15, 9, 0),
+    )
+
+    with _now(datetime(2026, 9, 15, 12, 0)):
+        stats = Statistics.today()
+
+    assert stats.threshold == 50
+    assert stats.per_task[0].new_budget == 60.0
+    assert stats.per_task[0].new_above_threshold == 60.0
+    assert stats.total_new_above_threshold == 60.0
+
+
+def test_statistics_new_above_threshold_is_none_below_the_threshold(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    settings.REVIEW_DEFAULT_EXCLUDE_BELOW = 50
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 15, 11, 0),
+        end_time=datetime(2026, 9, 15, 12, 0),
+    )
+
+    with _now(datetime(2026, 9, 15, 12, 0)):
+        stats = Statistics.today()
+
+    assert stats.per_task[0].new_budget == 20.0
+    assert stats.per_task[0].new_above_threshold is None
+    assert stats.total_new_above_threshold == 0.0
+
+
+def test_statistics_total_new_above_threshold_sums_only_qualifying_tasks(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    settings.REVIEW_DEFAULT_EXCLUDE_BELOW = 50
+    mou = MoU.objects.create(name="nlnet-2026")
+    task_a = Task.objects.create(mou=mou, name="10a")
+    task_b = Task.objects.create(mou=mou, name="11b")
+    link_a = Link.objects.create(task=task_a, url="https://example.com/issues/1")
+    link_b = Link.objects.create(task=task_b, url="https://example.com/issues/2")
+    TimeRecord.objects.create(
+        link=link_a,
+        start_time=datetime(2026, 9, 15, 6, 0),
+        end_time=datetime(2026, 9, 15, 9, 0),
+    )
+    TimeRecord.objects.create(
+        link=link_b,
+        start_time=datetime(2026, 9, 15, 11, 0),
+        end_time=datetime(2026, 9, 15, 12, 0),
+    )
+
+    with _now(datetime(2026, 9, 15, 12, 0)):
+        stats = Statistics.today()
+
+    by_task = {ts.task: ts for ts in stats.per_task}
+    assert by_task[task_a].new_above_threshold == 60.0
+    assert by_task[task_b].new_above_threshold is None
+    assert stats.total_new_above_threshold == 60.0
+
+
+def test_statistics_new_above_threshold_is_none_when_rate_is_unset(settings):
+    settings.RFP_EUROS_PER_HOUR = None
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 15, 6, 0),
+        end_time=datetime(2026, 9, 15, 9, 0),
+    )
+
+    with _now(datetime(2026, 9, 15, 12, 0)):
+        stats = Statistics.today()
+
+    assert stats.per_task[0].new_above_threshold is None
+    assert stats.total_new_above_threshold is None
+
+
+def test_statistics_total_budget_sums_the_rounded_per_task_values(settings):
+    # Rate chosen so each task's exact budget is 0.6€ (rounds to 1€), but
+    # the exact combined total is 1.2€ (rounds to 1€ on its own) - if the
+    # total were recomputed from the aggregate duration instead of summing
+    # what's actually shown per task, it would read 1€ instead of 2€.
+    settings.RFP_EUROS_PER_HOUR = 60.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task_a = Task.objects.create(mou=mou, name="10a")
+    task_b = Task.objects.create(mou=mou, name="11b")
+    link_a = Link.objects.create(task=task_a, url="https://example.com/issues/1")
+    link_b = Link.objects.create(task=task_b, url="https://example.com/issues/2")
+    start = datetime(2026, 9, 15, 9, 0)
+    TimeRecord.objects.create(
+        link=link_a, start_time=start, end_time=start + timedelta(seconds=36)
+    )
+    TimeRecord.objects.create(
+        link=link_b, start_time=start, end_time=start + timedelta(seconds=36)
+    )
+
+    with _now(datetime(2026, 9, 15, 12, 0)):
+        stats = Statistics.today()
+
+    assert [ts.budget for ts in stats.per_task] == [1, 1]
+    assert stats.total_budget == 2
