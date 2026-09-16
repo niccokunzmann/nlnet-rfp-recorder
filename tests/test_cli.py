@@ -1064,6 +1064,84 @@ def test_edit_edits_the_most_recent_entry_even_if_stopped():
     assert record.is_running is False
 
 
+def test_edit_reassigns_the_last_entrys_task():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    runner.invoke(app, ["task", "select", "11b"])
+
+    result = runner.invoke(app, ["edit", "--task", "11b"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.link.task.name == "11b"
+    assert "11b" in result.output
+
+
+def test_edit_reassigns_the_task_by_alias():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["task", "select", "11b"])
+    runner.invoke(app, ["alias", "set", "task", "11b", "bee"])
+
+    result = runner.invoke(app, ["edit", "--task", "bee"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.link.task.name == "11b"
+
+
+def test_edit_task_fails_for_an_unknown_task():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    result = runner.invoke(app, ["edit", "--task", "does-not-exist"])
+
+    assert result.exit_code != 0
+    assert "No such task" in result.output
+    record = TimeRecord.objects.get()
+    assert record.link.task.name == "10a"
+
+
+def test_edit_task_fails_without_a_link():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    TimeRecord.objects.create(start_time=timezone.now())
+
+    result = runner.invoke(app, ["edit", "--task", "10a"])
+
+    assert result.exit_code != 0
+    assert "no link" in result.output
+
+
+def test_edit_changes_link_tags_and_task_together():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["task", "select", "11b"])
+
+    result = runner.invoke(
+        app,
+        [
+            "edit",
+            "https://example.com/issues/2",
+            "--tags",
+            "review",
+            "--task",
+            "11b",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.link.url == "https://example.com/issues/2"
+    assert record.link.task.name == "11b"
+    assert "review" in {tag.name for tag in record.link.tags.all()}
+
+
 def _time_record_pk() -> int:
     return TimeRecord.objects.get().pk
 
@@ -2935,6 +3013,25 @@ def test_complete_task_name_matches_by_prefix():
     assert set(_complete_task_name("10")) == {"10a", "10b"}
     assert _complete_task_name("11") == ["11a"]
     assert _complete_task_name("99") == []
+
+
+def test_complete_alias_id_delegates_by_item_type():
+    from types import SimpleNamespace
+
+    from nlnet_rfp_recorder.cli import _complete_alias_id
+
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="10a")
+    Link.objects.create(url="https://example.com/issues/1")
+
+    assert _complete_alias_id(SimpleNamespace(params={"item": "mou"}), "nlnet") == [
+        "nlnet-2026"
+    ]
+    assert _complete_alias_id(SimpleNamespace(params={"item": "task"}), "10") == ["10a"]
+    assert _complete_alias_id(
+        SimpleNamespace(params={"item": "url"}), "https://example"
+    ) == ["https://example.com/issues/1"]
+    assert _complete_alias_id(SimpleNamespace(params={}), "any") == []
 
 
 def test_status_with_nothing_selected():

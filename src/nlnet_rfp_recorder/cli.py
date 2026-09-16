@@ -381,6 +381,20 @@ def _complete_alias_name(ctx: typer.Context, incomplete: str) -> list[str]:
         return []
 
 
+def _complete_alias_id(ctx: typer.Context, incomplete: str) -> list[str]:
+    """Complete `alias set`'s `id` argument - what it names depends on
+    the already-typed `item` argument (mou/task/url).
+    """
+    item_type = ctx.params.get("item")
+    if item_type == "mou":
+        return _complete_mou_name(incomplete)
+    if item_type == "task":
+        return _complete_task_name(incomplete)
+    if item_type == "url":
+        return _complete_link_url(incomplete)
+    return []
+
+
 def _backup_glob_pattern(database_file: Path) -> str:
     return f"{database_file.stem}-*{database_file.suffix}"
 
@@ -1403,10 +1417,16 @@ def edit(
     tags: str | None = typer.Option(
         None, "--tags", help="Comma-separated tags to add (implementation, review)."
     ),
+    task: str | None = typer.Option(
+        None,
+        "--task",
+        autocompletion=_complete_task_name,
+        help="Reassign this time entry's link to a different task (name or alias).",
+    ),
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Edit the most recent time entry's link and/or tags."""
+    """Edit the most recent time entry's link, tags, and/or task."""
     _setup(db, test)
     from nlnet_rfp_recorder.timetracking.models import Link, TimeRecord
 
@@ -1426,6 +1446,22 @@ def edit(
             _fail("Cannot edit tags: this time entry has no link.")
         for tag in (t.strip() for t in tags.split(",") if t.strip()):
             record.link.add_tag(tag)
+
+    if task is not None:
+        if record.link is None:
+            _fail("Cannot change the task: this time entry has no link.")
+        from nlnet_rfp_recorder.timetracking.models import MoU, Task, resolve_task_name
+
+        mou = MoU.get_selected()
+        task_name = resolve_task_name(task, mou)
+        try:
+            resolved_task = Task.objects.get(mou=mou, name=task_name)
+        except Task.DoesNotExist:
+            _fail(
+                f"No such task: {task_name}. Run `rfp task select {task_name}` first."
+            )
+        record.link.task = resolved_task
+        record.link.save(update_fields=["task"])
 
     url = record.link.url if record.link else ""
     typer.echo(f"Edited {_task_name(record)} {_format_duration(record.duration)} {url}")
@@ -1779,7 +1815,9 @@ def alias_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
 def alias_set(
     item: AliasItemType = typer.Argument(...),
     id: str = typer.Argument(
-        ..., help="mou: MoU name. task: task code. url: repo base URL."
+        ...,
+        autocompletion=_complete_alias_id,
+        help="mou: MoU name. task: task code. url: repo base URL.",
     ),
     alias: str = typer.Argument(...),
     db: Path | None = DbOption,
