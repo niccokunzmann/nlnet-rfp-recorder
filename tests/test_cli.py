@@ -633,6 +633,29 @@ def test_task_set_accepts_a_comma_separated_list_of_ranges_and_names():
         assert Task.objects.get(name=name).max_budget == 0.0
 
 
+def test_task_set_bulk_percentage_is_relative_to_each_tasks_own_maximum():
+    # One "50%" applied to a range/list must land on a different euro
+    # figure per task - each relative to its own max_budget, not to a
+    # single shared amount computed once for the whole batch.
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    for name in ["1a", "1b", "1c"]:
+        runner.invoke(app, ["task", "select", name])
+    runner.invoke(app, ["task", "set", "max", "1a", "200"])
+    runner.invoke(app, ["task", "set", "max", "1b", "400"])
+    runner.invoke(app, ["task", "set", "max", "1c", "100"])
+
+    result = runner.invoke(app, ["task", "set", "budget", "1a-1c", "50%"])
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.get(name="1a").personal_budget == 100.0
+    assert Task.objects.get(name="1b").personal_budget == 200.0
+    assert Task.objects.get(name="1c").personal_budget == 50.0
+    budgets = {
+        Task.objects.get(name=name).personal_budget for name in ["1a", "1b", "1c"]
+    }
+    assert len(budgets) == 3
+
+
 def test_task_set_accepts_a_prefix_matching_a_whole_group():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     for name in ["4a", "4b", "40a", "14a"]:
