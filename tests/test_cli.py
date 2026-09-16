@@ -299,9 +299,8 @@ def test_task_set_updates_budget_and_used():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
 
-    result = runner.invoke(
-        app, ["task", "set", "10a", "--budget", "500", "--used", "100"]
-    )
+    runner.invoke(app, ["task", "set", "max", "10a", "500"])
+    result = runner.invoke(app, ["task", "set", "used", "10a", "100"])
 
     assert result.exit_code == 0, result.output
     task = Task.objects.get(name="10a")
@@ -313,7 +312,7 @@ def test_task_set_updates_budget_and_used():
 def test_task_set_fails_for_an_unknown_task():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
 
-    result = runner.invoke(app, ["task", "set", "10a", "--budget", "500"])
+    result = runner.invoke(app, ["task", "set", "max", "10a", "500"])
 
     assert result.exit_code != 0
 
@@ -336,7 +335,8 @@ def test_task_list_reports_when_there_are_none():
 def test_task_list_marks_the_selected_task_and_shows_budget():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["task", "set", "10a", "--budget", "500", "--used", "100"])
+    runner.invoke(app, ["task", "set", "max", "10a", "500"])
+    runner.invoke(app, ["task", "set", "used", "10a", "100"])
     runner.invoke(app, ["task", "select", "11b"])
 
     result = runner.invoke(app, ["task", "list"])
@@ -454,9 +454,9 @@ def test_task_set_personal_budget_drives_the_budget_line():
     runner.invoke(app, ["task", "select", "10a"])
     # A max budget that the personal budget below overrides for
     # completion/time-left purposes.
-    runner.invoke(app, ["task", "set", "10a", "--budget", "500"])
+    runner.invoke(app, ["task", "set", "max", "10a", "500"])
 
-    result = runner.invoke(app, ["task", "set", "10a", "--budget", "200"])
+    result = runner.invoke(app, ["task", "set", "budget", "10a", "200"])
 
     assert result.exit_code == 0, result.output
     task = Task.objects.get(name="10a")
@@ -468,7 +468,7 @@ def test_task_set_personal_budget_drives_the_budget_line():
 def test_task_status_budget_line_falls_back_to_max_budget():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["task", "set", "10a", "--budget", "500"])
+    runner.invoke(app, ["task", "set", "max", "10a", "500"])
 
     result = runner.invoke(app, ["task", "status"])
 
@@ -485,6 +485,199 @@ def test_task_status_shows_no_budget_line_when_nothing_is_set():
 
     assert result.exit_code == 0, result.output
     assert "€" not in result.output
+
+
+def test_parse_budget_value_reads_a_plain_amount():
+    from nlnet_rfp_recorder.cli import _parse_budget_value
+
+    assert _parse_budget_value("150") == (150.0, False)
+
+
+def test_parse_budget_value_reads_a_percentage():
+    from nlnet_rfp_recorder.cli import _parse_budget_value
+
+    assert _parse_budget_value("50%") == (0.5, True)
+
+
+def test_parse_budget_value_strips_surrounding_whitespace():
+    from nlnet_rfp_recorder.cli import _parse_budget_value
+
+    assert _parse_budget_value(" 50 % ") == (0.5, True)
+
+
+def test_parse_budget_value_rejects_invalid_text():
+    from nlnet_rfp_recorder.cli import _parse_budget_value
+
+    with pytest.raises(ValueError, match="Invalid amount"):
+        _parse_budget_value("abc")
+
+
+def test_parse_budget_value_rejects_invalid_percentage_text():
+    from nlnet_rfp_recorder.cli import _parse_budget_value
+
+    with pytest.raises(ValueError, match="Invalid percentage"):
+        _parse_budget_value("abc%")
+
+
+def test_task_set_max_sets_an_absolute_amount():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["task", "set", "max", "10a", "500"])
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.get(name="10a").max_budget == 500.0
+
+
+def test_task_set_max_rejects_a_negative_amount():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["task", "set", "max", "10a", "--", "-1"])
+
+    assert result.exit_code != 0
+    assert "cannot be negative" in result.output
+
+
+def test_task_set_max_scales_by_a_percentage():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["task", "set", "max", "10a", "200"])
+
+    result = runner.invoke(app, ["task", "set", "max", "10a", "150%"])
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.get(name="10a").max_budget == 300.0
+
+
+def test_task_set_budget_requires_a_maximum_first():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["task", "set", "budget", "10a", "100"])
+
+    assert result.exit_code != 0
+    assert "no maximum budget" in result.output
+
+
+def test_task_set_budget_by_percentage():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["task", "set", "max", "10a", "200"])
+
+    result = runner.invoke(app, ["task", "set", "budget", "10a", "50%"])
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.get(name="10a").personal_budget == 100.0
+
+
+def test_task_set_budget_by_percentage_can_be_run_again():
+    # A later % must land relative to the (unchanged) maximum, not to
+    # whatever budget the previous call set - so re-running with a
+    # different percentage doesn't compound on top of it.
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["task", "set", "max", "10a", "200"])
+    runner.invoke(app, ["task", "set", "budget", "10a", "50%"])
+
+    result = runner.invoke(app, ["task", "set", "budget", "10a", "30%"])
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.get(name="10a").personal_budget == 60.0
+
+
+def test_task_set_budget_percentage_over_100_fails():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["task", "set", "max", "10a", "200"])
+
+    result = runner.invoke(app, ["task", "set", "budget", "10a", "150%"])
+
+    assert result.exit_code != 0
+    assert "between 0% and 100%" in result.output
+
+
+def test_task_set_used_by_percentage_above_100_is_allowed():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["task", "set", "max", "10a", "200"])
+
+    result = runner.invoke(app, ["task", "set", "used", "10a", "150%"])
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.get(name="10a").used_budget == 300.0
+
+
+def test_task_set_accepts_a_range_across_several_tasks():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    for name in ["1a", "1b", "1c"]:
+        runner.invoke(app, ["task", "select", name])
+
+    result = runner.invoke(app, ["task", "set", "max", "1a-1c", "500"])
+
+    assert result.exit_code == 0, result.output
+    assert "Updated 3 tasks:" in result.output
+    for name in ["1a", "1b", "1c"]:
+        assert Task.objects.get(name=name).max_budget == 500.0
+
+
+def test_task_set_accepts_a_comma_separated_list_of_ranges_and_names():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    for name in ["1a", "1b", "1c", "2f", "2h"]:
+        runner.invoke(app, ["task", "select", name])
+
+    result = runner.invoke(app, ["task", "set", "max", "1a-1c,2f,2h", "0"])
+
+    assert result.exit_code == 0, result.output
+    for name in ["1a", "1b", "1c", "2f", "2h"]:
+        assert Task.objects.get(name=name).max_budget == 0.0
+
+
+def test_task_set_accepts_a_prefix_matching_a_whole_group():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    for name in ["4a", "4b", "40a", "14a"]:
+        runner.invoke(app, ["task", "select", name])
+
+    result = runner.invoke(app, ["task", "set", "max", "4", "0"])
+
+    assert result.exit_code == 0, result.output
+    for name in ["4a", "4b", "40a"]:
+        assert Task.objects.get(name=name).max_budget == 0.0
+    assert Task.objects.get(name="14a").max_budget is None
+
+
+def test_task_set_fails_for_an_unknown_task_or_prefix():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["task", "set", "max", "9z", "500"])
+
+    assert result.exit_code != 0
+    assert "No such task: 9z" in result.output
+
+
+def test_task_set_a_range_with_end_before_start_fails():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "1a"])
+    runner.invoke(app, ["task", "select", "1c"])
+
+    result = runner.invoke(app, ["task", "set", "max", "1c-1a", "500"])
+
+    assert result.exit_code != 0
+    assert "end before start" in result.output
+
+
+def test_task_set_bulk_update_is_all_or_nothing():
+    # 1a already has a maximum, 1b doesn't - the whole batch must fail
+    # (and leave 1a untouched) rather than partially applying.
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "1a"])
+    runner.invoke(app, ["task", "set", "max", "1a", "500"])
+    runner.invoke(app, ["task", "select", "1b"])
+
+    result = runner.invoke(app, ["task", "set", "budget", "1a-1b", "100"])
+
+    assert result.exit_code != 0
+    assert Task.objects.get(name="1a").personal_budget is None
 
 
 def _invoke_task_import(*args: str, input: str | None = None):
@@ -3987,7 +4180,7 @@ def test_task_set_resolves_an_alias():
     runner.invoke(app, ["task", "select", "10a"])
     runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
 
-    result = runner.invoke(app, ["task", "set", "lib", "--budget", "500"])
+    result = runner.invoke(app, ["task", "set", "max", "lib", "500"])
 
     assert result.exit_code == 0, result.output
     assert Task.objects.get(name="10a").max_budget == 500.0

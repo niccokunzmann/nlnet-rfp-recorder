@@ -474,6 +474,396 @@ def test_task_reported_budget_reflects_a_manual_override(settings):
     assert task.budget == 999.0
 
 
+def test_set_max_budget_sets_the_value():
+    task = Task.objects.create(name="10a")
+
+    task.set_max_budget(500.0)
+
+    assert Task.objects.get(name="10a").max_budget == 500.0
+
+
+def test_set_max_budget_rejects_a_negative_amount():
+    task = Task.objects.create(name="10a", max_budget=500.0)
+
+    with pytest.raises(ValueError, match="cannot be negative"):
+        task.set_max_budget(-1.0)
+
+    assert Task.objects.get(name="10a").max_budget == 500.0
+
+
+def test_set_max_budget_accepts_zero():
+    task = Task.objects.create(name="10a", max_budget=500.0)
+
+    task.set_max_budget(0.0)
+
+    assert Task.objects.get(name="10a").max_budget == 0.0
+
+
+def test_set_max_budget_fraction_scales_the_current_value():
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    task.set_max_budget_fraction(1.5)
+
+    assert Task.objects.get(name="10a").max_budget == 300.0
+
+
+def test_set_max_budget_fraction_zero_percent_zeroes_it_out():
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    task.set_max_budget_fraction(0.0)
+
+    assert Task.objects.get(name="10a").max_budget == 0.0
+
+
+def test_set_max_budget_fraction_rejects_a_negative_fraction():
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    with pytest.raises(ValueError, match="cannot be negative"):
+        task.set_max_budget_fraction(-0.1)
+
+    assert Task.objects.get(name="10a").max_budget == 200.0
+
+
+def test_set_max_budget_fraction_requires_a_maximum_first():
+    task = Task.objects.create(name="10a")
+
+    with pytest.raises(ValueError, match="no maximum budget"):
+        task.set_max_budget_fraction(0.5)
+
+
+def test_set_budget_sets_the_personal_budget():
+    task = Task.objects.create(name="10a", max_budget=500.0)
+
+    task.set_budget(200.0)
+
+    assert Task.objects.get(name="10a").personal_budget == 200.0
+
+
+def test_set_budget_requires_a_maximum_first():
+    task = Task.objects.create(name="10a")
+
+    with pytest.raises(ValueError, match="no maximum budget"):
+        task.set_budget(100.0)
+
+
+def test_set_budget_rejects_a_negative_amount():
+    task = Task.objects.create(name="10a", max_budget=500.0)
+
+    with pytest.raises(ValueError, match="cannot be negative"):
+        task.set_budget(-1.0)
+
+
+def test_set_budget_rejects_exceeding_the_maximum():
+    task = Task.objects.create(name="10a", max_budget=500.0)
+
+    with pytest.raises(ValueError, match="cannot exceed the maximum"):
+        task.set_budget(500.01)
+
+
+def test_set_budget_accepts_exactly_the_maximum():
+    task = Task.objects.create(name="10a", max_budget=500.0)
+
+    task.set_budget(500.0)
+
+    assert Task.objects.get(name="10a").personal_budget == 500.0
+
+
+def test_set_budget_fraction_computes_a_share_of_the_maximum():
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    task.set_budget_fraction(0.5)
+
+    assert Task.objects.get(name="10a").personal_budget == 100.0
+
+
+def test_set_budget_fraction_can_be_set_again_relative_to_the_maximum():
+    # Each call must be a fraction of max_budget (which never changes
+    # here), not of whatever personal_budget the previous call left
+    # behind - otherwise repeated calls would compound instead of each
+    # landing on the percentage actually asked for.
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    task.set_budget_fraction(0.5)
+    assert Task.objects.get(name="10a").personal_budget == 100.0
+
+    task.set_budget_fraction(0.3)
+    assert Task.objects.get(name="10a").personal_budget == 60.0
+
+    # Setting the same percentage again lands on the same value too.
+    task.set_budget_fraction(0.3)
+    assert Task.objects.get(name="10a").personal_budget == 60.0
+
+
+def test_set_budget_fraction_accepts_the_bounds_zero_and_one():
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    task.set_budget_fraction(0.0)
+    assert Task.objects.get(name="10a").personal_budget == 0.0
+
+    task.set_budget_fraction(1.0)
+    assert Task.objects.get(name="10a").personal_budget == 200.0
+
+
+def test_set_budget_fraction_rejects_above_one():
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    with pytest.raises(ValueError, match="between 0% and 100%"):
+        task.set_budget_fraction(1.01)
+
+
+def test_set_budget_fraction_rejects_a_negative_fraction():
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    with pytest.raises(ValueError, match="between 0% and 100%"):
+        task.set_budget_fraction(-0.01)
+
+
+def test_set_budget_fraction_requires_a_maximum_first():
+    task = Task.objects.create(name="10a")
+
+    with pytest.raises(ValueError, match="no maximum budget"):
+        task.set_budget_fraction(0.5)
+
+
+def test_set_used_budget_sets_the_value():
+    task = Task.objects.create(name="10a")
+
+    task.set_used_budget(100.0)
+
+    assert Task.objects.get(name="10a").used_budget == 100.0
+
+
+def test_set_used_budget_rejects_a_negative_amount():
+    task = Task.objects.create(name="10a")
+
+    with pytest.raises(ValueError, match="cannot be negative"):
+        task.set_used_budget(-1.0)
+
+
+def test_set_used_budget_allows_exceeding_the_maximum():
+    # A task can legitimately already be over budget before this tool
+    # starts tracking it - unlike set_budget, there's no upper bound.
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    task.set_used_budget(300.0)
+
+    assert Task.objects.get(name="10a").used_budget == 300.0
+
+
+def test_set_budget_used_fraction_computes_a_share_of_the_maximum():
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    task.set_budget_used_fraction(0.5)
+
+    assert Task.objects.get(name="10a").used_budget == 100.0
+
+
+def test_set_budget_used_fraction_can_be_set_again_relative_to_the_maximum():
+    # Same guarantee as set_budget_fraction: always a share of the
+    # (unchanged) max_budget, not of the previous used_budget value.
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    task.set_budget_used_fraction(0.5)
+    assert Task.objects.get(name="10a").used_budget == 100.0
+
+    task.set_budget_used_fraction(1.5)
+    assert Task.objects.get(name="10a").used_budget == 300.0
+
+    task.set_budget_used_fraction(0.5)
+    assert Task.objects.get(name="10a").used_budget == 100.0
+
+
+def test_set_budget_used_fraction_allows_exceeding_one():
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    task.set_budget_used_fraction(1.5)
+
+    assert Task.objects.get(name="10a").used_budget == 300.0
+
+
+def test_set_budget_used_fraction_rejects_a_negative_fraction():
+    task = Task.objects.create(name="10a", max_budget=200.0)
+
+    with pytest.raises(ValueError, match="cannot be negative"):
+        task.set_budget_used_fraction(-0.01)
+
+
+def test_set_budget_used_fraction_requires_a_maximum_first():
+    task = Task.objects.create(name="10a")
+
+    with pytest.raises(ValueError, match="no maximum budget"):
+        task.set_budget_used_fraction(0.5)
+
+
+def test_resolve_query_matches_a_single_task():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    Task.objects.create(mou=mou, name="10b")
+
+    assert Task.resolve_query("10a", mou) == [task]
+
+
+def test_resolve_query_resolves_an_alias():
+    from nlnet_rfp_recorder.timetracking.models import Alias
+
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    Alias.objects.create(item_type="task", mou=mou, alias="lib", target="10a")
+
+    assert Task.resolve_query("lib", mou) == [task]
+
+
+def test_resolve_query_expands_a_range_inclusive():
+    mou = MoU.objects.create(name="nlnet-2026")
+    a = Task.objects.create(mou=mou, name="1a")
+    b = Task.objects.create(mou=mou, name="1b")
+    c = Task.objects.create(mou=mou, name="1c")
+    Task.objects.create(mou=mou, name="1d")
+
+    assert Task.resolve_query("1a-1c", mou) == [a, b, c]
+
+
+def test_resolve_query_range_skips_gaps_that_do_not_exist():
+    mou = MoU.objects.create(name="nlnet-2026")
+    a = Task.objects.create(mou=mou, name="1a")
+    c = Task.objects.create(mou=mou, name="1c")
+
+    assert Task.resolve_query("1a-1c", mou) == [a, c]
+
+
+def test_resolve_query_range_across_numbers_orders_by_number_then_letters():
+    mou = MoU.objects.create(name="nlnet-2026")
+    a9 = Task.objects.create(mou=mou, name="9a")
+    a10 = Task.objects.create(mou=mou, name="10a")
+    b10 = Task.objects.create(mou=mou, name="10b")
+    Task.objects.create(mou=mou, name="11a")
+
+    assert Task.resolve_query("9a-10b", mou) == [a9, a10, b10]
+
+
+def test_resolve_query_rejects_a_range_with_end_before_start():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="1a")
+    Task.objects.create(mou=mou, name="1c")
+
+    with pytest.raises(ValueError, match="end before start"):
+        Task.resolve_query("1c-1a", mou)
+
+
+def test_resolve_query_rejects_a_malformed_range():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="1a")
+    Task.objects.create(mou=mou, name="1b")
+    Task.objects.create(mou=mou, name="1c")
+
+    with pytest.raises(ValueError, match="Invalid task range"):
+        Task.resolve_query("1a-1b-1c", mou)
+
+
+def test_resolve_query_rejects_a_range_with_an_unknown_end():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="1a")
+
+    with pytest.raises(ValueError, match="No such task: 1z"):
+        Task.resolve_query("1a-1z", mou)
+
+
+def test_resolve_query_matches_a_prefix():
+    mou = MoU.objects.create(name="nlnet-2026")
+    a = Task.objects.create(mou=mou, name="4a")
+    b = Task.objects.create(mou=mou, name="4b")
+    forty_a = Task.objects.create(mou=mou, name="40a")
+    Task.objects.create(mou=mou, name="14a")
+
+    assert Task.resolve_query("4", mou) == [a, b, forty_a]
+
+
+def test_resolve_query_exact_match_wins_over_prefix():
+    from nlnet_rfp_recorder.timetracking.models import Alias
+
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    other = Task.objects.create(mou=mou, name="10b")
+    Alias.objects.create(item_type="task", mou=mou, alias="10", target="10a")
+
+    # "10" is aliased to exactly 10a - it must not also prefix-match 10b.
+    assert Task.resolve_query("10", mou) == [task]
+    assert other not in Task.resolve_query("10", mou)
+
+
+def test_resolve_query_combines_ranges_lists_and_prefixes():
+    mou = MoU.objects.create(name="nlnet-2026")
+    a1 = Task.objects.create(mou=mou, name="1a")
+    b1 = Task.objects.create(mou=mou, name="1b")
+    c1 = Task.objects.create(mou=mou, name="1c")
+    f2 = Task.objects.create(mou=mou, name="2f")
+    h2 = Task.objects.create(mou=mou, name="2h")
+    a4 = Task.objects.create(mou=mou, name="4a")
+    b4 = Task.objects.create(mou=mou, name="4b")
+    Task.objects.create(mou=mou, name="5a")
+
+    result = Task.resolve_query("1a-1c,2f,2h,4", mou)
+
+    assert result == [a1, b1, c1, f2, h2, a4, b4]
+
+
+def test_resolve_query_deduplicates_overlapping_terms():
+    mou = MoU.objects.create(name="nlnet-2026")
+    a = Task.objects.create(mou=mou, name="1a")
+    b = Task.objects.create(mou=mou, name="1b")
+
+    result = Task.resolve_query("1a,1a-1b,1b", mou)
+
+    assert result == [a, b]
+
+
+def test_resolve_query_sorts_the_result_regardless_of_input_order():
+    mou = MoU.objects.create(name="nlnet-2026")
+    a = Task.objects.create(mou=mou, name="1a")
+    b = Task.objects.create(mou=mou, name="1b")
+    c = Task.objects.create(mou=mou, name="1c")
+
+    assert Task.resolve_query("1c,1a,1b", mou) == [a, b, c]
+
+
+def test_resolve_query_only_matches_tasks_in_the_given_mou():
+    mou_a = MoU.objects.create(name="nlnet-2026")
+    mou_b = MoU.objects.create(name="nlnet-2027")
+    task_a = Task.objects.create(mou=mou_a, name="10a")
+    Task.objects.create(mou=mou_b, name="10a")
+
+    assert Task.resolve_query("10a", mou_a) == [task_a]
+
+
+def test_resolve_query_rejects_an_unknown_task():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="1a")
+
+    with pytest.raises(ValueError, match="No such task: 9z"):
+        Task.resolve_query("9z", mou)
+
+
+def test_resolve_query_rejects_a_prefix_matching_nothing():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="1a")
+
+    with pytest.raises(ValueError, match="No such task: 9"):
+        Task.resolve_query("9", mou)
+
+
+def test_resolve_query_rejects_an_empty_term():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="1a")
+
+    with pytest.raises(ValueError, match="Empty task in query"):
+        Task.resolve_query("1a,", mou)
+
+
+def test_resolve_query_requires_a_selected_mou():
+    with pytest.raises(ValueError, match="No MoU selected"):
+        Task.resolve_query("1a", None)
+
+
 def test_task_other_lists_links_that_are_not_issues_or_pull_requests():
     task = Task.objects.create(name="10a")
     other_link = Link.objects.create(task=task, url="https://example.com/docs/design")

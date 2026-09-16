@@ -3,6 +3,7 @@ import shutil
 import sys
 import tempfile
 import warnings
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from importlib.metadata import version as get_version
 from pathlib import Path
@@ -41,7 +42,13 @@ app = typer.Typer(
     cls=AlphabeticalGroup,
 )
 
-DbOption = typer.Option(None, "--db", help="Path to the sqlite database file.")
+DbOption = typer.Option(
+    None,
+    "--db",
+    envvar="RFP_DB",
+    help="Path to the sqlite database file. Falls back to the RFP_DB "
+    "environment variable when not given.",
+)
 TestOption = typer.Option(
     False,
     "--test",
@@ -822,53 +829,184 @@ def task_select(
     _echo_task_status(task)
 
 
-@task_app.command("set")
-def task_set(
-    name: str = typer.Argument(..., autocompletion=_complete_task_name),
-    budget: float | None = typer.Option(
-        None,
-        "--budget",
-        help=(
-            "Set the task's personal budget, up to its maximum (defaults "
-            "to the maximum budget if left unset)."
-        ),
+def _parse_budget_value(raw: str) -> tuple[float, bool]:
+    """Parse a --budget/--used/--max VALUE: a plain euro amount, or a
+    percentage of the task's maximum budget written as "N%".
+
+    Returns (value, is_percentage): `value` is a euro figure for a
+    plain amount, or a 0.0-based fraction (e.g. 0.5 for "50%") for a
+    percentage. Only checks that the text is a well-formed number -
+    the field-specific bounds (0-100% for budget, unbounded for used
+    and max) are enforced by the Task setter this feeds, not here.
+    """
+    text = raw.strip()
+    if text.endswith("%"):
+        percent_text = text[:-1].strip()
+        try:
+            percent = float(percent_text)
+        except ValueError:
+            raise ValueError(f"Invalid percentage: {raw!r}.") from None
+        return percent / 100, True
+    try:
+        return float(text), False
+    except ValueError:
+        raise ValueError(f"Invalid amount: {raw!r}.") from None
+
+
+TasksArgument = typer.Argument(
+    ...,
+    metavar="TASKS",
+    autocompletion=_complete_task_name,
+    help=(
+        "Which task(s) to update: an exact task name/alias ('10a'), a "
+        "dash-separated range ('1a-1c'), a bare prefix matching every "
+        "task whose name starts with it ('4' selects 4a, 4b, 40a, ...), "
+        "or a comma-separated combination of these ('1a-1c,2f,2h')."
     ),
-    used: float | None = typer.Option(
-        None, "--used", help="Set the task's used budget baseline."
+)
+ValueArgument = typer.Argument(
+    ...,
+    metavar="EUROS|PERCENT",
+    help=(
+        "A plain euro amount ('150') or a percentage of the task's "
+        "maximum budget ('50%')."
     ),
+)
+
+
+def _run_task_set(
+    query: str,
+    raw_value: str,
+    set_amount: Callable[[Task, float], None],
+    set_fraction: Callable[[Task, float], None],
+) -> None:
+    from django.db import transaction
+
+    from nlnet_rfp_recorder.timetracking.models import MoU, Task
+
+    mou = MoU.get_selected()
+    try:
+        tasks = Task.resolve_query(query, mou)
+        value, is_percentage = _parse_budget_value(raw_value)
+        setter = set_fraction if is_percentage else set_amount
+        with transaction.atomic():
+            for task in tasks:
+                setter(task, value)
+    except ValueError as error:
+        _fail(str(error))
+
+    if len(tasks) == 1:
+        _echo_task_status(tasks[0])
+        return
+    typer.echo(f"Updated {len(tasks)} tasks:")
+    for task in tasks:
+        line = task.display_name
+        if task.budget_line is not None:
+            line += f": {task.budget_line}"
+        typer.echo(line)
+
+
+task_set_app = typer.Typer(
+    help="Set a task's budget, used, or maximum - see subcommands.",
+    no_args_is_help=True,
+    cls=AlphabeticalGroup,
+)
+task_app.add_typer(task_set_app, name="set")
+
+
+@task_set_app.command("budget")
+def task_set_budget(
+    tasks: str = TasksArgument,
+    value: str = ValueArgument,
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Manually set a task's total and/or used budget."""
+    """Set one or more tasks' personal budget - up to their maximum.
+
+    TASKS must already have a maximum budget set (via `rfp mou import`
+    or `rfp task set max`) before a personal budget can be set within
+    it. A percentage is of that maximum, so it must be between 0% and
+    100% - see `rfp task set max` to raise the ceiling itself instead.
+
+    Examples:
+
+        rfp task set budget 10a 150      Set 10a's budget to 150 EUR.
+
+        rfp task set budget 10a 50%      Set it to 50% of 10a's maximum.
+
+        rfp task set budget 1a-1c,2f 0   Zero out several tasks at once.
+
+        rfp task set budget 4 0          Zero out every task starting with "4".
+    """
     _setup(db, test)
-    from nlnet_rfp_recorder.timetracking.models import MoU, Task, resolve_task_name
+    from nlnet_rfp_recorder.timetracking.models import Task
 
-    mou = MoU.get_selected()
-    name = resolve_task_name(name, mou)
-    try:
-        task = Task.objects.get(mou=mou, name=name)
-    except Task.DoesNotExist:
-        _fail(f"No such task: {name}. Run `rfp task select {name}` first.")
+    _run_task_set(tasks, value, Task.set_budget, Task.set_budget_fraction)
 
-    fields = []
-    if budget is not None:
-        if budget < 0:
-            _fail("Task budget cannot be negative.")
-        if task.max_budget is not None and budget > task.max_budget:
-            _fail(f"Task budget cannot exceed the maximum of {task.max_budget:.0f}€.")
-        task.personal_budget = budget
-        fields.append("personal_budget")
-        if task.max_budget is None:
-            # Preserve the old behavior for tasks that have no imported maximum.
-            task.max_budget = budget
-            fields.append("max_budget")
-    if used is not None:
-        task.used_budget = used
-        fields.append("used_budget")
-    if fields:
-        task.save(update_fields=fields)
 
-    _echo_task_status(task)
+@task_set_app.command("used")
+def task_set_used(
+    tasks: str = TasksArgument,
+    value: str = ValueArgument,
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Set one or more tasks' used-budget baseline (money already spent
+    before this tool started tracking them).
+
+    Unlike `rfp task set budget`, there's no upper bound - a task can
+    already be over its maximum before tracking begins, so a
+    percentage above 100% is accepted too. Still requires a maximum
+    budget to be set first when given as a percentage (there's nothing
+    to take a percentage of otherwise).
+
+    Examples:
+
+        rfp task set used 10a 100        Mark 100 EUR as already spent.
+
+        rfp task set used 10a 100%       Mark 10a as fully used already.
+
+        rfp task set used 1a-1c,2f,2h 0  Reset several tasks' baseline to 0.
+
+        rfp task set used 4 0            Reset every task starting with "4".
+    """
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Task
+
+    _run_task_set(tasks, value, Task.set_used_budget, Task.set_budget_used_fraction)
+
+
+@task_set_app.command("max")
+def task_set_max(
+    tasks: str = TasksArgument,
+    value: str = ValueArgument,
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Set one or more tasks' maximum budget directly.
+
+    This is a correction tool for fixing up what `rfp mou import`
+    brought in, not something to reach for day to day - prefer
+    re-importing the MoU's budget table if it changed. A percentage
+    here scales the task's *current* maximum rather than being a share
+    of some larger ceiling (there isn't one): "110%" raises it by 10%,
+    "50%" halves it. Doesn't touch personal_budget or used_budget even
+    if they now exceed the new maximum.
+
+    Examples:
+
+        rfp task set max 10a 500         Set 10a's maximum to 500 EUR.
+
+        rfp task set max 10a 110%        Raise it by 10% over its current value.
+
+        rfp task set max 1a-1c,2f,2h 500 Set several tasks' maximum at once.
+
+        rfp task set max 4 500           Set every task starting with "4" to 500 EUR.
+    """
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Task
+
+    _run_task_set(tasks, value, Task.set_max_budget, Task.set_max_budget_fraction)
 
 
 @task_app.command("remove")

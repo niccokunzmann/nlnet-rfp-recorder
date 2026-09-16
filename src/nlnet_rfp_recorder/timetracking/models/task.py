@@ -70,7 +70,7 @@ class Task(models.Model):
         help_text=(
             "Budget (EUR) already spent on this task before this tool "
             "started tracking it, e.g. from an earlier milestone report. "
-            "Set via `rfp mou import` or `rfp task set --used`."
+            "Set via `rfp mou import` or `rfp task set used`."
         ),
     )
     personal_budget = models.FloatField(
@@ -145,6 +145,78 @@ class Task(models.Model):
         type(self).objects.exclude(pk=self.pk).update(selected=False)
         self.selected = True
         self.save(update_fields=["selected"])
+
+    @classmethod
+    def resolve_query(cls, query: str, mou: MoU | None = None) -> list[Task]:
+        """Resolve a task-selector string to the matching tasks in `mou`.
+
+        `query` is a comma-separated list of terms, each one of:
+
+        - an exact task name or alias: "10a"
+        - a dash-separated range of two task names/aliases, inclusive
+          and ordered by (number, letters): "1a-1c" selects 1a, 1b, 1c
+        - a bare prefix shared by several task names: "4" selects every
+          task whose name starts with "4" (4a, 4b, 40a, ...) - handy
+          for updating a whole numbered group at once
+
+        Terms are tried in that order (exact, then range, then prefix),
+        so an exact name/alias always wins over treating it as a
+        prefix. Results are de-duplicated and returned sorted by
+        sort_key, regardless of how the terms overlapped or their order
+        in `query`.
+
+        Raises ValueError - naming the offending term - if a term
+        matches nothing, if a range's ends are out of order, or if no
+        MoU is selected.
+        """
+        from .alias import resolve_task_name
+
+        mou = mou or MoU.get_selected()
+        if mou is None:
+            raise ValueError("No MoU selected. Run `rfp mou add <name>` first.")
+
+        terms = [term.strip() for term in query.split(",")]
+        if not terms or any(not term for term in terms):
+            raise ValueError(f"Empty task in query: {query!r}.")
+
+        tasks = list(cls.objects.filter(mou=mou))
+        by_name = {task.name: task for task in tasks}
+
+        def _lookup(raw: str) -> Task | None:
+            return by_name.get(resolve_task_name(raw, mou))
+
+        matched: dict[int, Task] = {}
+        for term in terms:
+            if "-" in term:
+                start_raw, _, end_raw = term.partition("-")
+                if not start_raw or not end_raw or "-" in end_raw:
+                    raise ValueError(f"Invalid task range: {term!r}.")
+                start, end = _lookup(start_raw), _lookup(end_raw)
+                if start is None:
+                    raise ValueError(f"No such task: {start_raw}.")
+                if end is None:
+                    raise ValueError(f"No such task: {end_raw}.")
+                if start.sort_key > end.sort_key:
+                    raise ValueError(
+                        f"Invalid task range: {term!r} (end before start)."
+                    )
+                for task in tasks:
+                    if start.sort_key <= task.sort_key <= end.sort_key:
+                        matched[task.pk] = task
+                continue
+
+            exact = _lookup(term)
+            if exact is not None:
+                matched[exact.pk] = exact
+                continue
+
+            prefix_matches = [task for task in tasks if task.name.startswith(term)]
+            if not prefix_matches:
+                raise ValueError(f"No such task: {term}.")
+            for task in prefix_matches:
+                matched[task.pk] = task
+
+        return sorted(matched.values(), key=lambda task: task.sort_key)
 
     @property
     def links_with_tracked_time(self) -> models.QuerySet[Link]:
@@ -261,6 +333,103 @@ class Task(models.Model):
             return None
         used = self.used_budget + (self.budget or 0.0)
         return BudgetLine(used=used, total=total, rate=settings.RFP_EUROS_PER_HOUR)
+
+    def set_budget(self, amount: float) -> None:
+        """Set personal_budget to an absolute `amount` (euros).
+
+        Requires max_budget to already be set (via `rfp mou import` or
+        `rfp task set max`) - this picks a target within the maximum,
+        it doesn't establish one. Rejects a negative amount, or one
+        exceeding max_budget.
+        """
+        if self.max_budget is None:
+            raise ValueError(
+                f"Task {self.name} has no maximum budget yet. Set one "
+                f"first, e.g. `rfp task set max {self.name} <euros>`."
+            )
+        if amount < 0:
+            raise ValueError("Task budget cannot be negative.")
+        if amount > self.max_budget:
+            raise ValueError(
+                f"Task budget cannot exceed the maximum of {self.max_budget:.0f}€."
+            )
+        self.personal_budget = amount
+        self.save(update_fields=["personal_budget"])
+
+    def set_budget_fraction(self, fraction: float) -> None:
+        """Set personal_budget to `fraction` of max_budget (0.5 = 50%).
+
+        Same bounds as set_budget, just expressed as a share of the
+        maximum instead of an absolute figure: 0.0 to 1.0 (0% to 100%).
+        """
+        if self.max_budget is None:
+            raise ValueError(
+                f"Task {self.name} has no maximum budget yet. Set one "
+                f"first, e.g. `rfp task set max {self.name} <euros>`."
+            )
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError("Budget percentage must be between 0% and 100%.")
+        self.set_budget(fraction * self.max_budget)
+
+    def set_used_budget(self, amount: float) -> None:
+        """Set used_budget - money already spent before tracking began.
+
+        Only rejects a negative amount. Unlike set_budget, there's no
+        maximum check: a task can legitimately already be over budget
+        before this tool starts tracking it.
+        """
+        if amount < 0:
+            raise ValueError("Used budget cannot be negative.")
+        self.used_budget = amount
+        self.save(update_fields=["used_budget"])
+
+    def set_budget_used_fraction(self, fraction: float) -> None:
+        """Set used_budget to `fraction` of max_budget (0.5 = 50%).
+
+        Same bounds as set_used_budget, just expressed as a share of
+        the maximum: no upper limit, since already being over 100%
+        used is a real, legitimate starting point.
+        """
+        if self.max_budget is None:
+            raise ValueError(
+                f"Task {self.name} has no maximum budget yet. Set one "
+                f"first, e.g. `rfp task set max {self.name} <euros>`."
+            )
+        if fraction < 0.0:
+            raise ValueError("Used-budget percentage cannot be negative.")
+        self.set_used_budget(fraction * self.max_budget)
+
+    def set_max_budget(self, amount: float) -> None:
+        """Set max_budget directly - correcting an MoU import, not
+        normal use (see `rfp task set max`'s help).
+
+        Only rejects a negative amount. Doesn't touch personal_budget
+        or used_budget even if they now exceed the new maximum -
+        callers making a deliberate correction are trusted to fix
+        those too if needed.
+        """
+        if amount < 0:
+            raise ValueError("Maximum budget cannot be negative.")
+        self.max_budget = amount
+        self.save(update_fields=["max_budget"])
+
+    def set_max_budget_fraction(self, fraction: float) -> None:
+        """Scale max_budget by `fraction` of its current value (1.1 = +10%).
+
+        Unlike the budget/used fractions, there's no larger ceiling for
+        the maximum itself to be a share of, so this scales the
+        existing value instead - 0.5 halves it, 1.1 raises it by 10%.
+        Only rejects a negative fraction; anything above 1.0 is a
+        deliberate increase, not an error.
+        """
+        if self.max_budget is None:
+            raise ValueError(
+                f"Task {self.name} has no maximum budget yet to scale. "
+                f"Set one first, e.g. `rfp task set max {self.name} <euros>`."
+            )
+        if fraction < 0.0:
+            raise ValueError("Maximum-budget percentage cannot be negative.")
+        self.set_max_budget(fraction * self.max_budget)
 
     @property
     def issues(self) -> list[Issue]:

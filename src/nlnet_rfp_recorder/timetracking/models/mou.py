@@ -22,7 +22,7 @@ mou_name_validator = RegexValidator(
 
 # used_budget is exported for reference only - it is never applied on
 # import, since its baseline is only ever meant to be set by `rfp mou
-# import` or `rfp task set --used`, not by hand-editing a spreadsheet.
+# import` or `rfp task set used`, not by hand-editing a spreadsheet.
 TASK_CSV_FIELDNAMES = [
     "id",
     "alias",
