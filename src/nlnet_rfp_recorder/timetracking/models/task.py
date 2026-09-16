@@ -132,6 +132,20 @@ class Task(models.Model):
     def get_selected(cls) -> Task | None:
         return cls.objects.filter(selected=True).first()
 
+    def mark_selected(self) -> None:
+        """Make this the currently selected task, deselecting any other.
+
+        Unlike `select`, this takes an existing instance rather than a
+        name to look up or create - for callers (like starting a time
+        entry) that already have the task in hand and just need it to
+        become the one "currently worked on".
+        """
+        if self.selected:
+            return
+        type(self).objects.exclude(pk=self.pk).update(selected=False)
+        self.selected = True
+        self.save(update_fields=["selected"])
+
     @property
     def links_with_tracked_time(self) -> models.QuerySet[Link]:
         return self.links.filter(time_records__isnull=False).distinct()
@@ -193,9 +207,19 @@ class Task(models.Model):
 
     @property
     def tracked_time_records(self) -> models.QuerySet[TimeRecord]:
+        """Every unreported time record for this task, billable or not.
+
+        Deliberately not filtered down to billable_links: this feeds
+        duration/budget, which drive the personal status/task-list view
+        of "how much have I worked and how much budget is left" - time
+        on an open PR is real work already done even if it isn't
+        reportable yet. Report generation applies its own, independent
+        billable-vs-excluded check (see _billable_and_excluded_links in
+        report.py) and never reads this property.
+        """
         from .time_record import TimeRecord
 
-        link_ids = [link.id for link in self.billable_links]
+        link_ids = [link.id for link in self.links_with_unreported_time]
         return TimeRecord.objects.filter(link_id__in=link_ids, report_line__isnull=True)
 
     @property

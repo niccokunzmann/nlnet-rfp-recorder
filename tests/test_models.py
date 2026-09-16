@@ -367,6 +367,25 @@ def test_task_duration_counts_a_running_record_live():
     assert task.duration >= timedelta(minutes=5)
 
 
+def test_task_duration_counts_time_on_an_open_pull_request():
+    # duration/budget drive the personal status/task-list view of "how
+    # much have I worked", not what's reportable yet - unlike
+    # billable_links, an open PR's tracked time must still count here
+    # (see test_billable_links_and_excluded_pull_request_links_share_one_
+    # status_check for the report-side exclusion, which is unaffected).
+    task = Task.objects.create(name="10a")
+    open_link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/pull/1"
+    )
+    TimeRecord.objects.create(
+        link=open_link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+
+    assert task.duration == timedelta(hours=1)
+
+
 def test_task_budget_is_none_without_rfp_euros(settings):
     settings.RFP_EUROS_PER_HOUR = None
     task = Task.objects.create(name="10a")

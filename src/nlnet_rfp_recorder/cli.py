@@ -1362,6 +1362,12 @@ def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
             )
         desired_tag = tags if tags is not None else _default_tag(resolved_link)
         _apply_start_tag(record.link, desired_tag)
+        # Whatever task the entry ended up under - matched, freshly
+        # assigned, kept, or moved - is the one just worked on, so it's
+        # the selected task from now on, even if an explicit task name
+        # above picked a different one that a declined confirm reverted.
+        if record.link.task is not None:
+            record.link.task.mark_selected()
 
 
 @app.command()
@@ -1534,8 +1540,12 @@ def continue_(db: Path | None = DbOption, test: bool = TestOption) -> None:
         f"Continuing task {_task_name(record)} as a new entry: {record.link.url}"
     )
     task = record.link.task
-    if task is not None and task.description:
-        typer.echo(task.description)
+    if task is not None:
+        # This link's task is the one just worked on again - same
+        # invariant `_start` keeps (see its call to mark_selected).
+        task.mark_selected()
+        if task.description:
+            typer.echo(task.description)
 
 
 report_app = typer.Typer(

@@ -1003,6 +1003,23 @@ def test_continue_creates_a_new_time_entry_for_the_same_link():
     assert "https://example.com/issues/1" in result.output
 
 
+def test_continue_selects_the_links_task():
+    # Same invariant `_start` keeps: whatever task the continued entry's
+    # link belongs to is the task just worked on, so it must end up
+    # selected even if a different task was selected in the meantime.
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    runner.invoke(app, ["task", "select", "10b"])
+
+    result = runner.invoke(app, ["continue"])
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.get(name="10a").selected is True
+    assert Task.objects.get(name="10b").selected is False
+
+
 def test_continue_shows_the_tasks_description_if_present():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
@@ -2946,6 +2963,27 @@ def test_start_without_a_task_keeps_the_links_existing_task():
     assert "rfp start 10a https://example.com/issues/1" in result.output
     link = Link.objects.get()
     assert link.task.name == "10b"
+    assert Task.objects.get(name="10b").selected is True
+    assert Task.objects.get(name="10a").selected is False
+
+
+def test_start_declining_the_task_change_reselects_the_old_task():
+    # An explicit task name selects it right away (test_start_with_an_
+    # explicit_task_selects_it_first), but declining to actually move the
+    # link means 10a - not 10b - is the task that was really worked on,
+    # so it must end up selected again, not 10b.
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(
+        app, ["start", "10b", "https://example.com/issues/1"], input="n\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.get(name="10a").selected is True
+    assert Task.objects.get(name="10b").selected is False
 
 
 def test_implement_on_a_different_task_asks_before_moving_it():
