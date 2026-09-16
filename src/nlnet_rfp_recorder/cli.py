@@ -194,20 +194,32 @@ def _apply_start_tag(link: Link, desired_tag: str) -> None:
         typer.echo(f"Tag changed to '{desired_tag}'.")
 
 
-def _apply_start_task(link: Link, desired_task: Task) -> None:
+def _apply_start_task(link: Link, desired_task: Task, *, explicit: bool) -> None:
     """Move `link` to `desired_task` if it currently belongs elsewhere.
 
     A link with no task yet is simply assigned - nothing to ask about.
-    One already under a different task defaults to yes when asked,
-    unlike the tag question: typing a different task while starting,
-    reviewing, or implementing a link is usually a deliberate
-    correction, not a conflict to be wary of.
+    When a task was typed explicitly, one already under a different task
+    defaults to yes when asked, unlike the tag question: typing a task
+    while starting, reviewing, or implementing a link is usually a
+    deliberate correction, not a conflict to be wary of. When no task
+    was typed, `desired_task` is only the currently selected task
+    filling in for a missing argument, not something the user actually
+    asked for - so an existing assignment wins without a question, with
+    a hint for how to move it explicitly if that's wrong.
     """
     if link.task_id == desired_task.id:
         return
     if link.task_id is None:
         link.task = desired_task
         link.save(update_fields=["task"])
+        return
+
+    if not explicit:
+        typer.echo(f"{link.url} is under task {link.task.display_name}.")
+        typer.echo(
+            f"Run `rfp start {desired_task.name} {link.url}` to move it to "
+            f"{desired_task.display_name} instead."
+        )
         return
 
     typer.echo(
@@ -1345,7 +1357,9 @@ def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
     # (if the link's task or tag would actually change).
     if record.link is not None:
         if effective_task is not None:
-            _apply_start_task(record.link, effective_task)
+            _apply_start_task(
+                record.link, effective_task, explicit=task_name is not None
+            )
         desired_tag = tags if tags is not None else _default_tag(resolved_link)
         _apply_start_tag(record.link, desired_tag)
 

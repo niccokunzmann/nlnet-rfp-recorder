@@ -2927,6 +2927,27 @@ def test_start_assigns_a_taskless_link_without_asking():
     assert link.task == task
 
 
+def test_start_without_a_task_keeps_the_links_existing_task():
+    # No task was typed, so the selected task is only a fallback filling
+    # in for a missing argument - an existing assignment wins without a
+    # question, unlike typing a task explicitly (see
+    # test_start_asks_before_moving_a_link_to_a_different_task).
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "10b", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    assert "but this looks like" not in result.output
+    assert "is under task 10b" in result.output
+    assert "rfp start 10a https://example.com/issues/1" in result.output
+    link = Link.objects.get()
+    assert link.task.name == "10b"
+
+
 def test_implement_on_a_different_task_asks_before_moving_it():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
