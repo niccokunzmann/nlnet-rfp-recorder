@@ -94,6 +94,35 @@ def _format_duration(duration: timedelta) -> str:
     return format_duration_hours(duration.total_seconds() / 3600)
 
 
+def _parse_duration_or_fail(text: str) -> tuple[timedelta, bool]:
+    """Parse `edit --duration`'s value: plain minutes ('50') or 'H:MM'
+    ('1:20') - both accepting any number of minutes, not just < 60 -
+    set the duration outright. A leading '+' or '-' instead adjusts the
+    current duration by that amount ('+15', '-1:20').
+
+    Returns (amount, relative); `amount` already carries the sign for a
+    '-' adjustment, so callers just pick between TimeRecord.add_duration
+    (relative) and TimeRecord.set_duration (not relative).
+    """
+    relative = text[:1] in "+-"
+    sign = -1 if text.startswith("-") else 1
+    magnitude = text[1:] if relative else text
+
+    if ":" in magnitude:
+        hours_part, _, minutes_part = magnitude.partition(":")
+        try:
+            hours, minutes = int(hours_part), int(minutes_part)
+        except ValueError:
+            _fail(f"Invalid duration {text!r}; expected minutes or 'H:MM'.")
+        return sign * timedelta(hours=hours, minutes=minutes), relative
+
+    try:
+        minutes = int(magnitude)
+    except ValueError:
+        _fail(f"Invalid duration {text!r}; expected minutes or 'H:MM'.")
+    return sign * timedelta(minutes=minutes), relative
+
+
 def _task_name(record: TimeRecord) -> str:
     if record.link is None or record.link.task is None:
         return "?"
@@ -377,9 +406,14 @@ def _parse_task_and_link(args: list[str], command: str) -> tuple[str | None, str
     """Split a review/start [TASK] LINK argument list.
 
     One argument is just the link (the currently selected task is used,
-    as before); two are the task name/alias followed by the link.
+    as before); two are the task name/alias followed by the link. One
+    argument with neither "/" nor ":" can't be a link at all - it's a
+    bare task name or alias, started with an empty url instead.
     """
     if len(args) == 1:
+        if "/" not in args[0] and ":" not in args[0]:
+            typer.echo(f"{args[0]!r} isn't a link - starting it with an empty url.")
+            return args[0], ""
         return None, args[0]
     if len(args) == 2:
         return args[0], args[1]
@@ -726,11 +760,21 @@ def task_status(db: Path | None = DbOption, test: bool = TestOption) -> None:
 def task_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """List tasks for the current MoU, marking the selected one."""
     _setup(db, test)
-    from nlnet_rfp_recorder.timetracking.models import MoU, Task
+    from nlnet_rfp_recorder.timetracking.models import MoU
 
     mou = MoU.get_selected()
     if mou is None:
         _fail("No MoU selected. Run `rfp mou add <name>` first.")
+
+    _print_task_table(mou)
+
+
+def _print_task_table(mou: MoU) -> None:
+    """Print `mou`'s tasks (name/alias, budget, description), marking
+    the selected one - the body of `rfp task list`, also used by
+    _prompt_for_task's '?' listing.
+    """
+    from nlnet_rfp_recorder.timetracking.models import Task
 
     tasks = sorted(Task.objects.filter(mou=mou), key=lambda task: task.sort_key)
     if not tasks:
@@ -1451,6 +1495,110 @@ def stats_total(db: Path | None = DbOption, test: bool = TestOption) -> None:
     _echo_stats(Statistics.total())
 
 
+def _enable_task_completion(mou: MoU) -> Callable[[], None]:
+    """Best-effort tab-completion of `mou`'s task names/aliases for the
+    next input() call (e.g. via typer.prompt) - readline isn't available
+    everywhere (notably Windows), so this quietly does nothing there;
+    the '?' listing in _prompt_for_task is the fallback that always
+    works regardless.
+
+    Returns a callback that restores the previous completer - always
+    call it (in a finally) once done prompting, so an unrelated later
+    input() isn't left completing task names.
+    """
+    try:
+        import readline
+    except ImportError:
+        return lambda: None
+
+    from nlnet_rfp_recorder.timetracking.models import Alias, Task
+
+    names = Task.objects.filter(mou=mou).values_list("name", flat=True)
+    aliases = Alias.objects.filter(item_type="task", mou=mou).values_list(
+        "alias", flat=True
+    )
+    candidates = sorted(set(names) | set(aliases))
+
+    def _complete(text: str, state: int) -> str | None:
+        matches = [candidate for candidate in candidates if candidate.startswith(text)]
+        return matches[state] if state < len(matches) else None
+
+    previous_completer = readline.get_completer()
+    previous_delims = readline.get_completer_delims()
+    readline.set_completer_delims("")
+    readline.set_completer(_complete)
+    readline.parse_and_bind("tab: complete")
+
+    def _restore() -> None:
+        readline.set_completer(previous_completer)
+        readline.set_completer_delims(previous_delims)
+
+    return _restore
+
+
+def _prompt_for_task(record: TimeRecord) -> Task | None:
+    """Ask which task a just-started, still-taskless time entry should
+    count toward.
+
+    Plain Enter picks the task of the most recent other time entry that
+    had one - "the last task worked on" - if there is one. '?' prints
+    the task list (name/alias, budget, description - same as `rfp task
+    list`) and asks again. Anything else must be an existing task's
+    name or alias: unlike `rfp task select`, a typo here is never
+    silently taken as a brand new task, since this is asked mid-flow
+    rather than something deliberately typed.
+
+    Returns None - leaving the entry taskless, to be assigned later via
+    `rfp edit --task` - when there's no MoU to pick a task from yet.
+    """
+    from nlnet_rfp_recorder.timetracking.models import (
+        MoU,
+        Task,
+        TimeRecord,
+        resolve_task_name,
+    )
+
+    mou = MoU.get_selected()
+    if mou is None:
+        typer.echo(
+            "No MoU selected, so this entry can't be assigned a task yet. "
+            "Run `rfp mou add <name>` and `rfp task select <name>`, then "
+            "`rfp edit --task <name>` to assign it."
+        )
+        return None
+
+    previous = (
+        TimeRecord.objects.exclude(pk=record.pk)
+        .exclude(link__task__isnull=True)
+        .order_by("-start_time")
+        .first()
+    )
+    default_task = previous.link.task if previous is not None else None
+    # The plain name, not display_name - an aliased task's "10a (foo)"
+    # isn't itself a valid answer, and would fail to resolve below.
+    default_name = default_task.name if default_task is not None else None
+
+    restore_completer = _enable_task_completion(mou)
+    try:
+        while True:
+            answer = typer.prompt(
+                "Which task should this be assigned to? (enter '?' to list tasks)",
+                default=default_name,
+            ).strip()
+
+            if answer == "?":
+                _print_task_table(mou)
+                continue
+
+            name = resolve_task_name(answer, mou)
+            try:
+                return Task.objects.get(mou=mou, name=name)
+            except Task.DoesNotExist:
+                typer.echo(f"No such task: {answer!r}. Enter '?' to list tasks.")
+    finally:
+        restore_completer()
+
+
 def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
     from django.utils import timezone
 
@@ -1466,15 +1614,15 @@ def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
     effective_task = task or Task.get_selected()
     previously_running = TimeRecord.get_running()
 
-    try:
-        # A link already under a different task only ever gets a warning
-        # here (never reassigned) - suppressed, since _apply_start_task
-        # below replaces it with a proper question once the entry exists.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            record = TimeRecord.start(resolved_link, task=task, tags=(), start_time=now)
-    except ValueError as error:
-        _fail(str(error))
+    # A link already under a different task only ever gets a warning
+    # here (never reassigned) - suppressed, since _apply_start_task below
+    # replaces it with a proper question once the entry exists. Starting
+    # never fails for lack of a task any more - TimeRecord.start happily
+    # creates a taskless entry, asked about below once the clock is
+    # already running.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        record = TimeRecord.start(resolved_link, task=task, tags=(), start_time=now)
 
     if previously_running is not None and previously_running.pk != record.pk:
         previously_running.refresh_from_db()
@@ -1500,10 +1648,16 @@ def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
             )
         desired_tag = tags if tags is not None else _default_tag(resolved_link)
         _apply_start_tag(record.link, desired_tag)
+        if record.link.task is None:
+            chosen_task = _prompt_for_task(record)
+            if chosen_task is not None:
+                record.link.task = chosen_task
+                record.link.save(update_fields=["task"])
         # Whatever task the entry ended up under - matched, freshly
-        # assigned, kept, or moved - is the one just worked on, so it's
-        # the selected task from now on, even if an explicit task name
-        # above picked a different one that a declined confirm reverted.
+        # assigned, kept, moved, or just now picked - is the one just
+        # worked on, so it's the selected task from now on, even if an
+        # explicit task name above picked a different one that a
+        # declined confirm reverted.
         if record.link.task is not None:
             record.link.task.mark_selected()
 
@@ -1581,10 +1735,20 @@ def edit(
         autocompletion=_complete_task_name,
         help="Reassign this time entry's link to a different task (name or alias).",
     ),
+    duration: str | None = typer.Option(
+        None,
+        "--duration",
+        help=(
+            "Set this entry's duration - minutes ('50') or 'H:MM' ('1:20') "
+            "- or, prefixed with '+'/'-', adjust it ('+15', '-1:20') - by "
+            "moving its start time; a still-running entry keeps running. "
+            "For when you forgot to stop it."
+        ),
+    ),
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Edit the most recent time entry's link, tags, and/or task."""
+    """Edit the most recent time entry's link, tags, task, and/or duration."""
     _setup(db, test)
     from nlnet_rfp_recorder.timetracking.models import Link, TimeRecord
 
@@ -1620,6 +1784,18 @@ def edit(
             )
         record.link.task = resolved_task
         record.link.save(update_fields=["task"])
+        # Editing the task is a deliberate reassignment, just like an
+        # explicit task name on `start`/`review`/`implement` - it should
+        # become the selected task too (see _start's mark_selected call).
+        resolved_task.mark_selected()
+
+    if duration is not None:
+        amount, relative = _parse_duration_or_fail(duration)
+        if relative:
+            record.add_duration(amount)
+        else:
+            record.set_duration(amount)
+        typer.echo(f"New duration: {_format_duration(record.duration)}")
 
     url = record.link.url if record.link else ""
     typer.echo(f"Edited {_task_name(record)} {_format_duration(record.duration)} {url}")

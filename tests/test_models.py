@@ -105,6 +105,146 @@ def test_duration_of_a_running_record_counts_up_to_now():
     assert record.duration >= timedelta(minutes=5)
 
 
+def test_set_duration_fix_end_moves_the_start_of_a_finished_record():
+    record = TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 30),
+    )
+
+    record.set_duration(timedelta(minutes=50), fix="end")
+
+    assert record.end_time == datetime(2026, 9, 4, 10, 30)
+    assert record.start_time == datetime(2026, 9, 4, 9, 40)
+    assert record.duration == timedelta(minutes=50)
+
+
+def test_set_duration_defaults_to_fix_end():
+    record = TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 30),
+    )
+
+    record.set_duration(timedelta(minutes=50))
+
+    assert record.end_time == datetime(2026, 9, 4, 10, 30)
+    assert record.start_time == datetime(2026, 9, 4, 9, 40)
+
+
+def test_set_duration_fix_start_moves_the_end_of_a_finished_record():
+    record = TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 30),
+    )
+
+    record.set_duration(timedelta(minutes=50), fix="start")
+
+    assert record.start_time == datetime(2026, 9, 4, 9, 0)
+    assert record.end_time == datetime(2026, 9, 4, 9, 50)
+    assert record.duration == timedelta(minutes=50)
+
+
+def test_set_duration_fix_end_on_a_running_record_keeps_it_running():
+    # The whole point of fix="end": recalculating an entry left running
+    # (its "end" is "now", not a fixed end_time) without stopping it.
+    started_at = timezone.now() - timedelta(hours=3)
+    record = TimeRecord.objects.create(start_time=started_at)
+
+    with patch(
+        "django.utils.timezone.now", return_value=started_at + timedelta(hours=3)
+    ):
+        record.set_duration(timedelta(minutes=50), fix="end")
+        duration_now = record.duration
+
+    assert record.is_running is True
+    assert record.end_time is None
+    assert record.start_time == started_at + timedelta(hours=3, minutes=-50)
+    assert duration_now == timedelta(minutes=50)
+
+
+def test_set_duration_fix_start_on_a_running_record_still_moves_the_start():
+    # fix is ignored while running: there's no end_time to hold fixed,
+    # and set_duration never invents one - only `stop` does that.
+    started_at = timezone.now() - timedelta(hours=3)
+    record = TimeRecord.objects.create(start_time=started_at)
+
+    with patch(
+        "django.utils.timezone.now", return_value=started_at + timedelta(hours=3)
+    ):
+        record.set_duration(timedelta(minutes=50), fix="start")
+        duration_now = record.duration
+
+    assert record.is_running is True
+    assert record.end_time is None
+    assert record.start_time == started_at + timedelta(hours=3, minutes=-50)
+    assert duration_now == timedelta(minutes=50)
+
+
+def test_add_duration_grows_a_finished_record():
+    record = TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 30),
+    )
+
+    record.add_duration(timedelta(minutes=15))
+
+    assert record.end_time == datetime(2026, 9, 4, 10, 30)
+    assert record.start_time == datetime(2026, 9, 4, 8, 45)
+    assert record.duration == timedelta(hours=1, minutes=45)
+
+
+def test_add_duration_shrinks_a_finished_record():
+    record = TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 30),
+    )
+
+    record.add_duration(-timedelta(minutes=15))
+
+    assert record.end_time == datetime(2026, 9, 4, 10, 30)
+    assert record.start_time == datetime(2026, 9, 4, 9, 15)
+    assert record.duration == timedelta(hours=1, minutes=15)
+
+
+def test_add_duration_subtracting_too_much_clamps_to_zero():
+    record = TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 9, 30),
+    )
+
+    record.add_duration(-timedelta(hours=1))
+
+    assert record.end_time == datetime(2026, 9, 4, 9, 30)
+    assert record.start_time == datetime(2026, 9, 4, 9, 30)
+    assert record.duration == timedelta(0)
+
+
+def test_add_duration_fix_start_moves_the_end_of_a_finished_record():
+    record = TimeRecord.objects.create(
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 30),
+    )
+
+    record.add_duration(timedelta(minutes=15), fix="start")
+
+    assert record.start_time == datetime(2026, 9, 4, 9, 0)
+    assert record.end_time == datetime(2026, 9, 4, 10, 45)
+
+
+def test_add_duration_on_a_running_record_moves_the_start_and_keeps_it_running():
+    started_at = timezone.now() - timedelta(hours=3)
+    record = TimeRecord.objects.create(start_time=started_at)
+
+    with patch(
+        "django.utils.timezone.now", return_value=started_at + timedelta(hours=3)
+    ):
+        record.add_duration(timedelta(minutes=15))
+        duration_now = record.duration
+
+    assert record.is_running is True
+    assert record.end_time is None
+    assert duration_now == timedelta(hours=3, minutes=15)
+
+
 def test_budget_is_none_without_rfp_euros(settings):
     settings.RFP_EUROS_PER_HOUR = None
     record = TimeRecord.objects.create(
@@ -967,9 +1107,12 @@ def test_link_get_or_create_for_task_is_silent_for_the_same_task():
     assert result.task == task
 
 
-def test_start_without_a_task_and_none_selected_raises():
-    with pytest.raises(ValueError):
-        TimeRecord.start("https://example.com/issues/1")
+def test_start_without_a_task_and_none_selected_creates_a_taskless_entry():
+    record = TimeRecord.start("https://example.com/issues/1")
+
+    assert record.link.task is None
+    assert record.link.url == "https://example.com/issues/1"
+    assert record.is_running is True
 
 
 def test_start_uses_the_selected_task_by_default():

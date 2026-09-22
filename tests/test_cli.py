@@ -1045,12 +1045,97 @@ def test_task_export_import_round_trips_all_fields(tmp_path):
     assert reexported.output == exported.output
 
 
-def test_start_without_a_task_fails():
+def test_start_without_a_task_creates_a_taskless_entry():
     # Also covers "no MoU selected": without one, `rfp task` (and thus any
-    # task at all) can never succeed, so no task can ever be selected.
+    # task at all) can never succeed - starting still isn't held up by
+    # that, so the clock runs and the task can be assigned later.
     result = runner.invoke(app, ["start", "https://example.com/issues/1"])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 0, result.output
+    assert "No MoU selected" in result.output
+    record = TimeRecord.objects.get()
+    assert record.is_running is True
+    assert record.link.task is None
+
+
+def test_start_asks_which_task_when_none_is_selected():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["task", "select", "10b"])
+    runner.invoke(app, ["task", "select"])  # deselect - nothing selected now
+
+    result = runner.invoke(
+        app, ["start", "https://example.com/issues/1"], input="10a\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Which task should this be assigned to?" in result.output
+    record = TimeRecord.objects.get()
+    assert record.link.task.name == "10a"
+    assert Task.objects.get(name="10a").selected is True
+
+
+def test_start_prompt_defaults_to_the_last_worked_task():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    runner.invoke(app, ["task", "select"])  # deselect
+
+    result = runner.invoke(app, ["start", "https://example.com/issues/2"], input="\n")
+
+    assert result.exit_code == 0, result.output
+    assert "[10a]" in result.output
+    record = TimeRecord.objects.get(link__url="https://example.com/issues/2")
+    assert record.link.task.name == "10a"
+
+
+def test_start_prompt_default_uses_the_bare_name_not_the_alias():
+    # An aliased task's display_name is "10a (ical-lang)" - not itself a
+    # valid answer, so the default offered (and accepted on blank Enter)
+    # must be the plain name instead.
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["alias", "set", "task", "10a", "ical-lang"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    runner.invoke(app, ["task", "select"])
+
+    result = runner.invoke(app, ["start", "https://example.com/issues/2"], input="\n")
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get(link__url="https://example.com/issues/2")
+    assert record.link.task.name == "10a"
+
+
+def test_start_rejects_an_unknown_task_and_asks_again():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["task", "select"])
+
+    result = runner.invoke(
+        app, ["start", "https://example.com/issues/1"], input="99z\n10a\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No such task: '99z'" in result.output
+    record = TimeRecord.objects.get()
+    assert record.link.task.name == "10a"
+
+
+def test_start_question_mark_lists_tasks_then_asks_again():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    Task.objects.create(mou=MoU.objects.get(), name="10a", description="Do the thing")
+    runner.invoke(app, ["task", "select"])  # deselect the just-created task
+
+    result = runner.invoke(
+        app, ["start", "https://example.com/issues/1"], input="?\n10a\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Do the thing" in result.output
+    record = TimeRecord.objects.get()
+    assert record.link.task.name == "10a"
 
 
 def test_start_creates_a_time_entry_for_the_selected_task():
@@ -1119,6 +1204,22 @@ def test_start_with_an_explicit_task_selects_it_first():
     assert record.link.task.name == "10b"
     assert Task.objects.get(name="10b").selected is True
     assert Task.objects.get(name="10a").selected is False
+
+
+def test_start_with_a_single_bare_task_alias_uses_an_empty_url():
+    # No "/" or ":" - can't be a link, so it's a task name/alias started
+    # with an empty url instead of the currently selected task's link.
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["alias", "set", "task", "10a", "ical-lang"])
+
+    result = runner.invoke(app, ["start", "ical-lang"])
+
+    assert result.exit_code == 0, result.output
+    assert "'ical-lang' isn't a link - starting it with an empty url." in result.output
+    record = TimeRecord.objects.get()
+    assert record.link.task.name == "10a"
+    assert record.link.url == ""
 
 
 def test_start_with_too_many_positional_arguments_fails():
@@ -1326,6 +1427,20 @@ def test_edit_reassigns_the_task_by_alias():
     assert record.link.task.name == "11b"
 
 
+def test_edit_task_selects_the_new_task():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["task", "select", "11b"])
+    runner.invoke(app, ["task", "select", "10a"])
+
+    result = runner.invoke(app, ["edit", "--task", "11b"])
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.get(name="11b").selected is True
+    assert Task.objects.get(name="10a").selected is False
+
+
 def test_edit_task_fails_for_an_unknown_task():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
@@ -1373,6 +1488,157 @@ def test_edit_changes_link_tags_and_task_together():
     assert record.link.url == "https://example.com/issues/2"
     assert record.link.task.name == "11b"
     assert "review" in {tag.name for tag in record.link.tags.all()}
+
+
+def test_edit_duration_moves_the_start_keeping_the_end_fixed():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    original_end = TimeRecord.objects.get().end_time
+
+    result = runner.invoke(app, ["edit", "--duration", "50"])
+
+    assert result.exit_code == 0, result.output
+    assert "New duration: 0:50" in result.output
+    record = TimeRecord.objects.get()
+    assert record.end_time == original_end
+    assert record.start_time == original_end - timedelta(minutes=50)
+    assert record.duration == timedelta(minutes=50)
+
+
+def test_edit_duration_accepts_hmm():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(app, ["edit", "--duration", "1:20"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.duration == timedelta(hours=1, minutes=20)
+
+
+def test_edit_duration_plain_minutes_matches_equivalent_hmm():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(app, ["edit", "--duration", "80"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.duration == timedelta(hours=1, minutes=20)
+
+
+def test_edit_duration_plus_prefix_adds_to_the_current_duration():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    runner.invoke(app, ["edit", "--duration", "50"])
+
+    result = runner.invoke(app, ["edit", "--duration", "+15"])
+
+    assert result.exit_code == 0, result.output
+    assert "New duration: 1:05" in result.output
+    record = TimeRecord.objects.get()
+    assert record.duration == timedelta(minutes=65)
+
+
+def test_edit_duration_minus_prefix_subtracts_from_the_current_duration():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    runner.invoke(app, ["edit", "--duration", "50"])
+
+    result = runner.invoke(app, ["edit", "--duration", "-15"])
+
+    assert result.exit_code == 0, result.output
+    assert "New duration: 0:35" in result.output
+    record = TimeRecord.objects.get()
+    assert record.duration == timedelta(minutes=35)
+
+
+def test_edit_duration_minus_prefix_accepts_hmm():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    runner.invoke(app, ["edit", "--duration", "2:00"])
+
+    result = runner.invoke(app, ["edit", "--duration", "-1:20"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.duration == timedelta(minutes=40)
+
+
+def test_edit_duration_subtracting_too_much_clamps_to_zero():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    runner.invoke(app, ["edit", "--duration", "30"])
+
+    result = runner.invoke(app, ["edit", "--duration", "-1:00"])
+
+    assert result.exit_code == 0, result.output
+    assert "New duration: 0:00" in result.output
+    record = TimeRecord.objects.get()
+    assert record.duration == timedelta(0)
+    assert record.start_time == record.end_time
+
+
+def test_edit_duration_on_a_running_entry_moves_the_start_and_keeps_it_running():
+    # The whole point of --duration: fixing an entry left running because
+    # `rfp stop` was forgotten. The elapsed time is measured against
+    # "now" (there's no end_time yet), and only the start moves - the
+    # entry is still running afterwards, unlike a plain `rfp stop`.
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    started_at = timezone.now()
+    with patch("django.utils.timezone.now", return_value=started_at):
+        runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    edited_at = started_at + timedelta(hours=3)
+    with patch("django.utils.timezone.now", return_value=edited_at):
+        result = runner.invoke(app, ["edit", "--duration", "50"])
+        record = TimeRecord.objects.get()
+        duration_now = record.duration
+
+    assert result.exit_code == 0, result.output
+    assert record.is_running is True
+    assert record.end_time is None
+    assert record.start_time == edited_at - timedelta(minutes=50)
+    assert duration_now == timedelta(minutes=50)
+
+
+def test_edit_duration_rejects_garbage():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    result = runner.invoke(app, ["edit", "--duration", "not-a-duration"])
+
+    assert result.exit_code != 0
+    assert "Invalid duration" in result.output
+    record = TimeRecord.objects.get()
+    assert record.is_running is True
+
+
+def test_edit_duration_rejects_non_numeric_hmm_parts():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    result = runner.invoke(app, ["edit", "--duration", "1:xx"])
+
+    assert result.exit_code != 0
+    assert "Invalid duration" in result.output
 
 
 def _time_record_pk() -> int:
@@ -2854,10 +3120,13 @@ def test_review_starts_a_time_entry_tagged_review():
     assert "Started time entry for task 10a" in result.output
 
 
-def test_review_without_a_task_fails():
+def test_review_without_a_task_creates_a_taskless_entry():
     result = runner.invoke(app, ["review", "https://example.com/issues/1"])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.is_running is True
+    assert record.link.task is None
 
 
 def test_review_stops_a_previously_running_entry():
@@ -2915,10 +3184,27 @@ def test_implement_starts_a_time_entry_tagged_implementation():
     assert "Started time entry for task 10a" in result.output
 
 
-def test_implement_without_a_task_fails():
+def test_implement_without_a_task_creates_a_taskless_entry():
     result = runner.invoke(app, ["implement", "https://example.com/issues/1"])
 
-    assert result.exit_code != 0
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get()
+    assert record.is_running is True
+    assert record.link.task is None
+
+
+def test_implement_with_a_single_bare_task_alias_uses_an_empty_url():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["alias", "set", "task", "10a", "ical-lang"])
+
+    result = runner.invoke(app, ["implement", "ical-lang"])
+
+    assert result.exit_code == 0, result.output
+    assert "'ical-lang' isn't a link - starting it with an empty url." in result.output
+    record = TimeRecord.objects.get()
+    assert record.link.task.name == "10a"
+    assert record.link.url == ""
 
 
 def test_implement_with_an_explicit_task_selects_it_first():

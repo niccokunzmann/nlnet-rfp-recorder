@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from typing import Literal
 
 from django.conf import settings
 from django.db import models
@@ -108,11 +109,13 @@ class TimeRecord(models.Model):
         callers capture it up front so unrelated delays elsewhere in the
         command never show up as recorded time. It has no effect on a
         resumed entry, which keeps its original start_time.
+
+        `task` (or, absent that, the currently selected task) may be
+        None - the entry still starts, tracked against a taskless link;
+        the caller is responsible for getting it assigned a task
+        afterwards (see cli._prompt_for_task).
         """
         task = task or Task.get_selected()
-        if task is None:
-            raise ValueError("No task selected. Run `rfp task <name>` first.")
-
         link = Link.get_or_create_for_task(url, task)
         for tag in tags:
             link.add_tag(tag)
@@ -235,6 +238,46 @@ class TimeRecord(models.Model):
     @property
     def duration(self) -> timedelta:
         return (self.end_time or timezone.now()) - self.start_time
+
+    def set_duration(
+        self, duration: timedelta, fix: Literal["start", "end"] = "end"
+    ) -> None:
+        """Change this entry's duration to `duration` by moving one end
+        of it, leaving the other exactly where it was.
+
+        fix="end" (the default) keeps the end fixed - a stopped entry's
+        end_time, or "now" for a still-running one - and moves the start
+        back or forward to match. A running entry's end_time is never
+        touched here, so it stays running; its duration then keeps
+        growing from `duration` as time passes, same as any other
+        running entry.
+
+        fix="start" instead keeps start_time fixed and moves the end -
+        but only for an entry that already has one. A running entry has
+        no end_time to hold onto (and set_duration isn't `stop`, so it
+        never invents one), so a running entry always behaves as if
+        fix="end", no matter what was asked for.
+
+        A negative `duration` (from add_duration subtracting more than
+        was there) clamps to zero rather than putting the moved end
+        before the fixed one.
+        """
+        duration = max(duration, timedelta())
+        if self.is_running or fix == "end":
+            effective_end = self.end_time or timezone.now()
+            self.start_time = effective_end - duration
+            self.save(update_fields=["start_time"])
+        else:
+            self.end_time = self.start_time + duration
+            self.save(update_fields=["end_time"])
+
+    def add_duration(
+        self, delta: timedelta, fix: Literal["start", "end"] = "end"
+    ) -> None:
+        """Adjust this entry's duration by `delta` (negative to shrink
+        it), via the same fix semantics as set_duration.
+        """
+        self.set_duration(self.duration + delta, fix=fix)
 
     @property
     def budget(self) -> float | None:

@@ -55,9 +55,15 @@ class Link(models.Model):
     )
 
     @classmethod
-    def get_or_create_for_task(cls, url: str, task: Task) -> Link:
+    def get_or_create_for_task(cls, url: str, task: Task | None) -> Link:
+        """Get or create the link for `url`, assigning it to `task`.
+
+        `task` may be None - e.g. a link started with no task selected -
+        in which case a fresh link is simply created taskless, and an
+        existing one's task is never touched.
+        """
         link, created = cls.objects.get_or_create(url=url, defaults={"task": task})
-        if created:
+        if created or task is None:
             return link
         if link.task_id is None:
             link.task = task

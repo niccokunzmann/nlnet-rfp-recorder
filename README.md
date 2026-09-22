@@ -75,11 +75,16 @@ rfp stop
 rfp report
 ```
 
-- `rfp review <link>` instead of `rfp start`: tags the entry as review, not implementation.
-- `rfp status` / `rfp task` / `rfp mou status`: check where things stand.
-- `rfp report` counts issues once finished regardless of GitHub status, but only counts a PR once it's closed (checked live against GitHub).
-- `rfp token <token>` (`rfp token` alone for setup steps): avoids the unauthenticated GitHub API rate limit, which the report can hit quickly.
-- `rfp --test <command>`: try things against a disposable database instead of your real one.
+| Command | Description |
+| --- | --- |
+| `rfp review <link>` | Instead of `rfp start`: tags the entry as review, not implementation. |
+| `rfp start <link>` with no task selected | Starts tracking right away, then asks which task to assign it to - Enter picks the last task worked on, `?` lists tasks (as `rfp task list` does). |
+| `rfp edit --duration 50` / `--duration 1:20` | Fix the last entry's duration - forgot to `rfp stop`? Sets it outright (minutes, or `H:MM`), moving its start time; a still-running entry keeps running. |
+| `rfp edit --duration +15` / `--duration -1:20` | Nudge the last entry's duration up or down by that amount instead of setting it outright. |
+| `rfp status` / `rfp task` / `rfp mou status` | Check where things stand. |
+| `rfp report` | Counts issues once finished regardless of GitHub status, but only counts a PR once it's closed (checked live against GitHub). |
+| `rfp token <token>` (`rfp token` alone for setup steps) | Avoids the unauthenticated GitHub API rate limit, which the report can hit quickly. |
+| `rfp --test <command>` | Try things against a disposable database instead of your real one. |
 
 ## Environment variables
 
