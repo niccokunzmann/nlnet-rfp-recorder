@@ -1300,15 +1300,36 @@ def timesheet_remove(
     typer.echo(f"Removed time entry: {pk}")
 
 
-@timesheet_app.command("edit")
+@timesheet_app.command(
+    "edit",
+    epilog=(
+        "Example:\n\n"
+        "  rfp timesheet edit 42 nlnet-2026 10a 2026-09-04T09:00:00 "
+        "02:00:00 https://github.com/org/repo/issues/1 review"
+    ),
+)
 def timesheet_edit(
-    pk: int,
-    mou: str,
-    task: str,
-    start: str,
-    duration: str,
-    link: str,
-    tags: str = typer.Argument(""),
+    pk: int = typer.Argument(
+        ..., help="The time entry's id, as shown by `rfp timesheet show`."
+    ),
+    mou: str = typer.Argument(
+        ..., autocompletion=_complete_mou_name, help="The MoU this entry belongs to."
+    ),
+    task: str = typer.Argument(
+        ...,
+        autocompletion=_complete_task_name,
+        help="The task this entry belongs to (name or alias).",
+    ),
+    start: str = typer.Argument(
+        ..., help="When it started, ISO format (2026-09-04T09:00:00)."
+    ),
+    duration: str = typer.Argument(..., help="How long it ran, as HH:MM:SS."),
+    link: str = typer.Argument(
+        ..., autocompletion=_complete_link_url, help="The issue/PR/discussion URL."
+    ),
+    tags: str = typer.Argument(
+        "", help="Comma-separated tags to add (implementation, review)."
+    ),
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
@@ -1738,8 +1759,77 @@ def implement(
     _start(link, "implementation", task_name)
 
 
-@app.command()
+def _resolve_edit_record(timesheet_pk: int | None) -> TimeRecord:
+    """Resolve `rfp edit`'s optional TIMESHEET_PK to the entry to edit.
+
+    Not given (None): the most recent entry, same as before this
+    argument existed. A positive number is a literal time entry pk, as
+    shown by `rfp timesheet show`. A negative number instead counts
+    back from the most recent entry, Python-list-style: -1 is the most
+    recent entry (same as not passing anything), -2 is the one before
+    that, and so on.
+    """
+    from nlnet_rfp_recorder.timetracking.models import TimeRecord
+
+    if timesheet_pk is None:
+        record = TimeRecord.get_last()
+        if record is None:
+            _fail("No time entries yet.")
+        return record
+
+    if timesheet_pk == 0:
+        _fail(
+            "Invalid time entry: 0. Use a positive pk (see `rfp timesheet "
+            "show`), or a negative index counting back from the most "
+            "recent entry (-1 = most recent, -2 = the one before that, ...)."
+        )
+
+    if timesheet_pk > 0:
+        try:
+            return TimeRecord.objects.get(pk=timesheet_pk)
+        except TimeRecord.DoesNotExist:
+            _fail(f"No such time entry: {timesheet_pk}.")
+
+    offset = -timesheet_pk - 1
+    record = TimeRecord.objects.order_by("-start_time")[offset : offset + 1].first()
+    if record is None:
+        _fail(f"No time entry {timesheet_pk} entries back from the most recent.")
+    return record
+
+
+@app.command(
+    # Click otherwise routes a leading "-1", "-2", ... to its normal
+    # "-<letter>" short-option matching and rejects it as unknown before
+    # TIMESHEET_PK ever sees it - this makes an unrecognized short
+    # option fall through to the positional argument instead, which is
+    # what actually lets a negative TIMESHEET_PK be typed at all.
+    context_settings={"ignore_unknown_options": True},
+    epilog=(
+        "Examples:\n\n"
+        "  Edit the most recent entry's task:\n\n"
+        "    rfp edit --task 11b\n\n"
+        "  Edit entry with pk 42:\n\n"
+        "    rfp edit 42 --task 11b\n\n"
+        "  Edit the entry before the most recent one:\n\n"
+        "    rfp edit -2 --tags review\n\n"
+        "  Replace the most recent entry's link:\n\n"
+        "    rfp edit --url https://github.com/org/repo/issues/1\n\n"
+        "  Edit several fields of entry 42 at once:\n\n"
+        "    rfp edit 42 --url https://github.com/org/repo/issues/1 "
+        "--task 11b --duration 1:20"
+    ),
+)
 def edit(
+    timesheet_pk: int | None = typer.Argument(
+        None,
+        metavar="[TIMESHEET_PK]",
+        help=(
+            "Which time entry to edit: its pk (see `rfp timesheet show`), "
+            "or a negative index counting back from the most recent entry "
+            "(-1 = most recent, -2 = the one before that, ...). Defaults "
+            "to the most recent entry."
+        ),
+    ),
     link: str | None = typer.Option(
         None,
         "--url",
@@ -1768,13 +1858,15 @@ def edit(
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Edit the most recent time entry's link, tags, task, and/or duration."""
-    _setup(db, test)
-    from nlnet_rfp_recorder.timetracking.models import Link, TimeRecord
+    """Edit a time entry's link, tags, task, and/or duration.
 
-    record = TimeRecord.get_last()
-    if record is None:
-        _fail("No time entries yet.")
+    Defaults to the most recent entry - pass TIMESHEET_PK to edit a
+    different one.
+    """
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Link
+
+    record = _resolve_edit_record(timesheet_pk)
 
     if link is not None:
         if record.link is None or record.link.task is None:

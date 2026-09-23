@@ -1477,6 +1477,122 @@ def test_edit_edits_the_most_recent_entry_even_if_stopped():
     assert record.is_running is False
 
 
+def _start_and_stop_three_entries() -> list[int]:
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    for n in (1, 2, 3):
+        runner.invoke(app, ["start", "10a", f"https://example.com/issues/{n}"])
+        runner.invoke(app, ["stop"])
+    return list(TimeRecord.objects.order_by("pk").values_list("pk", flat=True))
+
+
+def test_edit_by_positive_pk_edits_that_entry():
+    pks = _start_and_stop_three_entries()
+
+    result = runner.invoke(app, ["edit", str(pks[0]), "--tags", "review"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get(pk=pks[0])
+    assert "review" in {tag.name for tag in record.link.tags.all()}
+    other = TimeRecord.objects.get(pk=pks[2])
+    assert "review" not in {tag.name for tag in other.link.tags.all()}
+
+
+def test_edit_by_negative_one_edits_the_most_recent_entry():
+    pks = _start_and_stop_three_entries()
+
+    result = runner.invoke(app, ["edit", "-1", "--tags", "review"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get(pk=pks[2])
+    assert "review" in {tag.name for tag in record.link.tags.all()}
+
+
+def test_edit_by_negative_index_counts_back_from_the_most_recent_entry():
+    pks = _start_and_stop_three_entries()
+
+    result = runner.invoke(app, ["edit", "-3", "--tags", "review"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get(pk=pks[0])
+    assert "review" in {tag.name for tag in record.link.tags.all()}
+
+
+def test_edit_negative_pk_works_before_or_after_options():
+    pks = _start_and_stop_three_entries()
+
+    result = runner.invoke(app, ["edit", "--tags", "review", "-1"])
+
+    assert result.exit_code == 0, result.output
+    record = TimeRecord.objects.get(pk=pks[2])
+    assert "review" in {tag.name for tag in record.link.tags.all()}
+
+
+def test_edit_rejects_pk_zero():
+    _start_and_stop_three_entries()
+
+    result = runner.invoke(app, ["edit", "0", "--tags", "review"])
+
+    assert result.exit_code != 0
+    assert "Invalid time entry: 0" in result.output
+
+
+def test_edit_fails_for_an_unknown_positive_pk():
+    _start_and_stop_three_entries()
+
+    result = runner.invoke(app, ["edit", "999", "--tags", "review"])
+
+    assert result.exit_code != 0
+    assert "No such time entry: 999" in result.output
+
+
+def test_edit_fails_for_a_negative_index_out_of_range():
+    _start_and_stop_three_entries()
+
+    result = runner.invoke(app, ["edit", "-99", "--tags", "review"])
+
+    assert result.exit_code != 0
+    assert "No time entry -99 entries back from the most recent" in result.output
+
+
+def test_edit_rejects_a_single_dash_typo_for_an_option():
+    # ignore_unknown_options (needed so a bare "-1" isn't rejected as an
+    # unrecognized option before it ever reaches TIMESHEET_PK) must not
+    # let a misspelled option quietly do nothing or get misread as
+    # something else - it still fails, just via TIMESHEET_PK's own int
+    # conversion rejecting the leftover token.
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    result = runner.invoke(app, ["edit", "-url", "https://example.com/issues/2"])
+
+    assert result.exit_code != 0
+    assert "not a valid int" in result.output
+    record = TimeRecord.objects.get()
+    assert record.link.url == "https://example.com/issues/1"
+
+
+def test_edit_rejects_a_misspelled_long_option():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    result = runner.invoke(app, ["edit", "--durtaion", "50"])
+
+    assert result.exit_code != 0
+    assert "not a valid int" in result.output
+
+
+def test_edit_rejects_two_positional_pks():
+    pks = _start_and_stop_three_entries()
+
+    result = runner.invoke(app, ["edit", "-1", str(pks[0])])
+
+    assert result.exit_code != 0
+    assert "unexpected extra argument" in result.output.lower()
+
+
 def test_edit_reassigns_the_last_entrys_task():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
