@@ -1468,8 +1468,31 @@ def _echo_stats(stats: Statistics) -> None:
         typer.echo("  ".join(cells).rstrip())
 
 
+STATS_COLUMNS_HELP = (
+    "Columns:\n\n"
+    "  ID     the task's name, or '?' for time tracked with no task\n\n"
+    "  alias  the task's alias, if it has one (omitted if no task in "
+    "the result has one)\n\n"
+    "  time   total time tracked for that task in this period\n\n"
+    "  Euro   that time's value at RFP_EUROS_PER_HOUR (the Euro/new/<N>+ "
+    "columns are all omitted if that's unset)\n\n"
+    "  new    the portion of Euro not yet claimed by any report - still "
+    "reportable\n\n"
+    "  <N>+   the same as new, but blank unless it's at least "
+    "REVIEW_DEFAULT_EXCLUDE_BELOW - the same threshold `rfp report "
+    "review` defaults to including\n\n"
+    "A final 'Total' row sums the columns above it (skipped when "
+    "there's only one task, since that row already is the total)."
+)
+
 stats_app = typer.Typer(
-    help="Show time/budget statistics.", no_args_is_help=True, cls=AlphabeticalGroup
+    help=(
+        "Show time/budget statistics.\n\n"
+        "Covers every task across every MoU, not just the selected one - "
+        "a personal 'how much did I work' view, not a report. " + STATS_COLUMNS_HELP
+    ),
+    no_args_is_help=True,
+    cls=AlphabeticalGroup,
 )
 app.add_typer(stats_app, name="stats")
 
@@ -1483,7 +1506,7 @@ def stats_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
         os.environ["RFP_DB"] = str(db)
 
 
-@stats_app.command("today")
+@stats_app.command("today", epilog=STATS_COLUMNS_HELP)
 def stats_today(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Show time and budget worked today, per task and in total."""
     _setup(db, test)
@@ -1492,7 +1515,7 @@ def stats_today(db: Path | None = DbOption, test: bool = TestOption) -> None:
     _echo_stats(Statistics.today())
 
 
-@stats_app.command("days")
+@stats_app.command("days", epilog=STATS_COLUMNS_HELP)
 def stats_days(
     n: int = typer.Argument(..., help="How many days back to look, including today."),
     db: Path | None = DbOption,
@@ -1509,7 +1532,7 @@ def stats_days(
     _echo_stats(stats)
 
 
-@stats_app.command("total")
+@stats_app.command("total", epilog=STATS_COLUMNS_HELP)
 def stats_total(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Show time and budget worked across all recorded time, per task and in total."""
     _setup(db, test)

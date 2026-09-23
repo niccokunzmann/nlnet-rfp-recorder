@@ -4236,6 +4236,17 @@ def test_stats_threshold_column_totals_only_qualifying_tasks(settings):
     assert lines[3].split() == ["Total", "4:00", "80€", "80€", "60€"]
 
 
+@pytest.mark.parametrize("args", [["stats", "--help"], ["stats", "today", "--help"]])
+def test_stats_help_explains_the_columns(args):
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    for column in ("ID", "alias", "time", "Euro", "new"):
+        assert column in result.output
+    assert "REVIEW_DEFAULT_EXCLUDE_BELOW" in result.output
+    assert "Total" in result.output
+
+
 def test_complete_link_url_matches_by_prefix():
     from nlnet_rfp_recorder.cli import _complete_link_url
 
