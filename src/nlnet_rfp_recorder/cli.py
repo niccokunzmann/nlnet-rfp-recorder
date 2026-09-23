@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from nlnet_rfp_recorder.timetracking.models import (
         Link,
         MoU,
+        Report,
         ReportLine,
         Task,
         TimeRecord,
@@ -466,6 +467,34 @@ def _complete_backup_name(incomplete: str) -> list[str]:
         return []
 
 
+def _complete_csv_path(incomplete: str) -> list[str]:
+    """Filesystem completion for `report export`/`import`'s CSV path.
+
+    typer's own Path type provides none of its own - TyperPath.
+    shell_complete (see typer/models.py) always returns an empty list,
+    a known, documented typer limitation, not something specific to
+    this argument. Suggests directories (with a trailing "/", to keep
+    tabbing into them) and .csv files under them.
+    """
+    try:
+        directory, _, prefix = incomplete.rpartition("/")
+        search_dir = Path(directory) if directory else Path.cwd()
+        if not search_dir.is_dir():
+            return []
+        lead = f"{directory}/" if directory else ""
+        matches = []
+        for entry in sorted(search_dir.iterdir()):
+            if not entry.name.startswith(prefix):
+                continue
+            if entry.is_dir():
+                matches.append(f"{lead}{entry.name}/")
+            elif entry.suffix == ".csv":
+                matches.append(f"{lead}{entry.name}")
+        return matches
+    except Exception:
+        return []
+
+
 def _complete_report_id(incomplete: str) -> list[str]:
     try:
         django.setup()
@@ -476,6 +505,38 @@ def _complete_report_id(incomplete: str) -> list[str]:
                 "pk", flat=True
             )
         )
+    except Exception:
+        return []
+
+
+def _complete_report_edit_tasks(ctx: typer.Context, incomplete: str) -> list[str]:
+    """Complete `report edit`'s TASKS argument - scoped to the tasks
+    actually in the already-typed report_id, not every task in the
+    database, since a report can belong to a MoU that isn't even the
+    currently selected one (see _complete_alias_id for the same
+    depends-on-an-earlier-argument pattern).
+    """
+    try:
+        django.setup()
+        from nlnet_rfp_recorder.timetracking.models import Alias, Report
+
+        try:
+            report = Report.objects.get(pk=ctx.params.get("report_id"))
+        except Report.DoesNotExist:
+            return []
+        names = sorted(
+            {task.name for task, _lines in report.lines_by_task() if task is not None}
+        )
+        matching_names = [name for name in names if name.startswith(incomplete)]
+        aliases = list(
+            Alias.objects.filter(
+                item_type="task",
+                mou=report.mou,
+                target__in=names,
+                alias__startswith=incomplete,
+            ).values_list("alias", flat=True)
+        )
+        return matching_names + aliases
     except Exception:
         return []
 
@@ -2003,8 +2064,9 @@ report_app = typer.Typer(
         "Typical workflow: \n1) create - generate a report from unreported "
         "time. \n2) export - to a CSV file; review/edit links there if "
         "needed. \n3) import - load the edited CSV back into the report. "
-        "\n4) review - go task by task, drop what isn't worth reporting "
-        "yet. \n5) print - print the final report and hand it in."
+        "\n4) review (task by task) or edit (link by link) - drop what "
+        "isn't worth reporting yet. \n5) print - print the final report "
+        "and hand it in."
     ),
     no_args_is_help=True,
     cls=AlphabeticalGroup,
@@ -2140,6 +2202,7 @@ def report_export(
     report_id: str = typer.Argument(..., autocompletion=_complete_report_id),
     path: Path | None = typer.Argument(
         None,
+        autocompletion=_complete_csv_path,
         help=(
             "Output CSV file (task, link, title, budget, tags, records), "
             "one row per report line, sorted by task then link. Omit for "
@@ -2177,7 +2240,9 @@ def report_export(
 @report_app.command("import")
 def report_import(
     report_id: str = typer.Argument(..., autocompletion=_complete_report_id),
-    path: Path = typer.Argument(..., exists=True, dir_okay=False),
+    path: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, autocompletion=_complete_csv_path
+    ),
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
@@ -2207,6 +2272,55 @@ def report_import(
     typer.echo(f"Report {report_id} now has {report.lines.count()} report lines.")
 
 
+def _ask_include_exclude_or_replace(
+    prompt: str = "Include it as is?",
+) -> tuple[str, str | None]:
+    """Ask include (default) / exclude / replace-with-a-URL about one
+    report line - the shared question behind both `report review`'s
+    open-issue check and `report edit`'s link-by-link walk.
+
+    Returns ("keep", None) to leave the line as is (plain Enter, or
+    'y'), ("exclude", None) to drop it ('n'), or ("replace", new_url)
+    when anything else was typed - treated as a replacement URL (e.g.
+    the work moved to a follow-up issue/PR), which keeps the line, just
+    under that link instead.
+    """
+    answer = typer.prompt(
+        f"{prompt} [Y/n], or paste a replacement URL", default="y"
+    ).strip()
+    lowered = answer.lower()
+    if lowered in ("", "y", "yes"):
+        return "keep", None
+    if lowered in ("n", "no"):
+        return "exclude", None
+    return "replace", _resolve_link_or_fail(answer)
+
+
+def _ask_about_open_issue(line: ReportLine) -> tuple[str, str | None]:
+    """Ask what to do with one still-open, implementation-tagged issue -
+    see _ask_include_exclude_or_replace for the return value.
+    """
+    typer.echo(f"\n{line.link.url} is open and tagged implementation.")
+    return _ask_include_exclude_or_replace()
+
+
+def _apply_link_decision(
+    report: Report, line: ReportLine, action: str, new_url: str | None
+) -> None:
+    """Apply one _ask_include_exclude_or_replace() decision to `line`,
+    once the user has confirmed writing changes - shared by `report
+    review`'s open-issue check and `report edit`.
+    """
+    from nlnet_rfp_recorder.timetracking.models import Link
+
+    if action == "exclude":
+        report.remove_link(line.link)
+    else:
+        assert new_url is not None
+        line.link = Link.get_or_create_for_task(new_url, line.link.task)
+        line.save(update_fields=["link"])
+
+
 @report_app.command("review")
 def report_review(
     report_id: str = typer.Argument(..., autocompletion=_complete_report_id),
@@ -2215,12 +2329,19 @@ def report_review(
 ) -> None:
     """Walk through a report task by task, deciding what actually gets reported.
 
-    Each task is printed exactly as it would appear in the report, then
-    you're asked whether to use it as is (default) or exclude it for now
-    - tasks under REVIEW_DEFAULT_EXCLUDE_BELOW default to excluded.
-    Excluding a task only detaches its time records from this report;
-    they stay reportable later. Nothing changes until you confirm the
-    summary at the end.
+    First, every still-open issue (not PR) tagged implementation is
+    asked about individually - open usually means the underlying work
+    isn't actually finished yet, unlike a 'review' issue, where the
+    work being billed (the review itself) is done regardless of the
+    issue's own status. Include it as is (default), exclude it, or
+    paste a replacement URL to report it under instead.
+
+    Then each task is printed exactly as it would appear in the report,
+    then you're asked whether to use it as is (default) or exclude it
+    for now - tasks under REVIEW_DEFAULT_EXCLUDE_BELOW default to
+    excluded. Excluding a task only detaches its time records from this
+    report; they stay reportable later. Nothing changes until you
+    confirm the summary at the end.
     """
     _setup(db, test)
     from django.conf import settings
@@ -2232,8 +2353,13 @@ def report_review(
     except Report.DoesNotExist:
         _fail(f"No such report: {report_id}")
 
+    open_issue_lines = report.open_implementation_issue_lines()
+    open_issue_decisions = [
+        (line, *_ask_about_open_issue(line)) for line in open_issue_lines
+    ]
+
     task_reviews = report.review_tasks()
-    if not task_reviews:
+    if not task_reviews and not open_issue_decisions:
         typer.echo(f"Report {report_id} has no lines to review.")
         return
 
@@ -2250,11 +2376,21 @@ def report_review(
         names = [task.display_name if task is not None else "?" for task in tasks]
         return ", ".join(names) if names else "none"
 
+    changed_open_issues = [d for d in open_issue_decisions if d[1] != "keep"]
+    if open_issue_decisions:
+        kept = len(open_issue_decisions) - len(changed_open_issues)
+        excluded_count = sum(1 for _, a, _ in open_issue_decisions if a == "exclude")
+        replaced_count = sum(1 for _, a, _ in open_issue_decisions if a == "replace")
+        typer.echo("\nOpen issues:")
+        typer.echo(f"  Kept as is: {kept}")
+        typer.echo(f"  Excluded: {excluded_count}")
+        typer.echo(f"  Replaced: {replaced_count}")
+
     typer.echo("\nSummary:")
     typer.echo(f"  Included: {_names(included)}")
     typer.echo(f"  Excluded: {_names(excluded)}")
 
-    if not excluded:
+    if not excluded and not changed_open_issues:
         typer.echo("Nothing to change.")
         return
 
@@ -2262,9 +2398,93 @@ def report_review(
         typer.echo("Cancelled - report left unchanged.")
         return
 
+    for line, action, new_url in changed_open_issues:
+        _apply_link_decision(report, line, action, new_url)
     for task in excluded:
         report.remove_task_lines(task)
-    typer.echo(f"Report {report_id} updated: {len(excluded)} task(s) removed.")
+
+    typer.echo(
+        f"Report {report_id} updated: {len(excluded)} task(s), "
+        f"{len(changed_open_issues)} open issue(s) changed."
+    )
+
+
+@report_app.command("edit")
+def report_edit(
+    report_id: str = typer.Argument(..., autocompletion=_complete_report_id),
+    tasks: str | None = typer.Argument(
+        None,
+        metavar="[TASKS]",
+        autocompletion=_complete_report_edit_tasks,
+        help=(
+            "Which task(s) to walk through - same syntax as `rfp task "
+            "set` ('10a', '1a-1c', '4', '10-14', '1a-1c,2f,2h', ...). "
+            "Defaults to every task currently in the report."
+        ),
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Walk through a report link by link, deciding what actually gets reported.
+
+    Unlike `report review` (which decides per task), this prints each
+    task's description, then asks about every one of its links
+    individually: include it as is (default), exclude it, or paste a
+    replacement URL to report it under instead. Nothing changes until
+    you confirm the summary at the end.
+    """
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import Report, Task, format_report_link
+
+    try:
+        report = Report.objects.get(pk=report_id)
+    except Report.DoesNotExist:
+        _fail(f"No such report: {report_id}")
+
+    grouped = report.lines_by_task()
+    if tasks is not None:
+        try:
+            wanted_tasks = set(Task.resolve_query(tasks, report.mou))
+        except ValueError as error:
+            _fail(str(error))
+        grouped = [(task, lines) for task, lines in grouped if task in wanted_tasks]
+
+    if not grouped:
+        typer.echo(f"Report {report_id} has no matching lines to edit.")
+        return
+
+    decisions: list[tuple[ReportLine, str, str | None]] = []
+    for task, lines in grouped:
+        task_display = task.display_name if task is not None else "?"
+        typer.echo(f"\n{task_display}:")
+        if task is not None and task.description:
+            typer.echo(f"  {task.description}")
+        for line in lines:
+            budget = round(line.budget) if line.budget else None
+            typer.echo(f"  {format_report_link(line.link, line.tag_list, budget)}")
+            decisions.append((line, *_ask_include_exclude_or_replace()))
+
+    changed = [d for d in decisions if d[1] != "keep"]
+    kept = len(decisions) - len(changed)
+    excluded_count = sum(1 for _, action, _ in decisions if action == "exclude")
+    replaced_count = sum(1 for _, action, _ in decisions if action == "replace")
+    typer.echo("\nSummary:")
+    typer.echo(f"  Kept as is: {kept}")
+    typer.echo(f"  Excluded: {excluded_count}")
+    typer.echo(f"  Replaced: {replaced_count}")
+
+    if not changed:
+        typer.echo("Nothing to change.")
+        return
+
+    if not typer.confirm("Write these changes?"):
+        typer.echo("Cancelled - report left unchanged.")
+        return
+
+    for line, action, new_url in changed:
+        _apply_link_decision(report, line, action, new_url)
+
+    typer.echo(f"Report {report_id} updated: {len(changed)} link(s) changed.")
 
 
 alias_app = typer.Typer(
@@ -2473,5 +2693,54 @@ def restore(
     typer.echo(f"Restored {database_file} from {backup_file}")
 
 
+def _report_database_locked(error: Exception) -> None:
+    """Print every process holding the database file open, on Linux -
+    sqlite3's own "database is locked" error (what `error` wraps) names
+    no culprit at all, which is the whole reason to go looking.
+    """
+    import platform
+
+    from django.conf import settings
+
+    database_file = Path(settings.DATABASES["default"]["NAME"])
+    typer.echo(f"Database is locked: {database_file}", err=True)
+    typer.echo(str(error), err=True)
+
+    if platform.system() != "Linux":
+        typer.echo(
+            "\n(Listing the processes holding it open is only supported on Linux.)",
+            err=True,
+        )
+        return
+
+    from nlnet_rfp_recorder.lock_diagnostics import find_processes_with_file_open
+
+    holders = find_processes_with_file_open(database_file)
+    if not holders:
+        typer.echo(
+            "\nNo process currently has it open that this user can see - "
+            "it may be held by another user, or the lock may already "
+            "have cleared. Try again.",
+            err=True,
+        )
+        return
+
+    typer.echo("\nProcesses with it open:", err=True)
+    for holder in holders:
+        user = holder.user or "?"
+        typer.echo(
+            f"  PID {holder.pid} ({holder.mode}, user {user}): {holder.cmdline}",
+            err=True,
+        )
+
+
 def main() -> None:
-    app()
+    from django.db.utils import OperationalError
+
+    try:
+        app()
+    except OperationalError as error:
+        if "database is locked" not in str(error):
+            raise
+        _report_database_locked(error)
+        sys.exit(1)

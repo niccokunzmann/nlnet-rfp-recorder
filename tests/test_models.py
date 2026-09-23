@@ -2259,6 +2259,133 @@ def test_report_review_tasks_empty_for_a_report_with_no_lines(settings):
     assert report.review_tasks() == []
 
 
+def test_open_implementation_issue_lines_returns_an_open_implementation_issue(
+    settings,
+):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    link.add_tag("implementation")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    report = Report.create(mou)
+    report.add_time_record(record)
+
+    with _mock_github_session("open"):
+        open_lines = report.open_implementation_issue_lines()
+
+    assert [line.link for line in open_lines] == [link]
+
+
+def test_open_implementation_issue_lines_skips_closed_issues(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    link.add_tag("implementation")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    report = Report.create(mou)
+    report.add_time_record(record)
+
+    with _mock_github_session("closed"):
+        open_lines = report.open_implementation_issue_lines()
+
+    assert open_lines == []
+
+
+def test_open_implementation_issue_lines_skips_review_tagged_issues(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    link.add_tag("review")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    report = Report.create(mou)
+    report.add_time_record(record)
+
+    with _mock_github_session("open"):
+        open_lines = report.open_implementation_issue_lines()
+
+    assert open_lines == []
+
+
+def test_open_implementation_issue_lines_skips_pull_requests(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/pull/1"
+    )
+    link.add_tag("implementation")
+    record = TimeRecord.objects.create(
+        link=link,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    report = Report.create(mou)
+    report.add_time_record(record)
+
+    open_lines = report.open_implementation_issue_lines()
+
+    assert open_lines == []
+
+
+def test_remove_link_detaches_only_that_links_records(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link_a = Link.objects.create(task=task, url="https://example.com/issues/1")
+    link_b = Link.objects.create(task=task, url="https://example.com/issues/2")
+    record_a = TimeRecord.objects.create(
+        link=link_a,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    record_b = TimeRecord.objects.create(
+        link=link_b,
+        start_time=datetime(2026, 9, 4, 9, 0),
+        end_time=datetime(2026, 9, 4, 10, 0),
+    )
+    report = Report.create(mou)
+    report.add_time_record(record_a)
+    report.add_time_record(record_b)
+
+    report.remove_link(link_a)
+
+    assert ReportLine.objects.filter(report=report, link=link_a).exists() is False
+    assert ReportLine.objects.filter(report=report, link=link_b).exists()
+    record_a.refresh_from_db()
+    record_b.refresh_from_db()
+    assert record_a.report_line is None
+    assert record_b.report_line is not None
+
+
+def test_remove_link_is_a_no_op_for_a_link_not_in_the_report(settings):
+    mou = MoU.objects.create(name="nlnet-2026")
+    link = Link.objects.create(url="https://example.com/issues/1")
+    report = Report.create(mou)
+
+    report.remove_link(link)  # must not raise
+
+
 def test_report_remove_task_lines_detaches_records_but_keeps_them(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
@@ -3281,7 +3408,12 @@ def test_report_preview_does_not_show_any_alias(settings):
     assert "lib" not in text
 
 
-def test_format_excluded_links_does_not_show_the_task_alias():
+def test_format_excluded_links_shows_the_task_alias():
+    # Unlike the report body itself (test_report_print_preview_shows_no_
+    # aliases), this section is never part of a persisted report - only
+    # ever shown to the person running `report create`/`preview` - so
+    # showing their own alias here is a convenience, not a leak into
+    # the official report text.
     mou = MoU.objects.create(name="nlnet-2026")
     task = Task.objects.create(mou=mou, name="10a")
     Alias.create("task", "10a", "lib", mou=mou)
@@ -3291,8 +3423,7 @@ def test_format_excluded_links_does_not_show_the_task_alias():
 
     text = Report.format_excluded_links([link])
 
-    assert "10a:" in text
-    assert "lib" not in text
+    assert "10a (lib):" in text
 
 
 def test_format_excluded_links_groups_by_task():

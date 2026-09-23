@@ -2285,6 +2285,31 @@ def test_report_includes_open_issues_but_excludes_open_prs(settings):
     assert "- https://github.com/nlnet/rfp-recorder/pull/2" in create_result.output
 
 
+def test_report_create_shows_the_task_alias_for_excluded_prs(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    now = timezone.now()
+    issue_link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    pr_link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/pull/2"
+    )
+    for link in (issue_link, pr_link):
+        TimeRecord.objects.create(
+            link=link, start_time=now - timedelta(minutes=20), end_time=now
+        )
+    runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
+
+    with _mock_github_session("open"):
+        result = runner.invoke(app, ["report", "create"])
+
+    assert result.exit_code == 0, result.output
+    assert "Excluded Pull Requests (not merged):" in result.output
+    assert "10a (lib):" in result.output
+
+
 def test_report_create_fails_cleanly_when_github_rejects_a_status_check(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
@@ -2985,6 +3010,160 @@ def test_report_review_prints_each_task_and_defaults_small_tasks_to_excluded(
     assert small_record.report_line is None
 
 
+def test_report_review_shows_the_task_alias_and_description(settings):
+    # Unlike the report text itself (test_report_print_preview_shows_no_
+    # aliases), review is operator-only feedback - showing the alias and
+    # description here helps decide what to keep, same reasoning as
+    # format_excluded_links showing the alias for excluded PRs.
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(
+        mou=mou, name="10a", description="Improve calendar parsing"
+    )
+    Alias.create("task", "10a", "lib", mou=mou)
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=3), end_time=now
+    )
+    runner.invoke(app, ["report", "create"])
+
+    result = runner.invoke(app, ["report", "review", "nlnet-2026-1"], input="\n")
+
+    assert result.exit_code == 0, result.output
+    assert "10a (lib): 60€" in result.output
+    assert "Improve calendar parsing" in result.output
+
+
+def test_report_review_asks_about_an_open_implementation_issue_and_keeps_it(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    link.add_tag("implementation")
+    now = timezone.now()
+    # 3 hours @ 20€/h = 60€ - at/above 50, task question defaults to included.
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=3), end_time=now
+    )
+    runner.invoke(app, ["report", "create"])
+
+    with _mock_github_session("open"):
+        # Blank "keep it as is" for the open issue, blank "use as is" for
+        # the task - nothing ends up changed, so no final write prompt.
+        result = runner.invoke(app, ["report", "review", "nlnet-2026-1"], input="\n\n")
+
+    assert result.exit_code == 0, result.output
+    assert "https://github.com/nlnet/rfp-recorder/issues/1 is open and tagged" in (
+        result.output
+    )
+    assert "Kept as is: 1" in result.output
+    assert "Nothing to change." in result.output
+    assert ReportLine.objects.filter(report__id="nlnet-2026-1", link=link).exists()
+
+
+def test_report_review_excludes_an_open_implementation_issue_when_declined(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    link.add_tag("implementation")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=3), end_time=now
+    )
+    runner.invoke(app, ["report", "create"])
+    record = TimeRecord.objects.get()
+
+    with _mock_github_session("open"):
+        result = runner.invoke(
+            app, ["report", "review", "nlnet-2026-1"], input="n\n\ny\n"
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Excluded: 1" in result.output
+    assert not ReportLine.objects.filter(report__id="nlnet-2026-1", link=link).exists()
+    record.refresh_from_db()
+    assert record.report_line is None
+
+
+def test_report_review_replaces_the_link_for_an_open_implementation_issue(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    old_link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    old_link.add_tag("implementation")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=old_link, start_time=now - timedelta(hours=3), end_time=now
+    )
+    runner.invoke(app, ["report", "create"])
+    new_url = "https://github.com/nlnet/rfp-recorder/issues/2"
+
+    with _mock_github_session("open"):
+        result = runner.invoke(
+            app, ["report", "review", "nlnet-2026-1"], input=f"{new_url}\n\ny\n"
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Replaced: 1" in result.output
+    assert not ReportLine.objects.filter(
+        report__id="nlnet-2026-1", link=old_link
+    ).exists()
+    new_line = ReportLine.objects.get(report__id="nlnet-2026-1", link__url=new_url)
+    assert new_line.link.task == task
+
+
+def test_report_review_does_not_ask_about_a_closed_implementation_issue(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    link.add_tag("implementation")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=3), end_time=now
+    )
+    runner.invoke(app, ["report", "create"])
+
+    with _mock_github_session("closed"):
+        result = runner.invoke(app, ["report", "review", "nlnet-2026-1"], input="\n")
+
+    assert result.exit_code == 0, result.output
+    assert "is open and tagged" not in result.output
+    assert "Open issues:" not in result.output
+
+
+def test_report_review_does_not_ask_about_a_review_tagged_issue(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(
+        task=task, url="https://github.com/nlnet/rfp-recorder/issues/1"
+    )
+    link.add_tag("review")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=3), end_time=now
+    )
+    runner.invoke(app, ["report", "create"])
+
+    with _mock_github_session("open"):
+        result = runner.invoke(app, ["report", "review", "nlnet-2026-1"], input="\n")
+
+    assert result.exit_code == 0, result.output
+    assert "is open and tagged" not in result.output
+    assert "Open issues:" not in result.output
+
+
 def test_report_review_leaves_the_report_unchanged_when_cancelled(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
@@ -3040,6 +3219,117 @@ def test_report_review_reports_nothing_to_review_for_an_empty_report(settings):
 
     assert result.exit_code == 0, result.output
     assert "no lines to review" in result.output
+
+
+def _create_two_link_report(settings) -> tuple[Task, Link, Link]:
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a", description="Improve parsing")
+    link_a = Link.objects.create(task=task, url="https://example.com/issues/1")
+    link_b = Link.objects.create(task=task, url="https://example.com/issues/2")
+    now = timezone.now()
+    for link in (link_a, link_b):
+        TimeRecord.objects.create(
+            link=link, start_time=now - timedelta(hours=1), end_time=now
+        )
+    runner.invoke(app, ["report", "create"])
+    return task, link_a, link_b
+
+
+def test_report_edit_prints_the_task_description_and_each_link(settings):
+    task, link_a, link_b = _create_two_link_report(settings)
+
+    result = runner.invoke(app, ["report", "edit", "nlnet-2026-1"], input="\n\n")
+
+    assert result.exit_code == 0, result.output
+    assert "10a:" in result.output
+    assert "Improve parsing" in result.output
+    assert link_a.url in result.output
+    assert link_b.url in result.output
+    assert "Nothing to change." in result.output
+    assert ReportLine.objects.filter(report__id="nlnet-2026-1", link=link_a).exists()
+    assert ReportLine.objects.filter(report__id="nlnet-2026-1", link=link_b).exists()
+
+
+def test_report_edit_excludes_a_link_when_declined(settings):
+    task, link_a, link_b = _create_two_link_report(settings)
+    record_a = TimeRecord.objects.get(link=link_a)
+
+    result = runner.invoke(app, ["report", "edit", "nlnet-2026-1"], input="n\n\ny\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Excluded: 1" in result.output
+    assert not ReportLine.objects.filter(
+        report__id="nlnet-2026-1", link=link_a
+    ).exists()
+    assert ReportLine.objects.filter(report__id="nlnet-2026-1", link=link_b).exists()
+    record_a.refresh_from_db()
+    assert record_a.report_line is None
+
+
+def test_report_edit_replaces_a_links_url(settings):
+    task, link_a, link_b = _create_two_link_report(settings)
+    new_url = "https://example.com/issues/99"
+
+    result = runner.invoke(
+        app, ["report", "edit", "nlnet-2026-1"], input=f"{new_url}\n\ny\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Replaced: 1" in result.output
+    assert not ReportLine.objects.filter(
+        report__id="nlnet-2026-1", link=link_a
+    ).exists()
+    new_line = ReportLine.objects.get(report__id="nlnet-2026-1", link__url=new_url)
+    assert new_line.link.task == task
+
+
+def test_report_edit_restricts_to_the_given_task_range(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task_a = Task.objects.create(mou=mou, name="10a")
+    task_b = Task.objects.create(mou=mou, name="11b")
+    link_a = Link.objects.create(task=task_a, url="https://example.com/issues/1")
+    link_b = Link.objects.create(task=task_b, url="https://example.com/issues/2")
+    now = timezone.now()
+    for link in (link_a, link_b):
+        TimeRecord.objects.create(
+            link=link, start_time=now - timedelta(hours=1), end_time=now
+        )
+    runner.invoke(app, ["report", "create"])
+
+    result = runner.invoke(app, ["report", "edit", "nlnet-2026-1", "10a"], input="\n")
+
+    assert result.exit_code == 0, result.output
+    assert "10a:" in result.output
+    assert "11b:" not in result.output
+    assert link_b.url not in result.output
+
+
+def test_report_edit_fails_for_an_unknown_report():
+    result = runner.invoke(app, ["report", "edit", "does-not-exist"])
+
+    assert result.exit_code != 0
+
+
+def test_report_edit_reports_nothing_to_edit_for_an_empty_report(settings):
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    report = Report.create(mou)
+
+    result = runner.invoke(app, ["report", "edit", report.id])
+
+    assert result.exit_code == 0, result.output
+    assert "no matching lines to edit" in result.output
+
+
+def test_report_edit_leaves_the_report_unchanged_when_cancelled(settings):
+    task, link_a, link_b = _create_two_link_report(settings)
+
+    result = runner.invoke(app, ["report", "edit", "nlnet-2026-1"], input="n\n\nn\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Cancelled" in result.output
+    assert ReportLine.objects.filter(report__id="nlnet-2026-1", link=link_a).exists()
 
 
 def test_mou_add_selects_a_mou():
@@ -3804,6 +4094,32 @@ def test_complete_alias_id_delegates_by_item_type():
     assert _complete_alias_id(SimpleNamespace(params={}), "any") == []
 
 
+def test_complete_report_edit_tasks_scopes_to_the_reports_own_tasks(settings):
+    from types import SimpleNamespace
+
+    from nlnet_rfp_recorder.cli import _complete_report_edit_tasks
+
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task_in_report = Task.objects.create(mou=mou, name="10a")
+    Alias.create("task", "10a", "lib", mou=mou)
+    # Exists in the MoU, but never tracked/reported - must not be suggested.
+    Task.objects.create(mou=mou, name="10b")
+    link = Link.objects.create(task=task_in_report, url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link,
+        start_time=timezone.now() - timedelta(hours=1),
+        end_time=timezone.now(),
+    )
+    runner.invoke(app, ["report", "create"])
+
+    ctx = SimpleNamespace(params={"report_id": "nlnet-2026-1"})
+    assert _complete_report_edit_tasks(ctx, "1") == ["10a"]
+    assert _complete_report_edit_tasks(ctx, "l") == ["lib"]
+    assert _complete_report_edit_tasks(ctx, "10b") == []
+    assert _complete_report_edit_tasks(SimpleNamespace(params={}), "1") == []
+
+
 def test_status_with_nothing_selected():
     result = runner.invoke(app, ["status"])
 
@@ -4279,6 +4595,38 @@ def test_complete_backup_name_matches_by_prefix(tmp_path, settings):
     assert _complete_backup_name("nope") == []
 
 
+def test_complete_csv_path_lists_csv_files_and_directories(tmp_path):
+    from nlnet_rfp_recorder.cli import _complete_csv_path
+
+    (tmp_path / "report.csv").write_text("")
+    (tmp_path / "notes.txt").write_text("")
+    (tmp_path / "reports").mkdir()
+
+    matches = _complete_csv_path(f"{tmp_path}/")
+
+    assert f"{tmp_path}/report.csv" in matches
+    assert f"{tmp_path}/reports/" in matches
+    assert not any(match.endswith("notes.txt") for match in matches)
+
+
+def test_complete_csv_path_filters_by_prefix(tmp_path):
+    from nlnet_rfp_recorder.cli import _complete_csv_path
+
+    (tmp_path / "report-a.csv").write_text("")
+    (tmp_path / "report-b.csv").write_text("")
+    (tmp_path / "other.csv").write_text("")
+
+    matches = _complete_csv_path(f"{tmp_path}/report")
+
+    assert set(matches) == {f"{tmp_path}/report-a.csv", f"{tmp_path}/report-b.csv"}
+
+
+def test_complete_csv_path_returns_nothing_for_a_missing_directory(tmp_path):
+    from nlnet_rfp_recorder.cli import _complete_csv_path
+
+    assert _complete_csv_path(f"{tmp_path}/does-not-exist/x") == []
+
+
 def test_restore_fails_for_an_unknown_backup_name():
     result = runner.invoke(app, ["restore", "does-not-exist"])
 
@@ -4430,6 +4778,7 @@ def test_report_help_lists_subcommands_alphabetically():
     assert result.exit_code == 0, result.output
     assert _subcommand_names("report") == [
         "create",
+        "edit",
         "export",
         "import",
         "list",
@@ -4832,3 +5181,92 @@ def test_report_print_preview_shows_no_aliases(settings):
     assert "10a: 10€" in result.output
     assert "og" not in result.output
     assert "lib" not in result.output
+
+
+def test_main_reports_database_locked_diagnostics(capsys):
+    from django.db.utils import OperationalError
+
+    from nlnet_rfp_recorder.cli import main
+    from nlnet_rfp_recorder.lock_diagnostics import FileHolder
+
+    holder = FileHolder(
+        pid=1234,
+        comm="sqlitebro",
+        cmdline="/usr/bin/sqlitebro rfp.db",
+        user="alice",
+        mode="read/write",
+    )
+    with (
+        patch(
+            "nlnet_rfp_recorder.cli.app",
+            side_effect=OperationalError("database is locked"),
+        ),
+        patch(
+            "nlnet_rfp_recorder.lock_diagnostics.find_processes_with_file_open",
+            return_value=[holder],
+        ),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "Database is locked" in captured.err
+    assert "PID 1234" in captured.err
+    assert "sqlitebro" in captured.err
+    assert "alice" in captured.err
+
+
+def test_main_reports_no_holder_found_gracefully(capsys):
+    from django.db.utils import OperationalError
+
+    from nlnet_rfp_recorder.cli import main
+
+    with (
+        patch(
+            "nlnet_rfp_recorder.cli.app",
+            side_effect=OperationalError("database is locked"),
+        ),
+        patch(
+            "nlnet_rfp_recorder.lock_diagnostics.find_processes_with_file_open",
+            return_value=[],
+        ),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "No process currently has it open" in captured.err
+
+
+def test_main_reraises_other_operational_errors():
+    from django.db.utils import OperationalError
+
+    from nlnet_rfp_recorder.cli import main
+
+    with patch(
+        "nlnet_rfp_recorder.cli.app",
+        side_effect=OperationalError("no such table: foo"),
+    ):
+        with pytest.raises(OperationalError):
+            main()
+
+
+def test_main_skips_process_listing_on_non_linux(capsys):
+    from django.db.utils import OperationalError
+
+    from nlnet_rfp_recorder.cli import main
+
+    with (
+        patch(
+            "nlnet_rfp_recorder.cli.app",
+            side_effect=OperationalError("database is locked"),
+        ),
+        patch("platform.system", return_value="Darwin"),
+    ):
+        with pytest.raises(SystemExit):
+            main()
+
+    captured = capsys.readouterr()
+    assert "only supported on Linux" in captured.err

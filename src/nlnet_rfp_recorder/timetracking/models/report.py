@@ -73,9 +73,14 @@ def _task_budget(
     return shown + _round_up_to_10(unshown_raw), line_budgets
 
 
-def _format_report_link(
+def format_report_link(
     link: Link, tags: Iterable[str] | None = None, budget: int | None = None
 ) -> str:
+    """Format one link as it appears in a report line: its URL, then
+    "- <budget>€" if given, then any tags other than 'implementation'
+    (the default, not worth calling out) in parens. Public - also used
+    by `rfp report edit` to show each link it's asking about.
+    """
     if link.is_issue:
         url = link.issue.url
     elif link.is_pr:
@@ -96,21 +101,35 @@ def _format_report_link(
 
 
 def _format_task_block(
-    task: Task | None, task_lines: Iterable[ReportLine | _PreviewLine]
+    task: Task | None,
+    task_lines: Iterable[ReportLine | _PreviewLine],
+    *,
+    show_task_context: bool = False,
 ) -> tuple[list[str], int]:
     """The lines `_render` prints for one task: its total, then its links
-    grouped into Issues/Pull Requests/Discussions/Links - reused as-is by
-    `Report.review_tasks()` so a task is reviewed exactly as it will
+    grouped into Issues/Pull Requests/Discussions/Links - reused by
+    `Report.review_tasks()` so a task is reviewed the same way it will
     print in the report.
+
+    `show_task_context` (used only by review_tasks(), never by the
+    actual report text - _render()'s callers always leave it False) adds
+    the task's alias to the header and its description as an extra line
+    below it - operator-only context to help decide what to keep, same
+    reasoning as Report.format_excluded_links showing the alias there.
     """
     task_lines = list(task_lines)
     task_total, line_budgets = _task_budget(task_lines)
-    task_display = task.name if task is not None else "?"
+    if task is None:
+        task_display = "?"
+    else:
+        task_display = task.display_name if show_task_context else task.name
     lines = [f"{task_display}: {task_total}€"]
+    if show_task_context and task is not None and task.description:
+        lines.append(f"  {task.description}")
 
     def _bullet(rl: ReportLine | _PreviewLine) -> str:
         budget = line_budgets[id(rl)]
-        return f"    - {_format_report_link(rl.link, rl.tag_list, budget)}"
+        return f"    - {format_report_link(rl.link, rl.tag_list, budget)}"
 
     sorted_lines = sorted(task_lines, key=lambda report_line: report_line.link)
     issue_lines = [rl for rl in sorted_lines if rl.link.is_issue]
@@ -311,9 +330,62 @@ class Report(models.Model):
     def time_records(self) -> models.QuerySet[TimeRecord]:
         return TimeRecord.objects.filter(report_line__report=self)
 
+    def open_implementation_issue_lines(self) -> list[ReportLine]:
+        """This report's lines for issues (not PRs) still open on GitHub
+        and tagged 'implementation' - for `report review` to ask about
+        individually before its usual task-by-task pass.
+
+        An issue still open usually means the work described in it isn't
+        actually finished yet, unlike a 'review' issue, where the work
+        being billed - the review itself - is done regardless of the
+        issue's own status; that's why only 'implementation' issues get
+        this extra scrutiny. Uses each line's own (ReportLine.tags)
+        snapshot, not the link's live tags, for the same reason
+        review_tasks() renders from persisted line data - what's asked
+        about should match what's actually in the report.
+
+        Checks every candidate's live GitHub status in one batched
+        request - same reasoning as _billable_and_excluded_links, which
+        does the equivalent open/closed check for PRs at `report create`
+        time.
+        """
+        candidates = [
+            line
+            for line in self.lines.select_related("link")
+            if line.link.is_issue and "implementation" in line.tag_list
+        ]
+        if not candidates:
+            return []
+        references = [line.link.issue for line in candidates]
+        token = GitHubToken.get()
+        statuses = fetch_statuses(references, token=token)
+        return [
+            line
+            for line, status in zip(candidates, statuses, strict=True)
+            if status == Status.OPEN
+        ]
+
+    def remove_link(self, link: Link) -> None:
+        """Drop this report's line for `link` specifically, e.g. after
+        `report review`'s open-issue check decides it isn't worth
+        reporting yet.
+
+        Same "detach, never delete the records" behavior as
+        remove_task_lines - see there - just scoped to one link instead
+        of a whole task.
+        """
+        try:
+            line = self.lines.get(link=link)
+        except ReportLine.DoesNotExist:
+            return
+        TimeRecord.objects.filter(report_line=line).update(report_line=None)
+        line.delete()
+
     def review_tasks(self) -> list[tuple[Task | None, str, int]]:
-        """This report's tasks, each rendered exactly as generate_report()
-        would print it, for `report review` to walk through one by one.
+        """This report's tasks, each rendered like generate_report() would
+        print it - plus the task's alias and description, shown only
+        here to help decide what to keep, never in the report itself -
+        for `report review` to walk through one by one.
 
         Returns one (task, block_text, task_total) tuple per task
         currently in the report, in the same order generate_report()
@@ -326,9 +398,33 @@ class Report(models.Model):
 
         result = []
         for task in sorted(report_lines_by_task, key=_task_sort_key):
-            block, task_total = _format_task_block(task, report_lines_by_task[task])
+            block, task_total = _format_task_block(
+                task, report_lines_by_task[task], show_task_context=True
+            )
             result.append((task, "\n".join(block), task_total))
         return result
+
+    def lines_by_task(self) -> list[tuple[Task | None, list[ReportLine]]]:
+        """This report's lines grouped by task, each task's own lines
+        sorted the same way generate_report()/review_tasks() show them -
+        for `report edit` to walk through link by link (unlike
+        review_tasks(), which asks per task, not per link).
+
+        Returns one (task, lines) tuple per task currently in the
+        report, tasks in the same order generate_report() prints them.
+        """
+        report_lines_by_task: dict[Task | None, list[ReportLine]] = {}
+        for report_line in self.lines.select_related("link__task"):
+            task = report_line.link.task if report_line.link else None
+            report_lines_by_task.setdefault(task, []).append(report_line)
+
+        return [
+            (
+                task,
+                sorted(report_lines_by_task[task], key=lambda rl: rl.link),
+            )
+            for task in sorted(report_lines_by_task, key=_task_sort_key)
+        ]
 
     def remove_task_lines(self, task: Task | None) -> None:
         """Drop this report's lines for `task`, e.g. after `report review`
@@ -600,6 +696,14 @@ class Report(models.Model):
 
     @staticmethod
     def format_excluded_links(excluded_links: list[Link]) -> str:
+        """Format the "Excluded Pull Requests" note shown by `rfp report
+        create`/`preview` - never part of a persisted report's own text
+        (generate_report() always passes an empty list), so unlike the
+        report body itself (see e.g. _format_task_block), this is purely
+        informational feedback for the person running the command, and
+        shows the task's alias alongside its name to make that lookup
+        easier for them.
+        """
         if not excluded_links:
             return ""
         links_by_task: dict[Task | None, list[Link]] = {}
@@ -608,10 +712,10 @@ class Report(models.Model):
 
         lines = ["Excluded Pull Requests (not merged):"]
         for task in sorted(links_by_task, key=_task_sort_key):
-            task_display = task.name if task is not None else "?"
+            task_display = task.display_name if task is not None else "?"
             lines.append(f"  {task_display}:")
             lines += [
-                f"    - {_format_report_link(link)}" for link in links_by_task[task]
+                f"    - {format_report_link(link)}" for link in links_by_task[task]
             ]
         return "\n".join(lines)
 
