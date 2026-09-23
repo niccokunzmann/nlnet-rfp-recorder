@@ -1432,7 +1432,7 @@ def test_continue_shows_the_tasks_description_if_present():
 
 
 def test_edit_without_any_time_entries_fails():
-    result = runner.invoke(app, ["edit", "https://example.com/issues/1"])
+    result = runner.invoke(app, ["edit", "--url", "https://example.com/issues/1"])
 
     assert result.exit_code != 0
 
@@ -1443,7 +1443,7 @@ def test_edit_replaces_the_last_entrys_link():
     runner.invoke(app, ["start", "10a", "https://example.com/issues/wrong"])
     runner.invoke(app, ["stop"])
 
-    result = runner.invoke(app, ["edit", "https://example.com/issues/right"])
+    result = runner.invoke(app, ["edit", "--url", "https://example.com/issues/right"])
 
     assert result.exit_code == 0, result.output
     record = TimeRecord.objects.get()
@@ -1469,7 +1469,7 @@ def test_edit_edits_the_most_recent_entry_even_if_stopped():
     runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
 
-    result = runner.invoke(app, ["edit", "https://example.com/issues/2"])
+    result = runner.invoke(app, ["edit", "--url", "https://example.com/issues/2"])
 
     assert result.exit_code == 0, result.output
     record = TimeRecord.objects.get()
@@ -1554,6 +1554,7 @@ def test_edit_changes_link_tags_and_task_together():
         app,
         [
             "edit",
+            "--url",
             "https://example.com/issues/2",
             "--tags",
             "review",

@@ -1740,7 +1740,12 @@ def implement(
 
 @app.command()
 def edit(
-    link: str | None = typer.Argument(None, autocompletion=_complete_link_url),
+    link: str | None = typer.Option(
+        None,
+        "--url",
+        autocompletion=_complete_link_url,
+        help="Replace this time entry's link with a different URL.",
+    ),
     tags: str | None = typer.Option(
         None, "--tags", help="Comma-separated tags to add (implementation, review)."
     ),
