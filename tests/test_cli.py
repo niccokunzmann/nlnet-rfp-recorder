@@ -656,7 +656,9 @@ def test_task_set_bulk_percentage_is_relative_to_each_tasks_own_maximum():
     assert len(budgets) == 3
 
 
-def test_task_set_accepts_a_prefix_matching_a_whole_group():
+def test_task_set_accepts_a_bare_number_matching_only_that_group():
+    # "4" must match exactly the "4" group (4a, 4b) - not 40a or 14a,
+    # even though both also contain "4" as a string.
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     for name in ["4a", "4b", "40a", "14a"]:
         runner.invoke(app, ["task", "select", name])
@@ -664,9 +666,24 @@ def test_task_set_accepts_a_prefix_matching_a_whole_group():
     result = runner.invoke(app, ["task", "set", "max", "4", "0"])
 
     assert result.exit_code == 0, result.output
-    for name in ["4a", "4b", "40a"]:
+    for name in ["4a", "4b"]:
         assert Task.objects.get(name=name).max_budget == 0.0
+    assert Task.objects.get(name="40a").max_budget is None
     assert Task.objects.get(name="14a").max_budget is None
+
+
+def test_task_set_accepts_a_range_of_numbered_groups():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    for name in ["9a", "10a", "10b", "11a", "14a", "15a"]:
+        runner.invoke(app, ["task", "select", name])
+
+    result = runner.invoke(app, ["task", "set", "max", "10-14", "0"])
+
+    assert result.exit_code == 0, result.output
+    for name in ["10a", "10b", "11a", "14a"]:
+        assert Task.objects.get(name=name).max_budget == 0.0
+    assert Task.objects.get(name="9a").max_budget is None
+    assert Task.objects.get(name="15a").max_budget is None
 
 
 def test_task_set_fails_for_an_unknown_task_or_prefix():
@@ -1078,7 +1095,7 @@ def test_start_asks_which_task_when_none_is_selected():
 def test_start_prompt_defaults_to_the_last_worked_task():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
     runner.invoke(app, ["task", "select"])  # deselect
 
@@ -1092,12 +1109,14 @@ def test_start_prompt_defaults_to_the_last_worked_task():
 
 def test_start_prompt_default_uses_the_bare_name_not_the_alias():
     # An aliased task's display_name is "10a (ical-lang)" - not itself a
-    # valid answer, so the default offered (and accepted on blank Enter)
-    # must be the plain name instead.
+    # valid answer, so the default *submitted* on blank Enter must be
+    # the plain name - but it's still shown with its alias in the
+    # prompt text itself (test_start_prompt_shows_the_alias_in_brackets
+    # covers the display side).
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
     runner.invoke(app, ["alias", "set", "task", "10a", "ical-lang"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
     runner.invoke(app, ["task", "select"])
 
@@ -1106,6 +1125,33 @@ def test_start_prompt_default_uses_the_bare_name_not_the_alias():
     assert result.exit_code == 0, result.output
     record = TimeRecord.objects.get(link__url="https://example.com/issues/2")
     assert record.link.task.name == "10a"
+
+
+def test_start_prompt_shows_the_alias_in_brackets():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["alias", "set", "task", "10a", "ical-lang"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    runner.invoke(app, ["task", "select"])
+
+    result = runner.invoke(app, ["start", "https://example.com/issues/2"], input="\n")
+
+    assert result.exit_code == 0, result.output
+    assert "[10a (ical-lang)]" in result.output
+
+
+def test_start_prompt_puts_the_input_on_its_own_line():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    task = Task.objects.create(mou=MoU.objects.get(), name="10a")
+    Link.objects.create(url="https://example.com/issues/1")
+
+    result = runner.invoke(app, ["start", "https://example.com/issues/1"], input="\n")
+
+    assert result.exit_code == 0, result.output
+    assert "tasks) [10a]\n> " in result.output
+    link = Link.objects.get()
+    assert link.task == task
 
 
 def test_start_rejects_an_unknown_task_and_asks_again():
@@ -1138,10 +1184,34 @@ def test_start_question_mark_lists_tasks_then_asks_again():
     assert record.link.task.name == "10a"
 
 
-def test_start_creates_a_time_entry_for_the_selected_task():
+@pytest.mark.parametrize("command1", ["start", "review", "implement"])
+@pytest.mark.parametrize("command2", ["start", "review", "implement"])
+def test_two_new_links_in_a_row_both_ask_for_a_task(command1, command2):
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    result = runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["task", "select", "10b"])
+    runner.invoke(app, ["task", "select"])  # deselect - nothing selected now
+
+    result1 = runner.invoke(
+        app, [command1, "https://example.com/issues/101"], input="10a\n"
+    )
+    result2 = runner.invoke(
+        app, [command2, "https://example.com/issues/102"], input="10b\n"
+    )
+
+    assert result1.exit_code == 0, result1.output
+    assert "Which task should this be assigned to?" in result1.output
+    assert result2.exit_code == 0, result2.output
+    assert "Which task should this be assigned to?" in result2.output
+
+
+def test_start_creates_a_time_entry_for_the_selected_task():
+    # A blank Enter accepts the selected task, offered as the default -
+    # it's still asked about, since a taskless link always is (see
+    # test_two_new_links_in_a_row_both_ask_for_a_task).
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    result = runner.invoke(app, ["start", "https://example.com/issues/1"], input="\n")
 
     assert result.exit_code == 0, result.output
     record = TimeRecord.objects.get()
@@ -1153,13 +1223,19 @@ def test_start_creates_a_time_entry_for_the_selected_task():
 def test_start_prints_the_previous_entry_being_stopped():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
-    result = runner.invoke(app, ["start", "https://example.com/issues/2"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
+    result = runner.invoke(app, ["start", "https://example.com/issues/2"], input="\n")
 
     assert result.exit_code == 0, result.output
     assert "Stopped 10a" in result.output
     assert "https://example.com/issues/1" in result.output
-    assert "Started time entry for task 10a" in result.output
+    # The task isn't known yet when "Started..." prints - it's still
+    # taskless at that point, resolved only once the prompt is answered.
+    assert "Started time entry for task ?: https://example.com/issues/2" in (
+        result.output
+    )
+    record = TimeRecord.objects.get(link__url="https://example.com/issues/2")
+    assert record.link.task.name == "10a"
 
 
 def test_start_uses_the_time_it_was_called_despite_a_slow_resolution():
@@ -1182,7 +1258,7 @@ def test_start_uses_the_time_it_was_called_despite_a_slow_resolution():
 def test_start_prints_continuing_when_resuming_the_same_link():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
 
     result = runner.invoke(app, ["start", "https://example.com/issues/1"])
@@ -1242,10 +1318,13 @@ def test_start_prints_the_tasks_description_if_present():
 
 
 def test_start_prints_nothing_extra_without_a_description():
+    # An explicit task, not the selected-task fallback, so this doesn't
+    # also trigger the task prompt (see _prompt_for_task) - irrelevant
+    # noise for what this test checks.
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
 
-    result = runner.invoke(app, ["start", "https://example.com/issues/1"])
+    result = runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
 
     assert result.exit_code == 0, result.output
     assert result.output.strip().splitlines()[-1].startswith("Started time entry")
@@ -1271,7 +1350,7 @@ def test_stop_ends_the_running_time_entry():
 def test_stop_with_a_url_replaces_the_running_records_link():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/wrong"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/wrong"])
 
     result = runner.invoke(app, ["stop", "https://example.com/issues/right"])
 
@@ -1326,7 +1405,7 @@ def test_continue_selects_the_links_task():
     # selected even if a different task was selected in the meantime.
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
     runner.invoke(app, ["task", "select", "10b"])
 
@@ -1343,7 +1422,7 @@ def test_continue_shows_the_tasks_description_if_present():
     task = Task.objects.get(name="10a")
     task.description = "Do the thing"
     task.save(update_fields=["description"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
 
     result = runner.invoke(app, ["continue"])
@@ -1361,7 +1440,7 @@ def test_edit_without_any_time_entries_fails():
 def test_edit_replaces_the_last_entrys_link():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/wrong"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/wrong"])
     runner.invoke(app, ["stop"])
 
     result = runner.invoke(app, ["edit", "https://example.com/issues/right"])
@@ -1387,7 +1466,7 @@ def test_edit_adds_tags_without_changing_the_link():
 def test_edit_edits_the_most_recent_entry_even_if_stopped():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
 
     result = runner.invoke(app, ["edit", "https://example.com/issues/2"])
@@ -1444,7 +1523,7 @@ def test_edit_task_selects_the_new_task():
 def test_edit_task_fails_for_an_unknown_task():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
 
     result = runner.invoke(app, ["edit", "--task", "does-not-exist"])
 
@@ -1468,7 +1547,7 @@ def test_edit_task_fails_without_a_link():
 def test_edit_changes_link_tags_and_task_together():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["task", "select", "11b"])
 
     result = runner.invoke(
@@ -1655,7 +1734,7 @@ def test_timesheet_show_reports_when_there_are_none():
 def test_timesheet_show_prints_one_line_per_entry():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
     pk = _time_record_pk()
 
@@ -3108,16 +3187,17 @@ def test_start_accepts_explicit_tags():
 
 
 def test_review_starts_a_time_entry_tagged_review():
-    Task.objects.create(name="10a")
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    Task.objects.create(mou=MoU.objects.get(), name="10a")
 
-    result = runner.invoke(app, ["review", "https://example.com/issues/1"])
+    result = runner.invoke(app, ["review", "https://example.com/issues/1"], input="\n")
 
     assert result.exit_code == 0, result.output
     record = TimeRecord.objects.get()
     assert record.is_running is True
+    assert record.link.task.name == "10a"
     link = Link.objects.get()
     assert [tag.name for tag in link.tags.all()] == ["review"]
-    assert "Started time entry for task 10a" in result.output
 
 
 def test_review_without_a_task_creates_a_taskless_entry():
@@ -3130,10 +3210,11 @@ def test_review_without_a_task_creates_a_taskless_entry():
 
 
 def test_review_stops_a_previously_running_entry():
-    Task.objects.create(name="10a")
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    Task.objects.create(mou=MoU.objects.get(), name="10a")
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
 
-    result = runner.invoke(app, ["review", "https://example.com/issues/2"])
+    result = runner.invoke(app, ["review", "https://example.com/issues/2"], input="\n")
 
     assert result.exit_code == 0, result.output
     assert "Stopped 10a" in result.output
@@ -3172,16 +3253,19 @@ def test_review_prints_the_tasks_description_if_present():
 
 
 def test_implement_starts_a_time_entry_tagged_implementation():
-    Task.objects.create(name="10a")
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    Task.objects.create(mou=MoU.objects.get(), name="10a")
 
-    result = runner.invoke(app, ["implement", "https://example.com/issues/1"])
+    result = runner.invoke(
+        app, ["implement", "https://example.com/issues/1"], input="\n"
+    )
 
     assert result.exit_code == 0, result.output
     record = TimeRecord.objects.get()
     assert record.is_running is True
+    assert record.link.task.name == "10a"
     link = Link.objects.get()
     assert [tag.name for tag in link.tags.all()] == ["implementation"]
-    assert "Started time entry for task 10a" in result.output
 
 
 def test_implement_without_a_task_creates_a_taskless_entry():
@@ -3376,7 +3460,7 @@ def test_start_does_not_ask_when_the_tag_already_matches():
 def test_start_asks_before_moving_a_link_to_a_different_task():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
 
     result = runner.invoke(
@@ -3395,7 +3479,7 @@ def test_start_defaults_to_yes_when_moving_a_link_to_a_different_task():
     # deliberate correction, not something to be wary of by default.
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
 
     result = runner.invoke(
@@ -3410,7 +3494,7 @@ def test_start_defaults_to_yes_when_moving_a_link_to_a_different_task():
 def test_start_declining_the_task_change_leaves_the_old_task():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
 
     result = runner.invoke(
@@ -3425,7 +3509,7 @@ def test_start_declining_the_task_change_leaves_the_old_task():
 def test_start_does_not_ask_when_the_task_already_matches():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
 
     result = runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
@@ -3434,14 +3518,22 @@ def test_start_does_not_ask_when_the_task_already_matches():
     assert "is under task" not in result.output
 
 
-def test_start_assigns_a_taskless_link_without_asking():
-    task = Task.objects.create(name="10a")
+def test_start_asks_before_assigning_a_taskless_link_defaulting_to_the_selected_task():
+    # A taskless link is never auto-assigned to the selected task
+    # silently any more - it's always asked about, just like any other
+    # taskless link (test_two_new_links_in_a_row_both_ask_for_a_task) -
+    # but the selected task is offered as the default, so accepting it
+    # is a single Enter away.
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    task = Task.objects.create(mou=MoU.objects.get(), name="10a")
     Link.objects.create(url="https://example.com/issues/1")
 
-    result = runner.invoke(app, ["start", "https://example.com/issues/1"])
+    result = runner.invoke(app, ["start", "https://example.com/issues/1"], input="\n")
 
     assert result.exit_code == 0, result.output
     assert "is under task" not in result.output
+    assert "Which task should this be assigned to?" in result.output
+    assert "[10a]" in result.output
     link = Link.objects.get()
     assert link.task == task
 
@@ -3476,7 +3568,7 @@ def test_start_declining_the_task_change_reselects_the_old_task():
     # so it must end up selected again, not 10b.
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
-    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
 
     result = runner.invoke(
@@ -4519,7 +4611,7 @@ def test_start_resolves_a_url_alias(settings):
         "nlnet_rfp_recorder.timetracking.models.alias.classify_issue_or_pr",
         return_value="pull",
     ):
-        result = runner.invoke(app, ["start", "ical/1782"])
+        result = runner.invoke(app, ["start", "ical/1782"], input="\n")
 
     assert result.exit_code == 0, result.output
     link = Link.objects.get()
@@ -4585,7 +4677,9 @@ def test_start_shows_the_task_alias_in_confirmation(settings):
     runner.invoke(app, ["task", "select", "10a"])
     runner.invoke(app, ["alias", "set", "task", "10a", "lib"])
 
-    result = runner.invoke(app, ["start", "https://example.com/issues/1"])
+    # An explicit task, so the "Started..." line - printed before the
+    # taskless-link prompt would even run - already reflects it.
+    result = runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
 
     assert result.exit_code == 0, result.output
     assert "Started time entry for task 10a (lib)" in result.output

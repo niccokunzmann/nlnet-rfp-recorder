@@ -110,12 +110,13 @@ class TimeRecord(models.Model):
         command never show up as recorded time. It has no effect on a
         resumed entry, which keeps its original start_time.
 
-        `task` (or, absent that, the currently selected task) may be
-        None - the entry still starts, tracked against a taskless link;
-        the caller is responsible for getting it assigned a task
-        afterwards (see cli._prompt_for_task).
+        `task` may be None - the entry still starts, tracked against a
+        taskless link; it is never silently filled in from the
+        currently selected task here (unlike most other places a task
+        is implied) - the caller is responsible for getting it assigned
+        a task afterwards (see cli._prompt_for_task, which offers the
+        selected task as its default answer, but always asks).
         """
-        task = task or Task.get_selected()
         link = Link.get_or_create_for_task(url, task)
         for tag in tags:
             link.add_tag(tag)

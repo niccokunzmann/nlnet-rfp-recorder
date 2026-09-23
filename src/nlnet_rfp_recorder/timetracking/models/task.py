@@ -155,13 +155,26 @@ class Task(models.Model):
         - an exact task name or alias: "10a"
         - a dash-separated range of two task names/aliases, inclusive
           and ordered by (number, letters): "1a-1c" selects 1a, 1b, 1c
-        - a bare prefix shared by several task names: "4" selects every
-          task whose name starts with "4" (4a, 4b, 40a, ...) - handy
-          for updating a whole numbered group at once
+        - a dash-separated range of two bare numbers, matching every
+          task in each numbered group in between, inclusive: "10-14"
+          selects every 10*, 11*, ..., 14* task (10a, 10b, 11a, ...,
+          14a, ...), regardless of letters
+        - a bare number, matching every task in that numbered group:
+          "1" selects 1a, 1b, 1c, ... but not 10a, 14a, or 19a - the
+          number has to match exactly, not just as a string prefix,
+          since task names are validated as \\d+[a-z]+ (see
+          task_name_validator) - handy for updating a whole numbered
+          group at once. A non-numeric term instead falls back to a
+          plain string prefix, matching every task name starting with
+          it - "10a" (once it isn't itself an exact name) matches
+          "10ab", "10ac", ...
 
-        Terms are tried in that order (exact, then range, then prefix),
-        so an exact name/alias always wins over treating it as a
-        prefix. Results are de-duplicated and returned sorted by
+        Terms are tried in that order (exact, then range, then
+        prefix/group), so an exact name/alias always wins. A range's
+        ends are only treated as bare numbers when *both* are digits
+        only ("10-14"); a range with any letters in either end ("1a-1c",
+        "10a-14") instead resolves each end to an exact task name/alias,
+        as before. Results are de-duplicated and returned sorted by
         sort_key, regardless of how the terms overlapped or their order
         in `query`.
 
@@ -185,12 +198,33 @@ class Task(models.Model):
         def _lookup(raw: str) -> Task | None:
             return by_name.get(resolve_task_name(raw, mou))
 
+        def _group_matches(number: int) -> list[Task]:
+            return [task for task in tasks if task.sort_key[0] == number]
+
         matched: dict[int, Task] = {}
         for term in terms:
             if "-" in term:
                 start_raw, _, end_raw = term.partition("-")
                 if not start_raw or not end_raw or "-" in end_raw:
                     raise ValueError(f"Invalid task range: {term!r}.")
+
+                if start_raw.isdigit() and end_raw.isdigit():
+                    start_number, end_number = int(start_raw), int(end_raw)
+                    if start_number > end_number:
+                        raise ValueError(
+                            f"Invalid task range: {term!r} (end before start)."
+                        )
+                    group_matches = [
+                        task
+                        for task in tasks
+                        if start_number <= task.sort_key[0] <= end_number
+                    ]
+                    if not group_matches:
+                        raise ValueError(f"No such task group: {term}.")
+                    for task in group_matches:
+                        matched[task.pk] = task
+                    continue
+
                 start, end = _lookup(start_raw), _lookup(end_raw)
                 if start is None:
                     raise ValueError(f"No such task: {start_raw}.")
@@ -208,6 +242,14 @@ class Task(models.Model):
             exact = _lookup(term)
             if exact is not None:
                 matched[exact.pk] = exact
+                continue
+
+            if term.isdigit():
+                group_matches = _group_matches(int(term))
+                if not group_matches:
+                    raise ValueError(f"No such task: {term}.")
+                for task in group_matches:
+                    matched[task.pk] = task
                 continue
 
             prefix_matches = [task for task in tasks if task.name.startswith(term)]

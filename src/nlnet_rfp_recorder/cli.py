@@ -233,21 +233,22 @@ def _apply_start_tag(link: Link, desired_tag: str) -> None:
 def _apply_start_task(link: Link, desired_task: Task, *, explicit: bool) -> None:
     """Move `link` to `desired_task` if it currently belongs elsewhere.
 
-    A link with no task yet is simply assigned - nothing to ask about.
-    When a task was typed explicitly, one already under a different task
-    defaults to yes when asked, unlike the tag question: typing a task
-    while starting, reviewing, or implementing a link is usually a
-    deliberate correction, not a conflict to be wary of. When no task
-    was typed, `desired_task` is only the currently selected task
-    filling in for a missing argument, not something the user actually
-    asked for - so an existing assignment wins without a question, with
-    a hint for how to move it explicitly if that's wrong.
+    A link with no task yet is assigned right away only when a task was
+    typed explicitly - that's a deliberate choice, nothing to ask about.
+    When no task was typed, `desired_task` is only the currently
+    selected task filling in for a missing argument, not something the
+    user actually asked for - so a taskless link is left as-is here
+    (_start's call to _prompt_for_task asks instead, offering it as the
+    default answer), and an *existing* assignment likewise wins without
+    a question, with a hint for how to move it explicitly if that's
+    wrong.
     """
     if link.task_id == desired_task.id:
         return
     if link.task_id is None:
-        link.task = desired_task
-        link.save(update_fields=["task"])
+        if explicit:
+            link.task = desired_task
+            link.save(update_fields=["task"])
         return
 
     if not explicit:
@@ -903,9 +904,10 @@ TasksArgument = typer.Argument(
     autocompletion=_complete_task_name,
     help=(
         "Which task(s) to update: an exact task name/alias ('10a'), a "
-        "dash-separated range ('1a-1c'), a bare prefix matching every "
-        "task whose name starts with it ('4' selects 4a, 4b, 40a, ...), "
-        "or a comma-separated combination of these ('1a-1c,2f,2h')."
+        "dash-separated range of tasks ('1a-1c'), a whole numbered group "
+        "('4' selects 4a, 4b, ... but not 40a or 14a), a dash-separated "
+        "range of numbered groups ('10-14' selects 10a, 10b, ..., 14a, "
+        "...), or a comma-separated combination of these ('1a-1c,2f,2h')."
     ),
 )
 ValueArgument = typer.Argument(
@@ -1536,17 +1538,21 @@ def _enable_task_completion(mou: MoU) -> Callable[[], None]:
     return _restore
 
 
-def _prompt_for_task(record: TimeRecord) -> Task | None:
+def _prompt_for_task(
+    record: TimeRecord, default_task: Task | None = None
+) -> Task | None:
     """Ask which task a just-started, still-taskless time entry should
     count toward.
 
-    Plain Enter picks the task of the most recent other time entry that
-    had one - "the last task worked on" - if there is one. '?' prints
-    the task list (name/alias, budget, description - same as `rfp task
-    list`) and asks again. Anything else must be an existing task's
-    name or alias: unlike `rfp task select`, a typo here is never
-    silently taken as a brand new task, since this is asked mid-flow
-    rather than something deliberately typed.
+    `default_task` - typically the currently selected task, i.e. "the
+    last task worked on" - is offered as the answer plain Enter picks,
+    when there is one. Absent that (nothing currently selected), the
+    task of the most recent *other* time entry that had one is offered
+    instead. '?' prints the task list (name/alias, budget, description
+    - same as `rfp task list`) and asks again. Anything else must be an
+    existing task's name or alias: unlike `rfp task select`, a typo
+    here is never silently taken as a brand new task, since this is
+    asked mid-flow rather than something deliberately typed.
 
     Returns None - leaving the entry taskless, to be assigned later via
     `rfp edit --task` - when there's no MoU to pick a task from yet.
@@ -1567,23 +1573,32 @@ def _prompt_for_task(record: TimeRecord) -> Task | None:
         )
         return None
 
-    previous = (
-        TimeRecord.objects.exclude(pk=record.pk)
-        .exclude(link__task__isnull=True)
-        .order_by("-start_time")
-        .first()
-    )
-    default_task = previous.link.task if previous is not None else None
-    # The plain name, not display_name - an aliased task's "10a (foo)"
-    # isn't itself a valid answer, and would fail to resolve below.
+    if default_task is None:
+        previous = (
+            TimeRecord.objects.exclude(pk=record.pk)
+            .exclude(link__task__isnull=True)
+            .order_by("-start_time")
+            .first()
+        )
+        default_task = previous.link.task if previous is not None else None
+    # The submitted default has to be the plain name - an aliased task's
+    # "10a (foo)" isn't itself a valid answer, and would fail to resolve
+    # below - but the alias is still worth showing, so it's shown
+    # separately (via display_name, show_default=False) rather than
+    # through click's own default echo.
     default_name = default_task.name if default_task is not None else None
+    prompt_text = "Which task should this be assigned to? (enter '?' to list tasks)"
+    if default_task is not None:
+        prompt_text += f" [{default_task.display_name}]"
 
     restore_completer = _enable_task_completion(mou)
     try:
         while True:
             answer = typer.prompt(
-                "Which task should this be assigned to? (enter '?' to list tasks)",
+                prompt_text,
                 default=default_name,
+                show_default=False,
+                prompt_suffix="\n> ",
             ).strip()
 
             if answer == "?":
@@ -1649,7 +1664,7 @@ def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
         desired_tag = tags if tags is not None else _default_tag(resolved_link)
         _apply_start_tag(record.link, desired_tag)
         if record.link.task is None:
-            chosen_task = _prompt_for_task(record)
+            chosen_task = _prompt_for_task(record, default_task=effective_task)
             if chosen_task is not None:
                 record.link.task = chosen_task
                 record.link.save(update_fields=["task"])

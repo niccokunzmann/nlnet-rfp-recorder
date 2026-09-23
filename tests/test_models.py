@@ -908,14 +908,56 @@ def test_resolve_query_rejects_a_range_with_an_unknown_end():
         Task.resolve_query("1a-1z", mou)
 
 
-def test_resolve_query_matches_a_prefix():
+def test_resolve_query_matches_a_numbered_group():
+    # A bare number matches its own group only - not any other group
+    # that merely shares it as a string prefix (40, 14 both contain "4").
     mou = MoU.objects.create(name="nlnet-2026")
     a = Task.objects.create(mou=mou, name="4a")
     b = Task.objects.create(mou=mou, name="4b")
     forty_a = Task.objects.create(mou=mou, name="40a")
+    fourteen_a = Task.objects.create(mou=mou, name="14a")
+
+    result = Task.resolve_query("4", mou)
+
+    assert result == [a, b]
+    assert forty_a not in result
+    assert fourteen_a not in result
+
+
+def test_resolve_query_matches_a_numbered_group_range():
+    # "10-14" is a range of bare numbers - every task in each of those
+    # numbered groups, not the letter-range/exact-name behavior of
+    # "1a-1c".
+    mou = MoU.objects.create(name="nlnet-2026")
+    a10 = Task.objects.create(mou=mou, name="10a")
+    b10 = Task.objects.create(mou=mou, name="10b")
+    a11 = Task.objects.create(mou=mou, name="11a")
+    a14 = Task.objects.create(mou=mou, name="14a")
+    a9 = Task.objects.create(mou=mou, name="9a")
+    a15 = Task.objects.create(mou=mou, name="15a")
+
+    result = Task.resolve_query("10-14", mou)
+
+    assert result == [a10, b10, a11, a14]
+    assert a9 not in result
+    assert a15 not in result
+
+
+def test_resolve_query_rejects_a_numbered_group_range_with_end_before_start():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="10a")
     Task.objects.create(mou=mou, name="14a")
 
-    assert Task.resolve_query("4", mou) == [a, b, forty_a]
+    with pytest.raises(ValueError, match="end before start"):
+        Task.resolve_query("14-10", mou)
+
+
+def test_resolve_query_rejects_a_numbered_group_range_matching_nothing():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="1a")
+
+    with pytest.raises(ValueError, match="No such task group: 10-14"):
+        Task.resolve_query("10-14", mou)
 
 
 def test_resolve_query_exact_match_wins_over_prefix():
@@ -1107,7 +1149,7 @@ def test_link_get_or_create_for_task_is_silent_for_the_same_task():
     assert result.task == task
 
 
-def test_start_without_a_task_and_none_selected_creates_a_taskless_entry():
+def test_start_without_a_task_creates_a_taskless_entry():
     record = TimeRecord.start("https://example.com/issues/1")
 
     assert record.link.task is None
@@ -1115,12 +1157,16 @@ def test_start_without_a_task_and_none_selected_creates_a_taskless_entry():
     assert record.is_running is True
 
 
-def test_start_uses_the_selected_task_by_default():
-    selected = Task.objects.create(name="10a")
+def test_start_without_a_task_stays_taskless_even_with_one_selected():
+    # Unlike most other places a task is implied, start() never falls
+    # back to the currently selected task on its own - the caller (cli's
+    # _start, via _prompt_for_task) is responsible for that, since it's
+    # asked about rather than silently applied.
+    Task.objects.create(name="10a")
 
     record = TimeRecord.start("https://example.com/issues/1")
 
-    assert record.link.task == selected
+    assert record.link.task is None
     assert record.link.url == "https://example.com/issues/1"
     assert record.is_running is True
 
@@ -1208,13 +1254,13 @@ def test_start_with_an_explicit_start_time_stops_the_previous_entry_at_it_too():
 
 def test_start_warns_when_link_belongs_to_another_task():
     MoU.select("nlnet-2026")
-    Task.objects.create(name="10a")
-    TimeRecord.start("https://example.com/issues/1")
+    task_a = Task.objects.create(name="10a")
+    TimeRecord.start("https://example.com/issues/1", task=task_a)
     TimeRecord.stop()
 
-    Task.select("11b")
+    task_b = Task.select("11b")
     with pytest.warns(UserWarning):
-        record = TimeRecord.start("https://example.com/issues/1")
+        record = TimeRecord.start("https://example.com/issues/1", task=task_b)
 
     assert record.link.task.name == "10a"
 
@@ -1271,7 +1317,7 @@ def test_stop_ends_the_running_record():
 
 def test_stop_with_a_url_replaces_the_running_records_link():
     task = Task.objects.create(name="10a")
-    started = TimeRecord.start("https://example.com/issues/wrong")
+    started = TimeRecord.start("https://example.com/issues/wrong", task=task)
 
     stopped = TimeRecord.stop("https://example.com/issues/right")
 
@@ -1314,7 +1360,7 @@ def test_continue_last_fails_while_a_record_is_running():
 
 def test_continue_last_creates_a_new_record_for_the_same_link():
     task = Task.objects.create(name="10a")
-    started = TimeRecord.start("https://example.com/issues/1")
+    started = TimeRecord.start("https://example.com/issues/1", task=task)
     stopped = TimeRecord.stop()
 
     resumed = TimeRecord.continue_last()
