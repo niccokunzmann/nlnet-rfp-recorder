@@ -13,6 +13,7 @@ from nlnet_rfp_recorder.timesheet import TimesheetRow, format_hhmmss, parse_hhmm
 
 from .link import Link
 from .mou import MoU
+from .tag import TAG_NAMES
 from .task import Task
 
 
@@ -117,6 +118,19 @@ class TimeRecord(models.Model):
         a task afterwards (see cli._prompt_for_task, which offers the
         selected task as its default answer, but always asks).
         """
+        tags = tuple(tags)
+        if url == "":
+            # Empty-url entries each have their own link, so "the same
+            # link" can't be matched by url - an entry on the same task
+            # with the same tags counts as the same thing instead.
+            same = cls._matching_empty_url_record(task, tags)
+            if same is not None:
+                if same.is_running:
+                    return same
+                cls.stop(end_time=start_time)
+                same.end_time = None
+                same.save(update_fields=["end_time"])
+                return same
         link = Link.get_or_create_for_task(url, task)
         for tag in tags:
             link.add_tag(tag)
@@ -138,6 +152,21 @@ class TimeRecord(models.Model):
             return resumable
 
         return cls.objects.create(link=link, start_time=start_time or timezone.now())
+
+    @classmethod
+    def _matching_empty_url_record(
+        cls, task: Task | None, tags: tuple[str, ...]
+    ) -> TimeRecord | None:
+        """The running (else most recent) entry, if it has no url and
+        matches `task` and `tags`."""
+        record = cls.get_running() or cls.get_last()
+        if record is None or record.link is None or record.link.url != "":
+            return None
+        link = record.link
+        if link.task_id != (task.id if task is not None else None):
+            return None
+        current = {t.name for t in link.tags.all() if t.name in TAG_NAMES}
+        return record if current == set(tags) else None
 
     @classmethod
     def get_running(cls) -> TimeRecord | None:

@@ -1298,6 +1298,110 @@ def test_start_with_a_single_bare_task_alias_uses_an_empty_url():
     assert record.link.url == ""
 
 
+def _setup_task_only_start():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    Task.objects.create(mou=MoU.objects.get(), name="10a")
+    Task.objects.create(mou=MoU.objects.get(), name="10b")
+
+
+def test_start_task_only_with_no_records_does_not_ask_to_change():
+    _setup_task_only_start()
+
+    result = runner.invoke(app, ["start", "10a"])
+
+    assert result.exit_code == 0, result.output
+    assert "Change it to" not in result.output
+    assert TimeRecord.get_running().link.task.name == "10a"
+
+
+def test_start_task_only_with_nothing_running_does_not_ask_to_change():
+    _setup_task_only_start()
+    runner.invoke(app, ["start", "10a"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(app, ["start", "10b"])
+
+    assert result.exit_code == 0, result.output
+    assert "Change it to" not in result.output
+    assert TimeRecord.get_running().link.task.name == "10b"
+
+
+def test_start_task_only_while_another_link_runs_does_not_ask_to_change():
+    _setup_task_only_start()
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
+
+    result = runner.invoke(app, ["start", "10b"])
+
+    assert result.exit_code == 0, result.output
+    assert "Change it to" not in result.output
+    assert TimeRecord.get_running().link.task.name == "10b"
+
+
+def test_start_task_only_with_the_same_task_running_does_not_ask_to_change():
+    _setup_task_only_start()
+    runner.invoke(app, ["start", "10a"])
+
+    result = runner.invoke(app, ["start", "10a"])
+
+    assert result.exit_code == 0, result.output
+    assert "Change it to" not in result.output
+    assert TimeRecord.get_running().link.task.name == "10a"
+
+
+def test_start_task_only_with_a_different_task_running_does_not_ask_to_change():
+    _setup_task_only_start()
+    runner.invoke(app, ["start", "10a"])
+
+    result = runner.invoke(app, ["start", "10b"])
+
+    assert result.exit_code == 0, result.output
+    assert "Change it to" not in result.output
+    assert TimeRecord.get_running().link.task.name == "10b"
+
+
+@pytest.mark.parametrize("command", ["review", "implement"])
+@pytest.mark.parametrize("other", ["none", "same", "different", "other-link"])
+def test_review_and_implement_task_only_do_not_ask_to_change(command, other):
+    _setup_task_only_start()
+    if other == "same":
+        runner.invoke(app, ["start", "10b"])
+    elif other == "different":
+        runner.invoke(app, ["start", "10a"])
+    elif other == "other-link":
+        runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
+
+    result = runner.invoke(app, [command, "10b"])
+
+    assert result.exit_code == 0, result.output
+    assert "Change it to" not in result.output
+    assert TimeRecord.get_running().link.task.name == "10b"
+
+
+def test_task_only_entries_keep_their_own_tags_and_suggest_fixing_the_url():
+    _setup_task_only_start()
+    runner.invoke(app, ["review", "10a"])
+
+    result = runner.invoke(app, ["implement", "10b"])
+
+    assert result.exit_code == 0, result.output
+    first, second = TimeRecord.objects.order_by("start_time")
+    assert [t.name for t in first.link.tags.all()] == ["review"]
+    assert first.link.task.name == "10a"
+    assert [t.name for t in second.link.tags.all()] == ["implementation"]
+    assert second.link.task.name == "10b"
+    assert "Still without a proper url" in result.output
+    assert f"rfp edit {first.pk} --url" in result.output
+
+
+def test_task_only_start_resumes_the_same_entry_for_same_task_and_tag():
+    _setup_task_only_start()
+    runner.invoke(app, ["review", "10a"])
+
+    runner.invoke(app, ["review", "10a"])
+
+    assert TimeRecord.objects.count() == 1
+
+
 def test_start_with_too_many_positional_arguments_fails():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
 

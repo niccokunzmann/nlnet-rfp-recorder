@@ -22,7 +22,6 @@ class Link(models.Model):
         ),
     )
     url = models.URLField(
-        unique=True,
         help_text=(
             "The issue/PR/discussion URL (or other link) time was tracked against."
         ),
@@ -54,6 +53,17 @@ class Link(models.Model):
         ),
     )
 
+    class Meta:
+        constraints = [
+            # An empty url means "no link yet" - each such entry gets its
+            # own Link, so its task and tags can differ from the others'.
+            models.UniqueConstraint(
+                fields=["url"],
+                condition=~models.Q(url=""),
+                name="unique_nonempty_link_url",
+            )
+        ]
+
     @classmethod
     def get_or_create_for_task(cls, url: str, task: Task | None) -> Link:
         """Get or create the link for `url`, assigning it to `task`.
@@ -62,6 +72,8 @@ class Link(models.Model):
         in which case a fresh link is simply created taskless, and an
         existing one's task is never touched.
         """
+        if url == "":
+            return cls.objects.create(url="", task=task)
         link, created = cls.objects.get_or_create(url=url, defaults={"task": task})
         if created or task is None:
             return link

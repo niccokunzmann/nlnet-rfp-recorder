@@ -1742,7 +1742,12 @@ def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
     # already running.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        record = TimeRecord.start(resolved_link, task=task, tags=(), start_time=now)
+        # An empty url has no link to look the tag up from later, and
+        # matching an existing entry needs it up front.
+        start_tags = (tags or "implementation",) if resolved_link == "" else ()
+        record = TimeRecord.start(
+            resolved_link, task=task, tags=start_tags, start_time=now
+        )
 
     if previously_running is not None and previously_running.pk != record.pk:
         previously_running.refresh_from_db()
@@ -1757,6 +1762,19 @@ def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
     record_task = record.link.task if record.link else None
     if record_task is not None and record_task.description:
         typer.echo(record_task.description)
+
+    if resolved_link == "":
+        others = [
+            other.pk
+            for other in TimeRecord.objects.filter(link__url="").exclude(pk=record.pk)
+        ]
+        if others:
+            typer.echo(
+                "Still without a proper url: time entr"
+                + ("y " if len(others) == 1 else "ies ")
+                + ", ".join(str(pk) for pk in others)
+                + f". Set one with `rfp edit {others[-1]} --url <url>`."
+            )
 
     # The clock is already running by this point - only now is it worth
     # spending network time (if tags weren't given) or asking a question
