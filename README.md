@@ -78,6 +78,7 @@ rfp report
 | Command | Description |
 | --- | --- |
 | `rfp review <link>` | Instead of `rfp start`: tags the entry as review, not implementation. |
+| `rfp review [<task>] --batch` | Reads one link per line; each is run as `rfp review [<task>] <link>` as soon as you press Enter. Ctrl+D ends. |
 | `rfp start <link>` with no task selected | Starts tracking right away, then asks which task to assign it to - Enter picks the last task worked on, `?` lists tasks (as `rfp task list` does). |
 | `rfp edit --duration 50` / `--duration 1:20` | Fix the last entry's duration - forgot to `rfp stop`? Sets it outright (minutes, or `H:MM`), moving its start time; a still-running entry keeps running. |
 | `rfp edit --duration +15` / `--duration -1:20` | Nudge the last entry's duration up or down by that amount instead of setting it outright. |

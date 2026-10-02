@@ -5374,3 +5374,63 @@ def test_main_skips_process_listing_on_non_linux(capsys):
 
     captured = capsys.readouterr()
     assert "only supported on Linux" in captured.err
+
+
+def test_review_batch_runs_review_for_each_line():
+    _setup_task_only_start()
+
+    result = runner.invoke(
+        app,
+        ["review", "10a", "--batch"],
+        input="https://example.com/issues/1\n\nhttps://example.com/issues/2\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    records = TimeRecord.objects.order_by("start_time")
+    assert [r.link.url for r in records] == [
+        "https://example.com/issues/1",
+        "https://example.com/issues/2",
+    ]
+    assert all(r.link.task.name == "10a" for r in records)
+    assert all([t.name for t in r.link.tags.all()] == ["review"] for r in records)
+
+
+def test_review_batch_without_task_asks_for_each_url():
+    _setup_task_only_start()
+
+    result = runner.invoke(
+        app,
+        ["review", "--batch"],
+        input="https://example.com/issues/1\n10b\nhttps://example.com/issues/2\n10a\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output.count("Which task should this be assigned to?") == 2
+    records = TimeRecord.objects.order_by("start_time")
+    assert [r.link.task.name for r in records] == ["10b", "10a"]
+
+
+def test_mou_import_leaves_no_task_selected(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    budget_file = tmp_path / "budget.txt"
+    budget_file.write_text("10a. Do the thing\t€ 500\n10b. Other thing\t€ 300\n")
+
+    result = _invoke_mou_import(str(budget_file))
+
+    assert result.exit_code == 0, result.output
+    assert Task.objects.count() == 2
+    assert Task.get_selected() is None
+
+
+def test_mou_import_stops_the_running_time_entry(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
+    assert TimeRecord.get_running() is not None
+    budget_file = tmp_path / "budget.txt"
+    budget_file.write_text("10a. Do the thing\t€ 500\n")
+
+    result = _invoke_mou_import(str(budget_file))
+
+    assert result.exit_code == 0, result.output
+    assert "Stopped" in result.output
+    assert TimeRecord.get_running() is None

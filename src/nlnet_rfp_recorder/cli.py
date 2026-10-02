@@ -750,6 +750,15 @@ def mou_import(
 
     text = path.read_text() if path is not None else _read_budget_from_stdin()
     tasks = selected.set_budget(text)
+    # Newly created tasks default to selected, which would leave several
+    # selected at once - start with none, like a fresh `rfp task select`.
+    from nlnet_rfp_recorder.timetracking.models import Task, TimeRecord
+
+    Task.objects.filter(selected=True).update(selected=False)
+    # Likewise a running entry belongs to the old task setup - stop it.
+    stopped = TimeRecord.stop()
+    if stopped is not None:
+        _echo_stopped(stopped)
     source = str(path) if path is not None else "stdin"
     typer.echo(
         f"Imported budget for MoU {selected.display_name} from {source} "
@@ -1824,12 +1833,21 @@ def start(
 @app.command()
 def review(
     args: list[str] = typer.Argument(
-        ...,
+        None,
         metavar="[TASK] LINK",
         autocompletion=_complete_task_or_link,
         help=(
             "A link to review against the currently selected task, or a "
-            "task (name or alias) followed by a link to select it first."
+            "task (name or alias) followed by a link to select it first. "
+            "With --batch, only the optional task."
+        ),
+    ),
+    batch: bool = typer.Option(
+        False,
+        "--batch",
+        help=(
+            "Read one link per line from stdin and run `rfp review "
+            "[TASK] LINK` for each as soon as it is entered."
         ),
     ),
     db: Path | None = DbOption,
@@ -1837,8 +1855,29 @@ def review(
 ) -> None:
     """Start a time entry tagged 'review', optionally selecting its task first."""
     _setup(db, test)
-    task_name, link = _parse_task_and_link(args, "review")
-    _start(link, "review", task_name)
+    args = args or []
+    if not batch:
+        if not args:
+            _fail("Usage: rfp review [TASK] LINK")
+        task_name, link = _parse_task_and_link(args, "review")
+        _start(link, "review", task_name)
+        return
+    if len(args) > 1:
+        _fail("Usage: rfp review [TASK] --batch")
+    task_name = args[0] if args else None
+    while True:
+        try:
+            line = input("link> " if sys.stdin.isatty() else "")
+        except EOFError, KeyboardInterrupt:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            _start(line, "review", task_name)
+        except typer.Exit:
+            # The error is already printed; keep going with the next link.
+            continue
 
 
 @app.command()
