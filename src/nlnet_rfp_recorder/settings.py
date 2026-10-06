@@ -26,6 +26,8 @@ REVIEW_DEFAULT_EXCLUDE_BELOW = env.float("REVIEW_DEFAULT_EXCLUDE_BELOW", default
 SECRET_KEY = "django-insecure-not-used-outside-tests"
 DEBUG = False
 USE_TZ = False
+# Use the system time zone; Django would otherwise default to America/Chicago.
+TIME_ZONE = None
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 INSTALLED_APPS = [

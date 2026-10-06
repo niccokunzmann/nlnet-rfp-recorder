@@ -10,3 +10,4 @@ wheels/
 .venv
 .prompts
 todo.txt
+/.prompts/

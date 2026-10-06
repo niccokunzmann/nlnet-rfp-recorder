@@ -5434,3 +5434,100 @@ def test_mou_import_stops_the_running_time_entry(tmp_path):
     assert result.exit_code == 0, result.output
     assert "Stopped" in result.output
     assert TimeRecord.get_running() is None
+
+
+def _stopped_record(start_hm: tuple[int, int], minutes: int) -> TimeRecord:
+    """A stopped entry today starting at `start_hm`, `minutes` long."""
+    from datetime import datetime
+
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    record = TimeRecord.objects.get()
+    record.start_time = datetime.now().replace(
+        hour=start_hm[0], minute=start_hm[1], second=0, microsecond=0
+    )
+    record.end_time = record.start_time + timedelta(minutes=minutes)
+    record.save()
+    return record
+
+
+def test_edit_start_changes_the_duration_by_default():
+    record = _stopped_record((1, 0), 120)
+    end = record.end_time
+
+    result = runner.invoke(app, ["edit", "--start", "0:30"], input="\n")
+
+    assert result.exit_code == 0, result.output
+    record.refresh_from_db()
+    assert (record.start_time.hour, record.start_time.minute) == (0, 30)
+    assert record.end_time == end
+    assert record.duration == timedelta(minutes=150)
+
+
+def test_edit_start_can_move_the_entry_instead():
+    record = _stopped_record((1, 0), 120)
+
+    result = runner.invoke(app, ["edit", "--start", "0:30"], input="m\n")
+
+    assert result.exit_code == 0, result.output
+    record.refresh_from_db()
+    assert (record.start_time.hour, record.start_time.minute) == (0, 30)
+    assert record.duration == timedelta(minutes=120)
+
+
+def test_edit_end_changes_the_duration_by_default():
+    record = _stopped_record((0, 0), 60)
+    start = record.start_time
+
+    result = runner.invoke(app, ["edit", "--end", "0:30"], input="\n")
+
+    assert result.exit_code == 0, result.output
+    record.refresh_from_db()
+    assert record.start_time == start
+    assert record.duration == timedelta(minutes=30)
+
+
+def test_edit_end_can_move_the_entry_instead():
+    record = _stopped_record((0, 0), 60)
+
+    result = runner.invoke(app, ["edit", "--end", "0:30"], input="m\n")
+
+    assert result.exit_code == 0, result.output
+    record.refresh_from_db()
+    assert (record.end_time.hour, record.end_time.minute) == (0, 30)
+    assert record.duration == timedelta(minutes=60)
+    assert (record.start_time.hour, record.start_time.minute) == (23, 30)
+
+
+def test_edit_start_later_than_now_asks_about_yesterday():
+    record = _stopped_record((0, 0), 30)
+    today = record.start_time.date()
+
+    result = runner.invoke(app, ["edit", "--start", "23:59"], input="y\nm\n")
+
+    assert result.exit_code == 0, result.output
+    assert "yesterday" in result.output
+    record.refresh_from_db()
+    assert record.start_time.date() == today - timedelta(days=1)
+
+
+def test_edit_start_rejects_invalid_time():
+    _stopped_record((1, 0), 30)
+
+    result = runner.invoke(app, ["edit", "--start", "nine"])
+
+    assert result.exit_code == 1
+    assert "Invalid time" in result.output
+
+
+def test_edit_end_of_running_entry_fails():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    result = runner.invoke(app, ["edit", "--end", "0:00"])
+
+    assert result.exit_code == 1
+    assert "still running" in result.output

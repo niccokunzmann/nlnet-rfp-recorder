@@ -124,6 +124,110 @@ def _parse_duration_or_fail(text: str) -> tuple[timedelta, bool]:
     return sign * timedelta(minutes=minutes), relative
 
 
+def _parse_local_time_or_fail(text: str) -> datetime:
+    """Parse `edit --start`/`--end`'s 'H:MM' local time to a datetime.
+
+    Assumes today; a time later than now is more likely meant for
+    yesterday, so that is asked about (declining keeps today).
+    """
+    hours_part, sep, minutes_part = text.partition(":")
+    try:
+        if not sep:
+            raise ValueError
+        wanted = datetime.now().replace(
+            hour=int(hours_part), minute=int(minutes_part), second=0, microsecond=0
+        )
+    except ValueError:
+        _fail(f"Invalid time {text!r}; expected local time as 'H:MM', e.g. 9:00.")
+    if wanted > datetime.now() and typer.confirm(
+        f"{text} is later than now. Is it about yesterday?", default=True
+    ):
+        wanted -= timedelta(days=1)
+    return wanted
+
+
+def _format_span(start: datetime, end: datetime | None) -> str:
+    """'start-end duration' for an entry - the start only shows its date
+    if that isn't today, the end only if it differs from the start's."""
+    start_text = start.strftime(
+        "%H:%M" if start.date() == datetime.now().date() else "%Y-%m-%d %H:%M"
+    )
+    if end is None:
+        return f"{start_text}- {_format_duration(datetime.now() - start)}"
+    end_text = end.strftime("%H:%M" if end.date() == start.date() else "%Y-%m-%d %H:%M")
+    return f"{start_text}-{end_text} {_format_duration(end - start)}"
+
+
+def _echo_edit_record(record: TimeRecord) -> None:
+    task = record.link.task if record.link and record.link.task else None
+    url = record.link.url if record.link else ""
+    span = _format_span(record.start_time, record.end_time)
+    typer.echo("Current time record:")
+    typer.echo(f"{_task_name(record)} {span} {url}".rstrip())
+    if task is not None and task.description:
+        typer.echo(task.description)
+    typer.echo()
+
+
+def _ask_move_or_change_duration(
+    record: TimeRecord,
+    changed: tuple[datetime, datetime],
+    moved: tuple[datetime, datetime],
+) -> bool:
+    """Show the current entry and both ways to apply an edit - changing
+    the duration (the default) or moving the whole entry - and ask which.
+
+    Returns True to move the entry.
+    """
+    _echo_edit_record(record)
+    typer.echo("Change duration [d, default]:")
+    typer.echo(_format_span(*changed))
+    delta = moved[0] - record.start_time
+    direction = "into the future" if delta > timedelta() else "into the past"
+    typer.echo(f"Move by {_format_duration(abs(delta))} {direction} [m]:")
+    typer.echo(_format_span(*moved))
+    answer = typer.prompt("Choose", default="d")
+    return answer.strip().lower().startswith("m")
+
+
+def _apply_edit_start(record: TimeRecord, new_start: datetime) -> None:
+    delta = new_start - record.start_time
+    if delta == timedelta():
+        return
+    if record.is_running:
+        if new_start > datetime.now():
+            _fail("The start of a running entry cannot be in the future.")
+        record.start_time = new_start
+        record.save(update_fields=["start_time"])
+        return
+    moved_end = record.end_time + delta
+    if _ask_move_or_change_duration(
+        record, (new_start, record.end_time), (new_start, moved_end)
+    ):
+        record.end_time = moved_end
+    elif new_start >= record.end_time:
+        _fail("The new start must be before the end of the entry.")
+    record.start_time = new_start
+    record.save(update_fields=["start_time", "end_time"])
+
+
+def _apply_edit_end(record: TimeRecord, new_end: datetime) -> None:
+    if record.is_running:
+        _fail("Cannot edit the end: this entry is still running. Use `rfp stop`.")
+    delta = new_end - record.end_time
+    if delta == timedelta():
+        return
+    moved_start = record.start_time + delta
+    if _ask_move_or_change_duration(
+        record, (record.start_time, new_end), (moved_start, new_end)
+    ):
+        record.start_time = moved_start
+    elif new_end <= record.start_time:
+        _fail("The new end must be after the start of the entry.")
+    record.end_time = new_end
+    record.save(update_fields=["start_time", "end_time"])
+
+
 def _task_name(record: TimeRecord) -> str:
     if record.link is None or record.link.task is None:
         return "?"
@@ -1957,7 +2061,9 @@ def _resolve_edit_record(timesheet_pk: int | None) -> TimeRecord:
         "    rfp edit --url https://github.com/org/repo/issues/1\n\n"
         "  Edit several fields of entry 42 at once:\n\n"
         "    rfp edit 42 --url https://github.com/org/repo/issues/1 "
-        "--task 11b --duration 1:20"
+        "--task 11b --duration 1:20\n\n"
+        "  Fix when the most recent entry started and ended:\n\n"
+        "    rfp edit --start 9:00 --end 10:30"
     ),
 )
 def edit(
@@ -1996,10 +2102,24 @@ def edit(
             "For when you forgot to stop it."
         ),
     ),
+    start: str | None = typer.Option(
+        None,
+        "--start",
+        help=(
+            "Set this entry's start to a local time ('9:00'). A time later "
+            "than now asks if you mean yesterday. Asks whether the duration "
+            "changes (default) or the whole entry moves."
+        ),
+    ),
+    end: str | None = typer.Option(
+        None,
+        "--end",
+        help=("Set this entry's end to a local time ('17:30'); same rules as --start."),
+    ),
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Edit a time entry's link, tags, task, and/or duration.
+    """Edit a time entry's link, tags, task, start, end, and/or duration.
 
     Defaults to the most recent entry - pass TIMESHEET_PK to edit a
     different one.
@@ -2008,6 +2128,12 @@ def edit(
     from nlnet_rfp_recorder.timetracking.models import Link
 
     record = _resolve_edit_record(timesheet_pk)
+
+    if start is not None:
+        _apply_edit_start(record, _parse_local_time_or_fail(start))
+
+    if end is not None:
+        _apply_edit_end(record, _parse_local_time_or_fail(end))
 
     if link is not None:
         if record.link is None or record.link.task is None:
