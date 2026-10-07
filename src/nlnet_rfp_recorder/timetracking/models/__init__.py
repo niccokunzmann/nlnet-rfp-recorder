@@ -9,6 +9,7 @@ from .alias import (
     resolve_mou_name,
     resolve_task_name,
 )
+from .background_task import BackgroundTask
 from .github_token import GitHubToken
 from .link import Link
 from .mou import TASK_CSV_FIELDNAMES, MoU, mou_name_validator
@@ -29,6 +30,7 @@ __all__ = [
     "TAG_NAMES",
     "TASK_CSV_FIELDNAMES",
     "Alias",
+    "BackgroundTask",
     "GitHubToken",
     "Link",
     "MoU",

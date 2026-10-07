@@ -1,5 +1,6 @@
 import csv
 import io
+import os
 import re
 from datetime import timedelta
 from pathlib import Path
@@ -4836,6 +4837,7 @@ def test_help_lists_commands_alphabetically():
     assert result.exit_code == 0, result.output
     assert _subcommand_names() == [
         "alias",
+        "background-task",
         "backup",
         "continue",
         "edit",
@@ -5531,3 +5533,220 @@ def test_edit_end_of_running_entry_fails():
 
     assert result.exit_code == 1
     assert "still running" in result.output
+
+
+def _start_running_entry() -> TimeRecord:
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    return TimeRecord.objects.get()
+
+
+def _fake_clock(*times):
+    from datetime import datetime
+
+    iterator = iter(times)
+    return lambda: datetime(2026, 10, 6) + timedelta(seconds=next(iterator))
+
+
+def test_background_task_stops_the_entry_at_the_time_before_suspend():
+    from datetime import datetime
+
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    record = _start_running_entry()
+    record.start_time = datetime(2026, 10, 5)
+    record.save()
+    task = BackgroundTask.register()
+
+    # start 0, ticks at 1, 2, then a 1h jump (suspend)
+    task.watch(sleep=lambda s: None, now=_fake_clock(0, 1, 2, 3602), ticks=3)
+
+    record.refresh_from_db()
+    assert record.end_time == datetime(2026, 10, 6) + timedelta(seconds=2)
+
+
+def test_background_task_leaves_the_entry_running_without_a_gap():
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    record = _start_running_entry()
+    task = BackgroundTask.register()
+
+    task.watch(sleep=lambda s: None, now=_fake_clock(0, 1, 2), ticks=2)
+
+    record.refresh_from_db()
+    assert record.is_running
+
+
+def test_background_task_updates_the_db_entry_every_minute():
+    from datetime import datetime
+
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    task = BackgroundTask.register()
+
+    task.watch(sleep=lambda s: None, now=_fake_clock(0, 30, 61, 90), ticks=3)
+
+    task.refresh_from_db()
+    assert task.last_seen == datetime(2026, 10, 6) + timedelta(seconds=61)
+
+
+def test_background_task_check_reports_status():
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    result = runner.invoke(app, ["background-task", "--check"])
+    assert result.exit_code == 1
+    assert "never run" in result.output
+
+    task = BackgroundTask.register()
+    result = runner.invoke(app, ["background-task", "--check"])
+    assert result.exit_code == 0
+    assert f"pid {os.getpid()}" in result.output
+    assert "Last check 0 seconds ago" in result.output
+
+    task.unregister()
+    result = runner.invoke(app, ["background-task", "--check"])
+    assert result.exit_code == 1
+    assert "Not running" in result.output
+
+
+def test_background_task_refuses_to_start_twice():
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    BackgroundTask.register()
+
+    result = runner.invoke(app, ["background-task"])
+
+    assert result.exit_code == 1
+    assert "already running" in result.output
+
+
+def test_background_task_with_a_dead_pid_is_not_alive():
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    task = BackgroundTask.register()
+    task.pid = 2**22 + 12345  # beyond the default pid_max
+    task.save()
+
+    assert not BackgroundTask.is_alive()
+    result = runner.invoke(app, ["background-task", "--check"])
+    assert result.exit_code == 1
+    assert "Not running" in result.output
+
+
+def test_background_task_reports_the_suspend_and_the_stopped_entry(capsys):
+    from datetime import datetime
+
+    from nlnet_rfp_recorder.cli import _report_suspend
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    record = _start_running_entry()
+    record.start_time = datetime(2026, 10, 5)
+    record.save()
+    task = BackgroundTask.register()
+
+    task.watch(
+        on_suspend=_report_suspend,
+        sleep=lambda s: None,
+        now=_fake_clock(0, 1, 7201),
+        ticks=2,
+    )
+
+    output = capsys.readouterr().out
+    assert "Suspend detected at 00:00:01: 2 hours until 02:00:01." in output
+    assert "Stopped " in output
+    assert "https://example.com/issues/1" in output
+
+
+def test_background_task_reports_a_suspend_with_nothing_running(capsys):
+    from nlnet_rfp_recorder.cli import _report_suspend
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    task = BackgroundTask.register()
+
+    task.watch(
+        on_suspend=_report_suspend,
+        sleep=lambda s: None,
+        now=_fake_clock(0, 1, 301),
+        ticks=2,
+    )
+
+    output = capsys.readouterr().out
+    assert "Suspend detected" in output
+    assert "5 minutes" in output
+    assert "nothing to stop" in output
+
+
+def test_background_task_watch_returns_true_when_the_schema_changed():
+    from django.db import connection
+    from django.db.migrations.recorder import MigrationRecorder
+
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    task = BackgroundTask.register()
+
+    def run():
+        return task.watch(
+            sleep=lambda s: None, now=_fake_clock(0, 30, 61, 91, 121), ticks=4
+        )
+
+    assert run() is False
+    MigrationRecorder(connection).record_applied("timetracking", "9999_from_the_future")
+
+    assert run() is True
+
+
+def test_background_task_restarts_itself_when_the_schema_changed():
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    with (
+        patch.object(BackgroundTask, "watch", return_value=True),
+        patch("nlnet_rfp_recorder.cli.os.execv") as execv,
+    ):
+        result = runner.invoke(app, ["background-task"])
+
+    assert result.exit_code == 0, result.output
+    assert "Restarting" in result.output
+    execv.assert_called_once()
+    assert not BackgroundTask.is_alive()
+
+
+def test_background_task_survives_a_query_failing_against_a_newer_schema():
+    from datetime import datetime
+
+    from django.db import connection
+    from django.db.migrations.recorder import MigrationRecorder
+
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    record = _start_running_entry()
+    record.start_time = datetime(2026, 10, 5)
+    record.save()
+    task = BackgroundTask.register()
+    # What a newer version's migration does to this process's models:
+    # TimeRecord.end_time no longer exists under that name.
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "ALTER TABLE timetracking_timerecord RENAME COLUMN end_time TO stopped_at"
+        )
+    MigrationRecorder(connection).record_applied("timetracking", "9999_rename")
+
+    # A suspend makes watch() query TimeRecord straight away -> OperationalError.
+    result = task.watch(sleep=lambda s: None, now=_fake_clock(0, 1, 7201), ticks=2)
+
+    assert result is True
+
+
+def test_background_task_reraises_an_operational_error_without_a_schema_change():
+    from django.db import OperationalError, connection
+
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    task = BackgroundTask.register()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "ALTER TABLE timetracking_timerecord RENAME COLUMN end_time TO stopped_at"
+        )
+
+    with pytest.raises(OperationalError):
+        task.watch(sleep=lambda s: None, now=_fake_clock(0, 1, 7201), ticks=2)

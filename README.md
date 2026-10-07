@@ -83,6 +83,7 @@ rfp report
 | `rfp edit --duration 50` / `--duration 1:20` | Fix the last entry's duration - forgot to `rfp stop`? Sets it outright (minutes, or `H:MM`), moving its start time; a still-running entry keeps running. |
 | `rfp edit --duration +15` / `--duration -1:20` | Nudge the last entry's duration up or down by that amount instead of setting it outright. |
 | `rfp edit --start 9:00` / `--end 17:30` | Set the last entry's start or end to a local time (today; a time later than now asks if you mean yesterday). Then asks whether the duration changes (default) or the whole entry moves by that amount. A running entry only accepts `--start`. |
+| `rfp background-task` / `rfp background-task --check` | Run in a spare terminal (Ctrl-C to quit): when the laptop suspends (a gap of over a minute between one-second checks), the running entry is ended at the last moment before it. `--check` reports whether it is running (pid, and how long ago it last checked in; exit code 1 if not). |
 | `rfp status` / `rfp task` / `rfp mou status` | Check where things stand. |
 | `rfp report` | Counts issues once finished regardless of GitHub status, but only counts a PR once it's closed (checked live against GitHub). |
 | `rfp token <token>` (`rfp token` alone for setup steps) | Avoids the unauthenticated GitHub API rate limit, which the report can hit quickly. |

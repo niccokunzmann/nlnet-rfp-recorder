@@ -2180,6 +2180,84 @@ def edit(
     typer.echo(f"Edited {_task_name(record)} {_format_duration(record.duration)} {url}")
 
 
+def _format_ago(elapsed: timedelta) -> str:
+    seconds = max(int(elapsed.total_seconds()), 0)
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds >= size:
+            count = seconds // size
+            return f"{count} {unit}{'s' if count != 1 else ''} ago"
+    return f"{seconds} seconds ago"
+
+
+@app.command("background-task")
+def background_task(
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help="Only check whether a background task is running (exit code 1 if not).",
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Stop the running time entry when the laptop goes to sleep.
+
+    Runs until interrupted with Ctrl-C. Every second it checks how much
+    time has passed; a gap of over a minute means the machine was
+    suspended, and the running entry is then ended at the last moment
+    before that. Reports that it is alive in the database every minute.
+    """
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    if check:
+        existing = BackgroundTask.get()
+        if existing is None:
+            _fail("The background task has never run.")
+        ago = _format_ago(datetime.now() - existing.last_seen)
+        if BackgroundTask.is_alive():
+            typer.echo(
+                f"Running (pid {existing.pid}) since "
+                f"{existing.started:%Y-%m-%d %H:%M:%S}. Last check {ago}."
+            )
+            return
+        _fail(f"Not running (pid {existing.pid}). Last check {ago}.")
+
+    try:
+        task = BackgroundTask.register()
+    except ValueError as error:
+        _fail(str(error))
+    typer.echo("Watching for suspend. Press Ctrl-C to stop.")
+    restart = False
+    try:
+        restart = task.watch(on_suspend=_report_suspend)
+    except KeyboardInterrupt:
+        typer.echo("Stopped.")
+    finally:
+        task.unregister()
+    if restart:
+        typer.echo("The database schema changed. Restarting.")
+        # Replaces this process, so the new code and models are loaded.
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+def _report_suspend(
+    previous: datetime, current: datetime, stopped: TimeRecord | None
+) -> None:
+    typer.echo(
+        f"Suspend detected at {previous:%H:%M:%S}: "
+        f"{_format_ago(current - previous).removesuffix(' ago')} "
+        f"until {current:%H:%M:%S}."
+    )
+    if stopped is None:
+        typer.echo("No time entry is running, nothing to stop.")
+        return
+    typer.echo(
+        f"Stopped {_task_name(stopped)} at {stopped.end_time:%H:%M:%S} "
+        f"({_format_duration(stopped.duration)}) "
+        f"{stopped.link.url if stopped.link else ''}".rstrip()
+    )
+
+
 @app.command()
 def stop(
     link: str | None = typer.Argument(None, autocompletion=_complete_link_url),
