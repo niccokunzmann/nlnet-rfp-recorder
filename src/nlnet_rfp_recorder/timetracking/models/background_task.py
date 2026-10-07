@@ -81,7 +81,7 @@ class BackgroundTask(models.Model):
     @classmethod
     def recover(
         cls, now: datetime | None = None
-    ) -> tuple[BackgroundTask, TimeRecord | None] | None:
+    ) -> tuple[BackgroundTask, TimeRecord | None, TimeRecord | None] | None:
         """Clean up after a background task that never shut down properly.
 
         A task that died without unregistering (the machine was shut
@@ -91,20 +91,25 @@ class BackgroundTask(models.Model):
         task's `last_seen`, the last moment the machine was known to be
         up. An entry that started after that is left alone.
 
-        Returns the dead task's row and the entry that was stopped (or
-        None), or None if there is nothing to recover from - no previous
-        task, one that exited cleanly, or one that is still alive. Call
-        this before register(), which replaces the row.
+        Returns the dead task's row, the entry that was stopped (or None)
+        and the running entry that was left alone because it started
+        after `last_seen` (or None). Returns None if there is nothing to
+        recover from - no previous task, one that exited cleanly, or one
+        that is still alive. Call this before register(), which replaces
+        the row.
         """
         previous = cls.get()
         if previous is None or not previous.is_running or cls.is_alive(now):
             return None
-        stopped = None
+        stopped = left_running = None
         running = TimeRecord.get_running()
-        if running is not None and running.start_time < previous.last_seen:
-            stopped = TimeRecord.stop(end_time=previous.last_seen)
+        if running is not None:
+            if running.start_time < previous.last_seen:
+                stopped = TimeRecord.stop(end_time=previous.last_seen)
+            else:
+                left_running = running
         previous.unregister()
-        return previous, stopped
+        return previous, stopped, left_running
 
     def touch(self, now: datetime | None = None) -> None:
         self.last_seen = now or timezone.now()

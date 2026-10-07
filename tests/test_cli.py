@@ -5840,7 +5840,10 @@ def test_background_task_recovery_leaves_a_newer_entry_running(background_log):
 
     record.refresh_from_db()
     assert record.is_running
-    assert "nothing to stop" in background_log.read_text()
+    log = background_log.read_text()
+    assert "after the last check-in" in log
+    assert "Left running" in log
+    assert "nothing to stop" not in log
 
 
 def test_background_task_no_recovery_after_a_clean_exit(background_log):
@@ -5915,3 +5918,16 @@ def test_background_task_recover_aborts_while_a_task_is_running(background_log):
     assert "RECOVER: A background task is already running" in (
         background_log.read_text()
     )
+
+
+def test_background_task_recovery_logs_when_no_entry_is_running(background_log):
+    from datetime import datetime
+
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    _dead_background_task(datetime(2026, 10, 5, 18, 30))
+
+    with patch.object(BackgroundTask, "watch", return_value=False):
+        runner.invoke(app, ["background-task"])
+
+    assert "No time entry is running, nothing to stop." in background_log.read_text()

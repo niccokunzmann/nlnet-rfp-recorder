@@ -2231,17 +2231,24 @@ def _recover_from_unclean_exit() -> None:
     recovery = BackgroundTask.recover()
     if recovery is None:
         return
-    previous, stopped = recovery
+    previous, stopped, left_running = recovery
     background_logger.warning(
         f"The previous background task (pid {previous.pid}, started "
         f"{previous.started:%Y-%m-%d %H:%M:%S}) did not shut down cleanly "
         f"(shutdown or crash). It was last seen at "
         f"{previous.last_seen:%Y-%m-%d %H:%M:%S}."
     )
-    if stopped is None:
-        background_logger.info("No time entry was running then, nothing to stop.")
-    else:
+    if stopped is not None:
         _log_stopped_entry(stopped)
+    elif left_running is not None:
+        background_logger.info(
+            f"A time entry is running ({_task_name(left_running)}), but it "
+            f"started at {left_running.start_time:%Y-%m-%d %H:%M:%S}, after "
+            "the last check-in, so it is not known whether it was running "
+            "at shutdown. Left running; fix it with `rfp edit --end`."
+        )
+    else:
+        background_logger.info("No time entry is running, nothing to stop.")
 
 
 def _run_background_task(once: bool = False) -> None:
