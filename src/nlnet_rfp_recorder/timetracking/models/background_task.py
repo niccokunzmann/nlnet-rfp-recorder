@@ -105,7 +105,7 @@ class BackgroundTask(models.Model):
         running = TimeRecord.get_running()
         if running is not None:
             if running.start_time < previous.last_seen:
-                stopped = TimeRecord.stop(end_time=previous.last_seen)
+                stopped = TimeRecord.stop(end_time=previous.last_seen, reason="restart")
             else:
                 left_running = running
         previous.unregister()
@@ -153,7 +153,8 @@ class BackgroundTask(models.Model):
                     running = TimeRecord.get_running()
                     if running is not None:
                         stopped = TimeRecord.stop(
-                            end_time=max(previous, running.start_time)
+                            end_time=max(previous, running.start_time),
+                            reason="suspend",
                         )
                     if on_suspend is not None:
                         on_suspend(previous, current, stopped)

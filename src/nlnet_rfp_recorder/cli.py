@@ -206,10 +206,11 @@ def _apply_edit_start(record: TimeRecord, new_start: datetime) -> None:
         record, (new_start, record.end_time), (new_start, moved_end)
     ):
         record.end_time = moved_end
+        record.stop_reason = "edit"
     elif new_start >= record.end_time:
         _fail("The new start must be before the end of the entry.")
     record.start_time = new_start
-    record.save(update_fields=["start_time", "end_time"])
+    record.save(update_fields=["start_time", "end_time", "stop_reason"])
 
 
 def _apply_edit_end(record: TimeRecord, new_end: datetime) -> None:
@@ -226,7 +227,8 @@ def _apply_edit_end(record: TimeRecord, new_end: datetime) -> None:
     elif new_end <= record.start_time:
         _fail("The new end must be after the start of the entry.")
     record.end_time = new_end
-    record.save(update_fields=["start_time", "end_time"])
+    record.stop_reason = "edit"
+    record.save(update_fields=["start_time", "end_time", "stop_reason"])
 
 
 def _task_name(record: TimeRecord) -> str:
@@ -1364,19 +1366,30 @@ def _timesheet_display_duration(duration: str) -> str:
     return f"{hh}:{mm:02d}"
 
 
-def _echo_timesheet_row(row: TimesheetRow) -> None:
+# Stop reasons from the background task - the only ones `timesheet show`
+# lists; entries the user stopped or edited need no explanation.
+BACKGROUND_STOP_REASONS = ("suspend", "restart")
+
+
+def _echo_timesheet_row(row: TimesheetRow, stop_reason: str = "") -> None:
     start = _timesheet_display_start(row.start)
     duration = _timesheet_display_duration(row.duration)
     link = row.link or "-"
     line = f"{row.pk} {row.mou} {row.task} {start} {duration} {link}"
     if row.tags:
         line += f" {row.tags}"
+    if stop_reason in BACKGROUND_STOP_REASONS:
+        line += f" {stop_reason}"
     typer.echo(line)
 
 
 @timesheet_app.command("show")
 def timesheet_show(db: Path | None = DbOption, test: bool = TestOption) -> None:
-    """List all time entries, one per line."""
+    """List all time entries, one per line.
+
+    The last column says why the background task stopped an entry
+    (suspend, restart); it is empty for entries stopped by you.
+    """
     _setup(db, test)
     from nlnet_rfp_recorder.timetracking.models import TimeRecord
 
@@ -1386,7 +1399,7 @@ def timesheet_show(db: Path | None = DbOption, test: bool = TestOption) -> None:
         return
 
     for record in records:
-        _echo_timesheet_row(record.row)
+        _echo_timesheet_row(record.row, record.stop_reason)
 
 
 @timesheet_app.command("export")
@@ -1540,7 +1553,11 @@ def status(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
     running = TimeRecord.get_running()
     if running is None:
-        typer.echo("Not running.")
+        last = TimeRecord.get_last()
+        if last is not None and last.stop_reason in BACKGROUND_STOP_REASONS:
+            typer.echo(f"Not running after {last.stop_reason}.")
+        else:
+            typer.echo("Not running.")
     else:
         url = running.link.url if running.link else ""
         typer.echo(f"Running: {url} ({_format_duration(running.duration)})")

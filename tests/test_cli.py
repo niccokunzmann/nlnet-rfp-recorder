@@ -5931,3 +5931,142 @@ def test_background_task_recovery_logs_when_no_entry_is_running(background_log):
         runner.invoke(app, ["background-task"])
 
     assert "No time entry is running, nothing to stop." in background_log.read_text()
+
+
+def test_stop_reason_is_user_by_default_and_after_rfp_stop():
+    record = _start_running_entry()
+    assert record.stop_reason == "user"
+
+    runner.invoke(app, ["stop"])
+
+    record.refresh_from_db()
+    assert record.end_time is not None
+    assert record.stop_reason == "user"
+
+
+def test_stop_reason_is_user_when_starting_another_entry():
+    record = _start_running_entry()
+
+    runner.invoke(app, ["start", "https://example.com/issues/2"])
+
+    record.refresh_from_db()
+    assert record.end_time is not None
+    assert record.stop_reason == "user"
+
+
+def test_stop_reason_is_edit_after_rfp_edit_end_and_start_move():
+    record = _stopped_record((1, 0), 120)
+
+    runner.invoke(app, ["edit", "--end", "1:30"], input="\n")
+    record.refresh_from_db()
+    assert record.stop_reason == "edit"
+
+    record.stop_reason = "user"
+    record.save()
+    runner.invoke(app, ["edit", "--start", "0:30"], input="m\n")
+    record.refresh_from_db()
+    assert record.stop_reason == "edit"
+
+
+def test_stop_reason_stays_user_when_edit_only_changes_the_start():
+    record = _stopped_record((1, 0), 120)
+
+    runner.invoke(app, ["edit", "--start", "0:30"], input="\n")
+
+    record.refresh_from_db()
+    assert record.stop_reason == "user"
+
+
+def test_stop_reason_is_edit_when_a_duration_edit_moves_the_end():
+    record = _stopped_record((1, 0), 120)
+
+    record.set_duration(timedelta(minutes=30), fix="start")
+
+    record.refresh_from_db()
+    assert record.stop_reason == "edit"
+
+
+def test_stop_reason_is_suspend_for_a_background_task_suspend():
+    from datetime import datetime
+
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    record = _start_running_entry()
+    record.start_time = datetime(2026, 10, 5)
+    record.save()
+    task = BackgroundTask.register()
+
+    task.watch(sleep=lambda s: None, now=_fake_clock(0, 1, 7201), ticks=2)
+
+    record.refresh_from_db()
+    assert record.stop_reason == "suspend"
+
+
+def test_stop_reason_is_restart_after_recovering_from_a_shutdown(background_log):
+    from datetime import datetime
+
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    record = _start_running_entry()
+    record.start_time = datetime(2026, 10, 5, 8)
+    record.save()
+    _dead_background_task(datetime(2026, 10, 5, 18, 30))
+
+    with patch.object(BackgroundTask, "watch", return_value=False):
+        runner.invoke(app, ["background-task"])
+
+    record.refresh_from_db()
+    assert record.stop_reason == "restart"
+
+
+def test_stop_reason_resets_to_user_when_an_entry_is_resumed():
+    record = _start_running_entry()
+    TimeRecord.stop(reason="suspend")
+
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    record.refresh_from_db()
+    assert record.is_running
+    assert record.stop_reason == "user"
+
+
+def test_timesheet_show_lists_background_stop_reasons_in_the_last_column():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+    TimeRecord.stop(reason="suspend")
+    runner.invoke(app, ["start", "https://example.com/issues/2"])
+    TimeRecord.stop(reason="restart")
+    runner.invoke(app, ["start", "https://example.com/issues/3"])
+    runner.invoke(app, ["stop"])
+    runner.invoke(app, ["start", "https://example.com/issues/4"])
+    TimeRecord.stop(reason="edit")
+
+    result = runner.invoke(app, ["timesheet", "show"])
+
+    lines = result.output.splitlines()
+    assert lines[0].endswith("implementation suspend")
+    assert lines[1].endswith("implementation restart")
+    assert lines[2].endswith("implementation")
+    assert lines[3].endswith("implementation")
+
+
+def test_status_says_not_running_after_a_background_stop():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    for reason, expected in (
+        ("suspend", "Not running after suspend."),
+        ("user", "Not running."),
+    ):
+        TimeRecord.stop(reason=reason)
+        result = runner.invoke(app, ["status"])
+        assert expected in result.output
+        assert result.output.count("Not running") == 1
+        runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    TimeRecord.stop(reason="restart")
+    assert "Not running after restart." in runner.invoke(app, ["status"]).output
+    TimeRecord.objects.update(stop_reason="edit")
+    assert "Not running." in runner.invoke(app, ["status"]).output

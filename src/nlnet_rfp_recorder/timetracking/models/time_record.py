@@ -48,6 +48,14 @@ class TimeSpan:
         return self.end - self.start
 
 
+STOP_REASONS = (
+    ("user", "user stopped it (`rfp stop`) or started another entry"),
+    ("edit", "its end was set by an edit (`rfp edit`, timesheet edit/import)"),
+    ("suspend", "the background task detected the machine suspending"),
+    ("restart", "the background task recovered from a shutdown or crash"),
+)
+
+
 class TimeRecordManager(models.Manager):
     def running(self) -> models.QuerySet[TimeRecord]:
         return self.filter(end_time__isnull=True)
@@ -69,6 +77,15 @@ class TimeRecord(models.Model):
         null=True,
         blank=True,
         help_text="When this time entry stopped, or None while it's still running.",
+    )
+    stop_reason = models.CharField(
+        max_length=7,
+        choices=STOP_REASONS,
+        default="user",
+        help_text=(
+            "Why this time entry was stopped: user, edit, suspend or "
+            "restart. 'user' while it is still running."
+        ),
     )
     report_line = models.ForeignKey(
         "ReportLine",
@@ -129,7 +146,8 @@ class TimeRecord(models.Model):
                     return same
                 cls.stop(end_time=start_time)
                 same.end_time = None
-                same.save(update_fields=["end_time"])
+                same.stop_reason = "user"
+                same.save(update_fields=["end_time", "stop_reason"])
                 return same
         link = Link.get_or_create_for_task(url, task)
         for tag in tags:
@@ -148,7 +166,8 @@ class TimeRecord(models.Model):
             and resumable.link_id == link.id
         ):
             resumable.end_time = None
-            resumable.save(update_fields=["end_time"])
+            resumable.stop_reason = "user"
+            resumable.save(update_fields=["end_time", "stop_reason"])
             return resumable
 
         return cls.objects.create(link=link, start_time=start_time or timezone.now())
@@ -178,14 +197,19 @@ class TimeRecord(models.Model):
 
     @classmethod
     def stop(
-        cls, url: str | None = None, end_time: datetime | None = None
+        cls,
+        url: str | None = None,
+        end_time: datetime | None = None,
+        reason: str = "user",
     ) -> TimeRecord | None:
+        """Stop the running entry, recording `reason` (one of STOP_REASONS)."""
         record = cls.get_running()
         if record is None:
             return None
         if url is not None and record.link is not None and record.link.task is not None:
             record.link = Link.get_or_create_for_task(url, record.link.task)
         record.end_time = end_time or timezone.now()
+        record.stop_reason = reason
         record.save()
         return record
 
@@ -299,7 +323,8 @@ class TimeRecord(models.Model):
             self.save(update_fields=["start_time"])
         else:
             self.end_time = self.start_time + duration
-            self.save(update_fields=["end_time"])
+            self.stop_reason = "edit"
+            self.save(update_fields=["end_time", "stop_reason"])
 
     def add_duration(
         self, delta: timedelta, fix: Literal["start", "end"] = "end"
@@ -378,7 +403,10 @@ class TimeRecord(models.Model):
 
         if row.pk is None:
             record = cls.objects.create(
-                link=link, start_time=start_time, end_time=end_time
+                link=link,
+                start_time=start_time,
+                end_time=end_time,
+                stop_reason="edit",
             )
         else:
             try:
@@ -387,11 +415,17 @@ class TimeRecord(models.Model):
                 if not allow_create_with_pk:
                     raise ValueError(f"No such time record: {row.pk}.") from None
                 record = cls.objects.create(
-                    pk=row.pk, link=link, start_time=start_time, end_time=end_time
+                    pk=row.pk,
+                    link=link,
+                    start_time=start_time,
+                    end_time=end_time,
+                    stop_reason="edit",
                 )
             else:
                 record.link = link
                 record.start_time = start_time
+                if record.end_time != end_time:
+                    record.stop_reason = "edit"
                 record.end_time = end_time
                 record.save()
 
