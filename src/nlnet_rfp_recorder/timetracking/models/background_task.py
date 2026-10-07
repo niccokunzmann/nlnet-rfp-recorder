@@ -78,6 +78,34 @@ class BackgroundTask(models.Model):
             started=now, last_seen=now, pid=os.getpid(), is_running=True
         )
 
+    @classmethod
+    def recover(
+        cls, now: datetime | None = None
+    ) -> tuple[BackgroundTask, TimeRecord | None] | None:
+        """Clean up after a background task that never shut down properly.
+
+        A task that died without unregistering (the machine was shut
+        down or crashed - no clean exit can be relied on) leaves its
+        row marked running. The time entry it was watching over then
+        gets the same treatment as for a suspend: it is ended at the
+        task's `last_seen`, the last moment the machine was known to be
+        up. An entry that started after that is left alone.
+
+        Returns the dead task's row and the entry that was stopped (or
+        None), or None if there is nothing to recover from - no previous
+        task, one that exited cleanly, or one that is still alive. Call
+        this before register(), which replaces the row.
+        """
+        previous = cls.get()
+        if previous is None or not previous.is_running or cls.is_alive(now):
+            return None
+        stopped = None
+        running = TimeRecord.get_running()
+        if running is not None and running.start_time < previous.last_seen:
+            stopped = TimeRecord.stop(end_time=previous.last_seen)
+        previous.unregister()
+        return previous, stopped
+
     def touch(self, now: datetime | None = None) -> None:
         self.last_seen = now or timezone.now()
         self.save(update_fields=["last_seen"])

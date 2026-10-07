@@ -73,6 +73,14 @@ pytestmark = pytest.mark.django_db
 runner = CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def background_log(tmp_path):
+    """Keep `rfp background-task` from logging into the real data dir."""
+    path = tmp_path / "rfp-background-task.log"
+    with patch("nlnet_rfp_recorder.cli._background_log_path", return_value=path):
+        yield path
+
+
 def _invoke_timesheet_import(*args: str, input: str | None = None):
     # The pytest-django test database is ":memory:", which shutil.copy2
     # can't back up - that path is covered for real in
@@ -5607,10 +5615,11 @@ def test_background_task_check_reports_status():
     task.unregister()
     result = runner.invoke(app, ["background-task", "--check"])
     assert result.exit_code == 1
-    assert "Not running" in result.output
+    assert "shut down cleanly" in result.output
+    assert "Awaiting recovery" not in result.output
 
 
-def test_background_task_refuses_to_start_twice():
+def test_background_task_refuses_to_start_twice(background_log):
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
 
     BackgroundTask.register()
@@ -5618,7 +5627,7 @@ def test_background_task_refuses_to_start_twice():
     result = runner.invoke(app, ["background-task"])
 
     assert result.exit_code == 1
-    assert "already running" in result.output
+    assert "already running" in background_log.read_text()
 
 
 def test_background_task_with_a_dead_pid_is_not_alive():
@@ -5634,7 +5643,7 @@ def test_background_task_with_a_dead_pid_is_not_alive():
     assert "Not running" in result.output
 
 
-def test_background_task_reports_the_suspend_and_the_stopped_entry(capsys):
+def test_background_task_reports_the_suspend_and_the_stopped_entry(caplog):
     from datetime import datetime
 
     from nlnet_rfp_recorder.cli import _report_suspend
@@ -5652,13 +5661,13 @@ def test_background_task_reports_the_suspend_and_the_stopped_entry(capsys):
         ticks=2,
     )
 
-    output = capsys.readouterr().out
+    output = caplog.text
     assert "Suspend detected at 00:00:01: 2 hours until 02:00:01." in output
     assert "Stopped " in output
     assert "https://example.com/issues/1" in output
 
 
-def test_background_task_reports_a_suspend_with_nothing_running(capsys):
+def test_background_task_reports_a_suspend_with_nothing_running(caplog):
     from nlnet_rfp_recorder.cli import _report_suspend
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
 
@@ -5671,7 +5680,7 @@ def test_background_task_reports_a_suspend_with_nothing_running(capsys):
         ticks=2,
     )
 
-    output = capsys.readouterr().out
+    output = caplog.text
     assert "Suspend detected" in output
     assert "5 minutes" in output
     assert "nothing to stop" in output
@@ -5696,7 +5705,7 @@ def test_background_task_watch_returns_true_when_the_schema_changed():
     assert run() is True
 
 
-def test_background_task_restarts_itself_when_the_schema_changed():
+def test_background_task_restarts_itself_when_the_schema_changed(background_log):
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
 
     with (
@@ -5706,7 +5715,7 @@ def test_background_task_restarts_itself_when_the_schema_changed():
         result = runner.invoke(app, ["background-task"])
 
     assert result.exit_code == 0, result.output
-    assert "Restarting" in result.output
+    assert "Restarting" in background_log.read_text()
     execv.assert_called_once()
     assert not BackgroundTask.is_alive()
 
@@ -5750,3 +5759,159 @@ def test_background_task_reraises_an_operational_error_without_a_schema_change()
 
     with pytest.raises(OperationalError):
         task.watch(sleep=lambda s: None, now=_fake_clock(0, 1, 7201), ticks=2)
+
+
+def test_background_task_logs_to_a_file_and_prints(background_log):
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    with patch.object(BackgroundTask, "watch", return_value=False):
+        result = runner.invoke(app, ["background-task"])
+
+    assert result.exit_code == 0, result.output
+    assert "Watching for suspend" in result.output
+    assert "Watching for suspend" in background_log.read_text()
+
+
+def test_background_task_log_prints_the_log_without_starting_a_task(background_log):
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    background_log.write_text("2026-10-06 20:00:00 INFO hello\n")
+
+    result = runner.invoke(app, ["background-task", "--log"])
+
+    assert result.exit_code == 0, result.output
+    assert "INFO hello" in result.output
+    assert BackgroundTask.get() is None
+
+
+def test_background_task_log_without_a_log_fails(background_log):
+    result = runner.invoke(app, ["background-task", "--log"])
+
+    assert result.exit_code == 1
+    assert "No log yet" in result.output
+
+
+def _dead_background_task(last_seen):
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    return BackgroundTask.objects.create(
+        started=last_seen - timedelta(hours=1),
+        last_seen=last_seen,
+        pid=2**22 + 12345,  # beyond the default pid_max: no such process
+        is_running=True,
+    )
+
+
+def test_background_task_recovers_after_an_unclean_shutdown(background_log):
+    from datetime import datetime
+
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    record = _start_running_entry()
+    record.start_time = datetime(2026, 10, 5, 8)
+    record.save()
+    last_seen = datetime(2026, 10, 5, 18, 30)
+    _dead_background_task(last_seen)
+
+    with patch.object(BackgroundTask, "watch", return_value=False):
+        result = runner.invoke(app, ["background-task"])
+
+    assert result.exit_code == 0, result.output
+    record.refresh_from_db()
+    assert record.end_time == last_seen
+    log = background_log.read_text()
+    assert "did not shut down cleanly" in log
+    assert "Stopped" in log
+    assert BackgroundTask.objects.count() == 1
+
+
+def test_background_task_recovery_leaves_a_newer_entry_running(background_log):
+    from datetime import datetime
+
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    record = _start_running_entry()
+    record.start_time = datetime(2026, 10, 6, 9)
+    record.save()
+    _dead_background_task(datetime(2026, 10, 5, 18, 30))
+
+    with patch.object(BackgroundTask, "watch", return_value=False):
+        runner.invoke(app, ["background-task"])
+
+    record.refresh_from_db()
+    assert record.is_running
+    assert "nothing to stop" in background_log.read_text()
+
+
+def test_background_task_no_recovery_after_a_clean_exit(background_log):
+    from datetime import datetime
+
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    record = _start_running_entry()
+    task = _dead_background_task(datetime(2026, 10, 5, 18, 30))
+    task.unregister()
+
+    with patch.object(BackgroundTask, "watch", return_value=False):
+        runner.invoke(app, ["background-task"])
+
+    record.refresh_from_db()
+    assert record.is_running
+    assert "did not shut down cleanly" not in background_log.read_text()
+
+
+def test_background_task_check_reports_a_killed_task_awaiting_recovery():
+    from datetime import datetime
+
+    _dead_background_task(datetime(2026, 10, 5, 18, 30))
+
+    result = runner.invoke(app, ["background-task", "--check"])
+
+    assert result.exit_code == 1
+    assert "did not shut down cleanly" in result.output
+    assert "Awaiting recovery" in result.output
+    assert "2026-10-05 18:30:00" in result.output
+    assert "rfp background-task --recover" in result.output
+
+
+def test_background_task_recover_recovers_and_loops_once(background_log):
+    from datetime import datetime
+    from unittest.mock import ANY
+
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    record = _start_running_entry()
+    record.start_time = datetime(2026, 10, 5, 8)
+    record.save()
+    _dead_background_task(datetime(2026, 10, 5, 18, 30))
+
+    with patch.object(BackgroundTask, "watch", return_value=False) as watch:
+        result = runner.invoke(app, ["background-task", "--recover"])
+
+    assert result.exit_code == 0, result.output
+    watch.assert_called_once_with(on_suspend=ANY, ticks=1)
+    record.refresh_from_db()
+    assert record.end_time == datetime(2026, 10, 5, 18, 30)
+    assert "did not shut down cleanly" in result.output
+    assert not BackgroundTask.is_alive()
+    assert not BackgroundTask.get().is_running
+    assert "RECOVER: " in result.output
+    assert "RECOVER: The previous background task" in background_log.read_text()
+
+
+def test_background_task_recover_aborts_while_a_task_is_running(background_log):
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    record = _start_running_entry()
+    BackgroundTask.register()
+
+    result = runner.invoke(app, ["background-task", "--recover"])
+
+    assert result.exit_code == 1
+    assert "already running" in result.output
+    record.refresh_from_db()
+    assert record.is_running
+    assert BackgroundTask.is_alive()
+    assert "RECOVER: A background task is already running" in (
+        background_log.read_text()
+    )

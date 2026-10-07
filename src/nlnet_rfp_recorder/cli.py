@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import sys
@@ -2189,6 +2190,86 @@ def _format_ago(elapsed: timedelta) -> str:
     return f"{seconds} seconds ago"
 
 
+BACKGROUND_TASK_LOG_NAME = "rfp-background-task.log"
+
+background_logger = logging.getLogger("nlnet_rfp_recorder.background_task")
+
+
+def _background_log_path() -> Path:
+    """The background task's log file, next to the database."""
+    from django.conf import settings
+
+    database_file = Path(settings.DATABASES["default"]["NAME"])
+    return database_file.with_name(BACKGROUND_TASK_LOG_NAME)
+
+
+def _log_stopped_entry(stopped: TimeRecord) -> None:
+    background_logger.info(
+        f"Stopped {_task_name(stopped)} at {stopped.end_time:%H:%M:%S} "
+        f"({_format_duration(stopped.duration)}) "
+        f"{stopped.link.url if stopped.link else ''}".rstrip()
+    )
+
+
+def _report_suspend(
+    previous: datetime, current: datetime, stopped: TimeRecord | None
+) -> None:
+    background_logger.info(
+        f"Suspend detected at {previous:%H:%M:%S}: "
+        f"{_format_ago(current - previous).removesuffix(' ago')} "
+        f"until {current:%H:%M:%S}."
+    )
+    if stopped is None:
+        background_logger.info("No time entry is running, nothing to stop.")
+    else:
+        _log_stopped_entry(stopped)
+
+
+def _recover_from_unclean_exit() -> None:
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    recovery = BackgroundTask.recover()
+    if recovery is None:
+        return
+    previous, stopped = recovery
+    background_logger.warning(
+        f"The previous background task (pid {previous.pid}, started "
+        f"{previous.started:%Y-%m-%d %H:%M:%S}) did not shut down cleanly "
+        f"(shutdown or crash). It was last seen at "
+        f"{previous.last_seen:%Y-%m-%d %H:%M:%S}."
+    )
+    if stopped is None:
+        background_logger.info("No time entry was running then, nothing to stop.")
+    else:
+        _log_stopped_entry(stopped)
+
+
+def _run_background_task(once: bool = False) -> None:
+    from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    try:
+        _recover_from_unclean_exit()
+        task = BackgroundTask.register()
+    except ValueError as error:
+        background_logger.error(str(error))
+        raise typer.Exit(code=1) from None
+    background_logger.info(f"Watching for suspend (pid {task.pid}).")
+    restart = False
+    try:
+        restart = task.watch(on_suspend=_report_suspend, ticks=1 if once else None)
+    except KeyboardInterrupt:
+        background_logger.info("Stopped.")
+    except Exception:
+        background_logger.exception("The background task crashed.")
+        raise
+    finally:
+        task.unregister()
+    if restart and not once:
+        background_logger.info("The database schema changed. Restarting.")
+        # Replaces this process, so the new code and models are loaded.
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
 @app.command("background-task")
 def background_task(
     check: bool = typer.Option(
@@ -2196,18 +2277,45 @@ def background_task(
         "--check",
         help="Only check whether a background task is running (exit code 1 if not).",
     ),
+    recover: bool = typer.Option(
+        False,
+        "--recover",
+        help=(
+            "Recover from a task that did not shut down cleanly (end the "
+            "running time entry), run the loop through once, and exit. "
+            "Aborts if a background task is running. Log messages are marked RECOVER:."
+        ),
+    ),
+    log: bool = typer.Option(
+        False,
+        "--log",
+        help="Only print the background task's log file, next to the database.",
+    ),
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
     """Stop the running time entry when the laptop goes to sleep.
 
-    Runs until interrupted with Ctrl-C. Every second it checks how much
-    time has passed; a gap of over a minute means the machine was
-    suspended, and the running entry is then ended at the last moment
-    before that. Reports that it is alive in the database every minute.
+    Meant to be started when your session starts. Runs until interrupted
+    with Ctrl-C. Every second it checks how much time has passed; a gap
+    of over a minute means the machine was suspended, and the running
+    entry is then ended at the last moment before that. Reports that it
+    is alive in the database every minute - if the previous run never
+    shut down cleanly (e.g. the machine was shut down), the entry it
+    was watching is ended at that last report when this starts. All
+    output goes to the terminal and to a log file next to the database
+    (see --log).
     """
     _setup(db, test)
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
+
+    log_path = _background_log_path()
+
+    if log:
+        if not log_path.is_file():
+            _fail(f"No log yet: {log_path} does not exist.")
+        typer.echo(log_path.read_text(), nl=False)
+        return
 
     if check:
         existing = BackgroundTask.get()
@@ -2220,42 +2328,35 @@ def background_task(
                 f"{existing.started:%Y-%m-%d %H:%M:%S}. Last check {ago}."
             )
             return
-        _fail(f"Not running (pid {existing.pid}). Last check {ago}.")
+        if existing.is_running:
+            _fail(
+                f"Not running (pid {existing.pid}), but it did not shut down "
+                f"cleanly. Last check {ago}. Awaiting recovery: the next "
+                f"start ends the running time entry at "
+                f"{existing.last_seen:%Y-%m-%d %H:%M:%S}. Run "
+                f"`rfp background-task --recover` to do that now."
+            )
+        _fail(f"Not running (pid {existing.pid}), shut down cleanly. Last check {ago}.")
 
+    # Messages of a manual --recover run are marked so they can be told
+    # apart from the real background task's in the shared log.
+    prefix = "RECOVER: " if recover else ""
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(logging.Formatter(f"{prefix}%(message)s"))
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setFormatter(
+        logging.Formatter(f"%(asctime)s %(levelname)s {prefix}%(message)s")
+    )
+    handlers: list[logging.Handler] = [stdout_handler, file_handler]
+    for handler in handlers:
+        background_logger.addHandler(handler)
+    background_logger.setLevel(logging.INFO)
     try:
-        task = BackgroundTask.register()
-    except ValueError as error:
-        _fail(str(error))
-    typer.echo("Watching for suspend. Press Ctrl-C to stop.")
-    restart = False
-    try:
-        restart = task.watch(on_suspend=_report_suspend)
-    except KeyboardInterrupt:
-        typer.echo("Stopped.")
+        _run_background_task(once=recover)
     finally:
-        task.unregister()
-    if restart:
-        typer.echo("The database schema changed. Restarting.")
-        # Replaces this process, so the new code and models are loaded.
-        os.execv(sys.executable, [sys.executable, *sys.argv])
-
-
-def _report_suspend(
-    previous: datetime, current: datetime, stopped: TimeRecord | None
-) -> None:
-    typer.echo(
-        f"Suspend detected at {previous:%H:%M:%S}: "
-        f"{_format_ago(current - previous).removesuffix(' ago')} "
-        f"until {current:%H:%M:%S}."
-    )
-    if stopped is None:
-        typer.echo("No time entry is running, nothing to stop.")
-        return
-    typer.echo(
-        f"Stopped {_task_name(stopped)} at {stopped.end_time:%H:%M:%S} "
-        f"({_format_duration(stopped.duration)}) "
-        f"{stopped.link.url if stopped.link else ''}".rstrip()
-    )
+        for handler in handlers:
+            background_logger.removeHandler(handler)
+            handler.close()
 
 
 @app.command()
