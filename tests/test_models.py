@@ -3848,3 +3848,23 @@ def test_resolve_link_sends_the_token_to_classify_issue_or_pr():
         resolve_link("ical/1782", token="secret")
 
     classify.assert_called_once_with("collective", "icalendar", 1782, token="secret")
+
+
+def test_find_last_combines_filters_and_none_disables_them():
+    mou_a = MoU.objects.create(name="a")
+    mou_b = MoU.objects.create(name="b")
+    task_a = Task.objects.create(name="10a", mou=mou_a)
+    task_b = Task.objects.create(name="10a", mou=mou_b)
+    Alias.objects.create(item_type="task", mou=mou_a, alias="x", target="10a")
+    first = TimeRecord.start("https://example.com/1", task=task_a)
+    TimeRecord.stop()
+    second = TimeRecord.start("https://example.com/2", task=task_b)
+    TimeRecord.stop()
+
+    assert TimeRecord.find_last() == second
+    assert TimeRecord.find_last(task="10a") == second
+    assert TimeRecord.find_last(task="10a", mou=mou_a) == first
+    assert TimeRecord.find_last(task="x", mou=mou_a) == first
+    assert TimeRecord.find_last(task=task_b) == second
+    assert TimeRecord.find_last(url="https://example.com/1") == first
+    assert TimeRecord.find_last(url="https://example.com/1", mou=mou_b) is None

@@ -1366,7 +1366,7 @@ def _timesheet_display_duration(duration: str) -> str:
     return f"{hh}:{mm:02d}"
 
 
-# Stop reasons from the background task - the only ones `timesheet show`
+# Stop reasons from the background task - the only ones `timesheet list`
 # lists; entries the user stopped or edited need no explanation.
 BACKGROUND_STOP_REASONS = ("suspend", "restart")
 
@@ -1383,8 +1383,8 @@ def _echo_timesheet_row(row: TimesheetRow, stop_reason: str = "") -> None:
     typer.echo(line)
 
 
-@timesheet_app.command("show")
-def timesheet_show(db: Path | None = DbOption, test: bool = TestOption) -> None:
+@timesheet_app.command("list")
+def timesheet_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """List all time entries, one per line.
 
     The last column says why the background task stopped an entry
@@ -1498,7 +1498,7 @@ def timesheet_remove(
 )
 def timesheet_edit(
     pk: int = typer.Argument(
-        ..., help="The time entry's id, as shown by `rfp timesheet show`."
+        ..., help="The time entry's id, as shown by `rfp timesheet list`."
     ),
     mou: str = typer.Argument(
         ..., autocompletion=_complete_mou_name, help="The MoU this entry belongs to."
@@ -2027,7 +2027,7 @@ def _resolve_edit_record(timesheet_pk: int | None) -> TimeRecord:
 
     Not given (None): the most recent entry, same as before this
     argument existed. A positive number is a literal time entry pk, as
-    shown by `rfp timesheet show`. A negative number instead counts
+    shown by `rfp timesheet list`. A negative number instead counts
     back from the most recent entry, Python-list-style: -1 is the most
     recent entry (same as not passing anything), -2 is the one before
     that, and so on.
@@ -2089,7 +2089,7 @@ def edit(
         None,
         metavar="[TIMESHEET_PK]",
         help=(
-            "Which time entry to edit: its pk (see `rfp timesheet show`), "
+            "Which time entry to edit: its pk (see `rfp timesheet list`), "
             "or a negative index counting back from the most recent entry "
             "(-1 = most recent, -2 = the one before that, ...). Defaults "
             "to the most recent entry."
@@ -2404,22 +2404,60 @@ def stop(
     _echo_stopped(record)
 
 
+def _find_record_to_continue(target: str) -> TimeRecord:
+    """The time entry `rfp continue TARGET` picks up: an entry id, the
+    last entry of a task name/alias, or the last entry of a url."""
+    from nlnet_rfp_recorder.timetracking.models import TimeRecord
+
+    if target.isdigit():
+        record = TimeRecord.objects.filter(pk=int(target)).first()
+        if record is None:
+            _fail(f"No time entry {target}.")
+        return record
+
+    if "/" in target or "." in target:
+        url = _resolve_link_or_fail(target)
+        record = TimeRecord.find_last(url=url)
+        if record is None:
+            _fail(f"{url} was never tracked. Use `rfp start {url}` instead.")
+        return record
+
+    record = TimeRecord.find_last(task=target)
+    if record is None:
+        _fail(f"No time entry found for task {target!r}.")
+    return record
+
+
 @app.command("continue")
-def continue_(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def continue_(
+    target: str | None = typer.Argument(
+        None,
+        autocompletion=_complete_task_or_link,
+        help="A time entry id, a task name/alias or a url already tracked.",
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
     """Start a new time entry for the same link as the last stopped one.
 
     Unlike `rfp start` on that same link - which reopens the existing
     entry - this always creates a fresh time entry, so a new work
     session becomes its own report line instead of merging into the last.
 
-    If a time entry is already running, nothing is created or stopped -
-    that entry is already "continuing" - this just reports it instead.
+    TARGET picks what to continue: a time entry id ("1361"), a task
+    name/alias (the url of that task's last entry) or a url (which must
+    have been tracked before - use `rfp start` for new ones). The
+    link's MoU and task are selected, switching MoU if needed.
+
+    If a time entry is already running, nothing is created or stopped
+    without a TARGET - that entry is already "continuing" - this just
+    reports it instead. With a TARGET, the running entry is stopped.
     """
     _setup(db, test)
-    from nlnet_rfp_recorder.timetracking.models import TimeRecord
+    from nlnet_rfp_recorder.timetracking.models import MoU, TimeRecord
 
     running = TimeRecord.get_running()
-    if running is not None:
+    if target is None and running is not None:
         url = running.link.url if running.link else ""
         typer.echo(
             f"Already running task {_task_name(running)}: {url} "
@@ -2428,7 +2466,13 @@ def continue_(db: Path | None = DbOption, test: bool = TestOption) -> None:
         return
 
     try:
-        record = TimeRecord.continue_last()
+        if target is None:
+            record = TimeRecord.continue_last()
+        else:
+            source = _find_record_to_continue(target)
+            if running is not None:
+                TimeRecord.stop()
+            record = TimeRecord.continue_record(source)
     except ValueError as error:
         _fail(str(error))
 
@@ -2437,6 +2481,9 @@ def continue_(db: Path | None = DbOption, test: bool = TestOption) -> None:
     )
     task = record.link.task
     if task is not None:
+        if task.mou is not None and not task.mou.selected:
+            MoU.select_existing(task.mou.name)
+            typer.echo(f"Switched to MoU: {task.mou.display_name}")
         # This link's task is the one just worked on again - same
         # invariant `_start` keeps (see its call to mark_selected).
         task.mark_selected()

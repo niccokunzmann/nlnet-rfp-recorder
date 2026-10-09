@@ -11,6 +11,7 @@ from django.utils import timezone
 
 from nlnet_rfp_recorder.timesheet import TimesheetRow, format_hhmmss, parse_hhmmss
 
+from .alias import Alias
 from .link import Link
 from .mou import MoU
 from .tag import TAG_NAMES
@@ -230,12 +231,47 @@ class TimeRecord(models.Model):
             raise ValueError(
                 "A time entry is already running. Stop it first (`rfp stop`)."
             )
-        if last.link is None:
-            raise ValueError("The last time entry has no link to continue.")
+        return cls.continue_record(last, start_time)
 
+    @classmethod
+    def continue_record(
+        cls, record: TimeRecord, start_time: datetime | None = None
+    ) -> TimeRecord:
+        """Start a brand new time entry for `record`'s link."""
+        if record.link is None:
+            raise ValueError("That time entry has no link to continue.")
         return cls.objects.create(
-            link=last.link, start_time=start_time or timezone.now()
+            link=record.link, start_time=start_time or timezone.now()
         )
+
+    @classmethod
+    def find_last(
+        cls,
+        task: Task | str | None = None,
+        mou: MoU | None = None,
+        url: str | None = None,
+    ) -> TimeRecord | None:
+        """The most recent entry matching every filter given.
+
+        A filter of None is disabled. `task` is a Task or a task
+        name/alias (aliases are looked up in `mou`, or in every MoU if
+        `mou` is None); `mou` is the MoU the entry's task belongs to;
+        `url` is the entry's exact link url.
+        """
+        records = cls.objects.all()
+        if isinstance(task, Task):
+            records = records.filter(link__task=task)
+        elif task is not None:
+            aliases = Alias.objects.filter(item_type="task", alias=task)
+            if mou is not None:
+                aliases = aliases.filter(mou=mou)
+            names = {task, *aliases.values_list("target", flat=True)}
+            records = records.filter(link__task__name__in=names)
+        if mou is not None:
+            records = records.filter(link__task__mou=mou)
+        if url is not None:
+            records = records.filter(link__url=url)
+        return records.order_by("-start_time").first()
 
     @classmethod
     def get_statistics(

@@ -1544,6 +1544,64 @@ def test_continue_shows_the_tasks_description_if_present():
     assert "Do the thing" in result.output
 
 
+def test_continue_with_entry_id_continues_that_entry():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/2"])
+    runner.invoke(app, ["stop"])
+    first = TimeRecord.objects.get(link__url="https://example.com/issues/1")
+
+    result = runner.invoke(app, ["continue", str(first.pk)])
+
+    assert result.exit_code == 0, result.output
+    running = TimeRecord.get_running()
+    assert running.link.url == "https://example.com/issues/1"
+    assert running.pk != first.pk
+
+
+def test_continue_with_unknown_entry_id_fails():
+    result = runner.invoke(app, ["continue", "9999"])
+
+    assert result.exit_code != 0
+    assert "No time entry 9999" in result.output
+
+
+def test_continue_with_unknown_url_refers_to_start():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["continue", "https://example.com/issues/7"])
+
+    assert result.exit_code != 0
+    assert "rfp start https://example.com/issues/7" in result.output
+    assert TimeRecord.objects.count() == 0
+
+
+def test_continue_with_url_switches_mou():
+    runner.invoke(app, ["mou", "add", "nlnet-2025"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
+    runner.invoke(app, ["stop"])
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["continue", "https://example.com/issues/1"])
+
+    assert result.exit_code == 0, result.output
+    assert MoU.get_selected().name == "nlnet-2025"
+    assert TimeRecord.get_running().link.url == "https://example.com/issues/1"
+
+
+def test_continue_with_task_uses_its_last_entry():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
+    runner.invoke(app, ["start", "10b", "https://example.com/issues/2"])
+    runner.invoke(app, ["stop"])
+
+    result = runner.invoke(app, ["continue", "10a"])
+
+    assert result.exit_code == 0, result.output
+    assert TimeRecord.get_running().link.url == "https://example.com/issues/1"
+    assert Task.objects.get(name="10a").selected is True
+
+
 def test_edit_without_any_time_entries_fails():
     result = runner.invoke(app, ["edit", "--url", "https://example.com/issues/1"])
 
@@ -1954,21 +2012,21 @@ def _time_record_pk() -> int:
     return TimeRecord.objects.get().pk
 
 
-def test_timesheet_show_reports_when_there_are_none():
-    result = runner.invoke(app, ["timesheet", "show"])
+def test_timesheet_list_reports_when_there_are_none():
+    result = runner.invoke(app, ["timesheet", "list"])
 
     assert result.exit_code == 0, result.output
     assert "No time entries" in result.output
 
 
-def test_timesheet_show_prints_one_line_per_entry():
+def test_timesheet_list_prints_one_line_per_entry():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
     runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
     runner.invoke(app, ["stop"])
     pk = _time_record_pk()
 
-    result = runner.invoke(app, ["timesheet", "show"])
+    result = runner.invoke(app, ["timesheet", "list"])
 
     assert result.exit_code == 0, result.output
     line = result.output.strip()
@@ -1980,10 +2038,10 @@ def test_timesheet_show_prints_one_line_per_entry():
     assert start_field.count(":") == 1  # HH:MM only, no seconds
 
 
-def test_timesheet_show_uses_a_dash_for_an_entry_without_a_link():
+def test_timesheet_list_uses_a_dash_for_an_entry_without_a_link():
     TimeRecord.objects.create(start_time=timezone.now(), end_time=timezone.now())
 
-    result = runner.invoke(app, ["timesheet", "show"])
+    result = runner.invoke(app, ["timesheet", "list"])
 
     assert result.exit_code == 0, result.output
     assert result.output.strip().endswith(" -")
@@ -4874,8 +4932,8 @@ def test_timesheet_help_lists_subcommands_alphabetically():
         "edit",
         "export",
         "import",
+        "list",
         "remove",
-        "show",
     ]
 
 
@@ -6030,7 +6088,7 @@ def test_stop_reason_resets_to_user_when_an_entry_is_resumed():
     assert record.stop_reason == "user"
 
 
-def test_timesheet_show_lists_background_stop_reasons_in_the_last_column():
+def test_timesheet_list_lists_background_stop_reasons_in_the_last_column():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
     runner.invoke(app, ["start", "https://example.com/issues/1"])
@@ -6042,7 +6100,7 @@ def test_timesheet_show_lists_background_stop_reasons_in_the_last_column():
     runner.invoke(app, ["start", "https://example.com/issues/4"])
     TimeRecord.stop(reason="edit")
 
-    result = runner.invoke(app, ["timesheet", "show"])
+    result = runner.invoke(app, ["timesheet", "list"])
 
     lines = result.output.splitlines()
     assert lines[0].endswith("implementation suspend")
