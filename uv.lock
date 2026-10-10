@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.14"
 
 [[package]]
@@ -310,6 +310,7 @@ dependencies = [
     { name = "django" },
     { name = "django-environ" },
     { name = "niquests" },
+    { name = "termgraph" },
     { name = "typer" },
 ]
 
@@ -328,6 +329,7 @@ requires-dist = [
     { name = "django", specifier = ">=5.1" },
     { name = "django-environ" },
     { name = "niquests", specifier = ">=3.21.1" },
+    { name = "termgraph", specifier = ">=0.7.6" },
     { name = "typer", specifier = ">=0.15" },
 ]
 
@@ -576,6 +578,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/5f/d3/3f06a1006f2261d1342aefb3c71eed02f5d4ca5bdbecd86ebc12ad38306e/sqlparse-0.6.0.tar.gz", hash = "sha256:113c35c75365ab9cc9c7231d68c6428fb11c085fc8e9eb1ad659b7ddbf6cd2b9", size = 178477, upload-time = "2026-08-13T19:16:06.396Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d9/50/f00935da0ec7cbf325f8dc4f772ae46fbc7b672dd62876e73f0a94adda57/sqlparse-0.6.0-py3-none-any.whl", hash = "sha256:b861c0288ce2fa56209a9a6412d2e066ac664b3873b89c26c9d8415e8e32996f", size = 50070, upload-time = "2026-08-13T19:16:04.062Z" },
+]
+
+[[package]]
+name = "termgraph"
+version = "0.7.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/38/d6/43a42797431d299a4b09b3b9fcdbcdea9a762231f6037c5660a9125e33f0/termgraph-0.7.6.tar.gz", hash = "sha256:0a86f6033cec461785ca4ffae19b394c788820fa9beab17f9d2eb83068e1fe60", size = 463933, upload-time = "2026-03-25T05:19:25.831Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/34/02/7d15699fc4d431443e6f1217c22a130b129a866a5f88164fedfab7fe39f2/termgraph-0.7.6-py3-none-any.whl", hash = "sha256:c9dc8b10189462b511ba076c484cf6e3c389e7c2d40f170f09489dd101148398", size = 18627, upload-time = "2026-03-25T05:19:24.682Z" },
 ]
 
 [[package]]

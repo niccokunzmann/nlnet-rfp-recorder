@@ -3868,3 +3868,14 @@ def test_find_last_combines_filters_and_none_disables_them():
     assert TimeRecord.find_last(task=task_b) == second
     assert TimeRecord.find_last(url="https://example.com/1") == first
     assert TimeRecord.find_last(url="https://example.com/1", mou=mou_b) is None
+
+
+def test_count_workdays_skips_weekends():
+    from datetime import date
+
+    from nlnet_rfp_recorder.timetracking.models.mou import count_workdays
+
+    # 2026-10-05 is a Monday.
+    assert count_workdays(date(2026, 10, 5), date(2026, 10, 11)) == 5
+    assert count_workdays(date(2026, 10, 10), date(2026, 10, 11)) == 0
+    assert count_workdays(date(2026, 10, 5), date(2026, 10, 4)) == 0

@@ -2,7 +2,7 @@ import csv
 import io
 import os
 import re
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -4966,9 +4966,11 @@ def test_mou_help_lists_subcommands_alphabetically():
     assert result.exit_code == 0, result.output
     assert _subcommand_names("mou") == [
         "add",
+        "deadline",
         "export",
         "import",
         "list",
+        "plot",
         "remove",
         "select",
         "status",
@@ -4983,6 +4985,7 @@ def test_task_help_lists_subcommands_alphabetically():
         "export",
         "import",
         "list",
+        "plot",
         "remove",
         "select",
         "set",
@@ -6128,3 +6131,438 @@ def test_status_says_not_running_after_a_background_stop():
     assert "Not running after restart." in runner.invoke(app, ["status"]).output
     TimeRecord.objects.update(stop_reason="edit")
     assert "Not running." in runner.invoke(app, ["status"]).output
+
+
+def test_mou_deadline_can_be_set_shown_and_cleared():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    assert "No deadline" in runner.invoke(app, ["mou", "deadline"]).output
+    result = runner.invoke(app, ["mou", "deadline", "2099-01-31"])
+    assert result.exit_code == 0, result.output
+    assert "Deadline: 2099-01-31" in result.output
+    assert "Deadline: 2099-01-31" in runner.invoke(app, ["mou", "status"]).output
+
+    runner.invoke(app, ["mou", "deadline", "--clear"])
+    assert "Deadline" not in runner.invoke(app, ["mou", "status"]).output
+
+
+def test_mou_deadline_rejects_an_invalid_date():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["mou", "deadline", "next week"])
+
+    assert result.exit_code != 0
+
+
+def test_plot_calendar_fails_without_time_records():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["mou", "plot", "calendar"])
+
+    assert result.exit_code != 0
+
+
+def _record_an_hour_for_plot():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+
+def test_plot_calendar_shows_a_heat_map_of_worked_time():
+    _record_an_hour_for_plot()
+
+    result = runner.invoke(app, ["mou", "plot", "calendar"])
+
+    assert result.exit_code == 0, result.output
+    assert "Hours worked on nlnet-2026" in result.output
+    assert "Mon" in result.output
+
+
+def test_split_bar_always_adds_up_to_the_width():
+    from nlnet_rfp_recorder.cli import _split_bar
+
+    assert _split_bar([1, 1, 1], 10) == [4, 3, 3]
+    assert sum(_split_bar([7.3, 0.2, 99.1], 77)) == 77
+    assert _split_bar([0, 0, 0], 10) == [0, 0, 0]
+
+
+def test_task_plot_complete_shows_stacked_bars(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a", max_budget=300.0)
+    task.set_budget(200.0)
+
+    result = runner.invoke(app, ["task", "plot", "complete"])
+
+    assert result.exit_code == 0, result.output
+    assert "10a" in result.output
+    assert "worked" in result.output
+    assert "max" in result.output
+
+
+def test_task_plot_complete_fails_without_tasks():
+    MoU.objects.create(name="nlnet-2026")
+
+    result = runner.invoke(app, ["task", "plot", "complete"])
+
+    assert result.exit_code != 0
+
+
+def test_task_plot_complete_bars_align_and_skip_tasks_without_budget():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="10a", max_budget=300.0).set_budget(100.0)
+    Task.objects.create(mou=mou, name="10b", max_budget=30.0)
+    Task.objects.create(mou=mou, name="10c", max_budget=50.0).set_budget(0.0)
+
+    result = runner.invoke(app, ["task", "plot", "complete"])
+
+    assert result.exit_code == 0, result.output
+    bars = {
+        line[:3]: line.count("█")
+        for line in result.output.splitlines()
+        if line[:3] in ("10a", "10b", "10c")
+    }
+    assert bars == {"10a": 50, "10b": 50}
+
+
+def test_task_plot_complete_separates_task_groups_with_a_blank_line():
+    mou = MoU.objects.create(name="nlnet-2026")
+    for name in ("5f", "5g", "6a"):
+        Task.objects.create(mou=mou, name=name, max_budget=100.0)
+
+    result = runner.invoke(app, ["task", "plot", "complete"])
+
+    assert result.exit_code == 0, result.output
+    lines = [line[:2].strip() for line in result.output.splitlines()[2:]]
+    assert lines == ["5", "5f", "5g", "", "6", "6a"]
+
+
+def test_task_plot_complete_fits_the_terminal_width(monkeypatch):
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="1i", max_budget=300.0)
+    Alias.create("task", "1i", "ical-rfc-compat", mou=mou)
+    task.set_budget(200.0)
+    monkeypatch.setenv("COLUMNS", "60")
+
+    result = runner.invoke(app, ["task", "plot", "complete"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert max(len(line) for line in lines) <= 60
+    assert any(line.count("█") >= 15 for line in lines)
+
+
+def test_plot_calendar_is_cut_to_the_terminal_width(monkeypatch):
+    _record_an_hour_for_plot()
+    monkeypatch.setenv("COLUMNS", "30")
+
+    result = runner.invoke(app, ["mou", "plot", "calendar"])
+
+    assert result.exit_code == 0, result.output
+    mon = next(line for line in result.output.splitlines() if line.startswith("Mon"))
+    assert len(re.sub(r"\x1b\[[0-9;]*m", "", mon)) <= 30
+
+
+def _mou_for_plot_complete(settings, started_days_ago, deadline_in_days):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(
+        name="nlnet-2026", deadline=date.today() + timedelta(days=deadline_in_days)
+    )
+    task = Task.objects.create(mou=mou, name="10a", max_budget=1000.0, used_budget=100)
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    start = timezone.now() - timedelta(days=started_days_ago)
+    TimeRecord.objects.create(
+        link=link, start_time=start, end_time=start + timedelta(hours=5)
+    )
+
+
+def test_mou_plot_complete_says_how_far_behind_schedule_you_are(settings):
+    # Half the time is over, so 500€ should be used; 100€ + 5h * 20€ = 200€ are.
+    _mou_for_plot_complete(settings, 10, 10)
+
+    result = runner.invoke(app, ["mou", "plot", "complete"])
+
+    assert result.exit_code == 0, result.output
+    assert "1000€" in result.output
+    assert "submitted 100€" in result.output
+    assert "worked 100€" in result.output
+    assert "15:00 hours behind schedule." in result.output
+    # 5h tracked over 11 days; 400€ = 20h left over the days until the deadline.
+    assert "Average total" in result.output
+    assert "Average 30 days" in result.output
+    assert "daily work (Mo-Fr)" in result.output
+    assert "weekly work" in result.output
+    assert "Required for completion" in result.output
+
+
+def test_mou_plot_complete_says_when_you_are_in_front(settings):
+    _mou_for_plot_complete(settings, 10, 10000)
+
+    result = runner.invoke(app, ["mou", "plot", "complete"])
+
+    assert result.exit_code == 0, result.output
+    assert "in front of schedule." in result.output
+
+
+def test_mou_plot_complete_asks_for_a_deadline(settings):
+    _mou_for_plot_complete(settings, 10, 10)
+    MoU.objects.update(deadline=None)
+
+    result = runner.invoke(app, ["mou", "plot", "complete"])
+
+    assert result.exit_code == 0, result.output
+    assert "deadline" in result.output
+
+
+def test_task_plot_complete_shows_submitted_and_worked_separately(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a", max_budget=400.0, used_budget=100)
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=5), end_time=now
+    )
+
+    result = runner.invoke(app, ["task", "plot", "complete"])
+
+    assert result.exit_code == 0, result.output
+    assert "submitted" in result.output
+    assert "worked" in result.output
+
+
+def test_mou_plot_weeks_shows_required_and_recent_weeks(settings):
+    _mou_for_plot_complete(settings, 10, 10)
+
+    result = runner.invoke(app, ["mou", "plot", "weeks"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[0] == "Weeks since the start:"
+    assert "required for completion" in lines[1]
+    assert "this week (actual)" in lines[2]
+    assert "this week (projected)" in lines[3]
+    assert "last week (" in lines[4]
+    assert "2 weeks ago (" not in result.output
+    assert len(lines) == 5
+
+
+def test_mou_plot_weeks_marks_missing_hours_red_after_yellow(settings, monkeypatch):
+    _mou_for_plot_complete(settings, 10, 10)
+    monkeypatch.setenv("COLUMNS", "80")
+
+    result = runner.invoke(app, ["mou", "plot", "weeks"], color=True)
+
+    assert result.exit_code == 0, result.output
+    row = next(line for line in result.output.splitlines() if "last week" in line)
+    assert row.index("\x1b[33m") < row.index("\x1b[31m")
+
+
+def test_mou_plot_weeks_fails_without_rate(settings):
+    _mou_for_plot_complete(settings, 10, 10)
+    settings.RFP_EUROS_PER_HOUR = None
+
+    result = runner.invoke(app, ["mou", "plot", "weeks"])
+
+    assert result.exit_code != 0
+
+
+def test_task_plot_complete_shows_right_aligned_budget_amounts():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="1a", max_budget=1200.0, used_budget=50)
+    Task.objects.create(mou=mou, name="1b", max_budget=300.0, used_budget=5)
+
+    result = runner.invoke(app, ["task", "plot", "complete"])
+
+    assert result.exit_code == 0, result.output
+    rows = [line for line in result.output.splitlines() if line.startswith("1")]
+    # The group line "1" first, with the totals of 1a and 1b.
+    assert "55€ / 1500€ :" in rows[0]
+    assert "  50€ / 1200€ :" in rows[1]
+    assert "   5€ /  300€ :" in rows[2]
+    assert rows[1].index("€") == rows[2].index("€")
+
+
+def test_task_plot_complete_hours_replaces_euros_with_time(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="1a", max_budget=1200.0, used_budget=50)
+    Task.objects.create(mou=mou, name="1b", max_budget=300.0, used_budget=5)
+
+    result = runner.invoke(app, ["task", "plot", "complete", "--hours"])
+
+    assert result.exit_code == 0, result.output
+    assert "€" not in result.output
+    rows = [line for line in result.output.splitlines() if line.startswith("1")]
+    assert " 2:30 / 60:00 :" in rows[1]
+    assert " 0:15 / 15:00 :" in rows[2]
+
+
+def test_mou_plot_weeks_aligns_bars_and_pads_dates_with_spaces(settings):
+    _mou_for_plot_complete(settings, 10, 10)
+
+    result = runner.invoke(app, ["mou", "plot", "weeks"])
+
+    lines = result.output.splitlines()[1:]
+    assert len({line.index(" : ") for line in lines}) == 1
+    assert any(re.search(r"\( ?\d+\. ?\d+\.\d{4} - ", line) for line in lines)
+
+
+def test_mou_plot_weeks_shows_actual_and_projected_this_week(settings, monkeypatch):
+    import datetime as dt
+
+    import nlnet_rfp_recorder.cli as cli
+
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    monday = dt.datetime(2026, 10, 5)
+    thursday_noon = monday + dt.timedelta(days=3.5)
+
+    class FrozenDatetime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return thursday_noon
+
+    class FrozenDate(dt.date):
+        @classmethod
+        def today(cls):
+            return thursday_noon.date()
+
+    monkeypatch.setattr(cli, "datetime", FrozenDatetime)
+    monkeypatch.setattr(cli, "date", FrozenDate)
+    mou = MoU.objects.create(name="nlnet-2026", deadline=dt.date(2026, 12, 1))
+    task = Task.objects.create(mou=mou, name="10a", max_budget=1000.0)
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    # 6h worked in the first 3.5 days of the week -> 12h projected for 7 days.
+    TimeRecord.objects.create(
+        link=link, start_time=monday, end_time=monday + dt.timedelta(hours=6)
+    )
+
+    result = runner.invoke(app, ["mou", "plot", "weeks"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert "6:00  this week (actual)" in lines[2]
+    assert "12:00  this week (projected)" in lines[3]
+
+
+def test_complete_task_name_only_offers_the_selected_mous_ids_and_aliases():
+    from nlnet_rfp_recorder.cli import _complete_task_name
+
+    other = MoU.objects.create(name="nlnet-2025")
+    Task.objects.create(mou=other, name="10z")
+    Alias.create("task", "10z", "old-thing", mou=other)
+    mou = MoU.select("nlnet-2026")
+    Task.objects.create(mou=mou, name="10a")
+    Alias.create("task", "10a", "vcard", mou=mou)
+
+    assert _complete_task_name("10") == ["10a"]
+    assert _complete_task_name("v") == ["vcard"]
+    assert _complete_task_name("old") == []
+
+
+def test_complete_task_name_offers_nothing_without_a_selected_mou():
+    from nlnet_rfp_recorder.cli import _complete_task_name
+
+    mou = MoU.objects.create(name="nlnet-2026", selected=False)
+    Task.objects.create(mou=mou, name="10a")
+
+    assert _complete_task_name("10") == []
+
+
+def test_task_plot_complete_marks_spending_over_the_budget(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(
+        mou=mou, name="10a", max_budget=400.0, used_budget=150
+    ).set_budget(100.0)
+
+    result = runner.invoke(app, ["task", "plot", "complete"], color=True)
+
+    assert result.exit_code == 0, result.output
+    assert "over budget" in result.output
+    row = next(line for line in result.output.splitlines() if line.startswith("10a"))
+    assert "\x1b[93m" in row  # light yellow: the 50€ over the 100€ budget
+
+
+def test_task_plot_complete_amount_is_bright_green_when_all_is_submitted(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    submitted = Task.objects.create(
+        mou=mou, name="1a", max_budget=400.0, used_budget=80
+    )
+    submitted.set_budget(200.0)
+    worked = Task.objects.create(mou=mou, name="2a", max_budget=400.0)
+    worked.set_budget(200.0)
+    link = Link.objects.create(task=worked, url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=2), end_time=now
+    )
+
+    result = runner.invoke(app, ["task", "plot", "complete"], color=True)
+
+    assert result.exit_code == 0, result.output
+    row_1a = next(line for line in result.output.splitlines() if line.startswith("1a"))
+    row_2a = next(line for line in result.output.splitlines() if line.startswith("2a"))
+    assert "\x1b[92m80€" in row_1a
+    assert "\x1b[38;5;28m" in row_2a
+
+
+def test_task_plot_complete_budget_amount_matches_used_when_none_is_left(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(
+        mou=mou, name="1a", max_budget=400.0, used_budget=200
+    ).set_budget(200.0)
+    Task.objects.create(
+        mou=mou, name="2a", max_budget=400.0, used_budget=100
+    ).set_budget(200.0)
+
+    result = runner.invoke(app, ["task", "plot", "complete"], color=True)
+
+    rows = {
+        line[:2]: line
+        for line in result.output.splitlines()
+        if line[:2] in ("1a", "2a")
+    }
+    assert "\x1b[92m200€\x1b[0m / \x1b[92m200€" in rows["1a"]  # nothing left
+    assert "\x1b[93m200€" not in rows["1a"]
+    assert "/ \x1b[33m200€" in rows["2a"]  # 100€ left
+
+
+def test_task_plot_complete_amounts_turn_yellow_and_red_when_over_budget(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    over = Task.objects.create(mou=mou, name="1a", max_budget=400.0, used_budget=300)
+    over.set_budget(200.0)
+
+    result = runner.invoke(app, ["task", "plot", "complete"], color=True)
+
+    row = next(line for line in result.output.splitlines() if line.startswith("1a"))
+    assert "\x1b[93m300€\x1b[0m / \x1b[31m200€" in row
+
+
+def test_task_plot_complete_percent_shows_percent_of_the_maximum():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(
+        mou=mou, name="1a", max_budget=400.0, used_budget=100
+    ).set_budget(200.0)
+
+    result = runner.invoke(app, ["task", "plot", "complete", "--percent"])
+
+    assert result.exit_code == 0, result.output
+    assert "€" not in result.output
+    rows = [line for line in result.output.splitlines() if line.startswith("1")]
+    assert "25% / 50% :" in rows[1]
+
+
+def test_task_plot_complete_rejects_hours_together_with_percent():
+    MoU.objects.create(name="nlnet-2026")
+
+    result = runner.invoke(app, ["task", "plot", "complete", "--hours", "--percent"])
+
+    assert result.exit_code != 0

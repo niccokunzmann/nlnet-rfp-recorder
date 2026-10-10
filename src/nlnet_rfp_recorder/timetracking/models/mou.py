@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import datetime
 import io
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,16 @@ TASK_CSV_FIELDNAMES = [
     "used_budget",
     "description",
 ]
+
+
+def count_workdays(first: datetime.date, last: datetime.date) -> int:
+    """Mondays to Fridays from `first` to `last`, both included."""
+    days = (last - first).days + 1
+    return sum(
+        1
+        for offset in range(max(days, 0))
+        if (first + datetime.timedelta(days=offset)).weekday() < 5
+    )
 
 
 def _is_blank_row(row: dict[str, str | None]) -> bool:
@@ -66,6 +77,15 @@ class MoU(models.Model):
             "document, not a short value - unbounded rather than a short "
             "CharField), used to regenerate each task's budget and shown "
             "by `rfp mou export`."
+        ),
+    )
+
+    deadline = models.DateField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The date until which all assigned personal budget needs to "
+            "be used up. Set via `rfp mou deadline`."
         ),
     )
 
@@ -258,12 +278,118 @@ class MoU(models.Model):
         return sum(amount or 0.0 for amount in amounts)
 
     @property
+    def total_personal_budget(self) -> float | None:
+        """Sum of the tasks' effective personal budgets (EUR), if any is known."""
+        amounts = [task.effective_personal_budget for task in self.tasks.all()]
+        if not amounts or all(amount is None for amount in amounts):
+            return None
+        return sum(amount or 0.0 for amount in amounts)
+
+    @property
     def total_used(self) -> float:
         return sum(task.used_budget + (task.budget or 0.0) for task in self.tasks.all())
 
     @property
+    def personal_budget_left(self) -> float:
+        """Assigned personal budget (EUR) not used up yet, over all tasks."""
+        left = 0.0
+        for task in self.tasks.all():
+            line = task.budget_line
+            if line is not None:
+                left += max(line.remaining, 0.0)
+        return left
+
+    @property
+    def tracked_duration(self) -> datetime.timedelta:
+        """All time tracked on this MoU's tasks, reported or not."""
+        from .time_record import TimeRecord
+
+        records = TimeRecord.objects.filter(link__task__mou=self)
+        return sum((record.duration for record in records), datetime.timedelta())
+
+    def hours_worked(self, first: datetime.date, last: datetime.date) -> float:
+        """Hours tracked on this MoU's tasks from `first` to `last` (both
+        included; the part of an entry outside is not counted).
+        """
+        from .time_record import TimeRecord
+
+        spans = TimeRecord.get_statistics(first, last + datetime.timedelta(days=1))
+        seconds = sum(
+            span.duration.total_seconds()
+            for span in spans
+            if span.record.link is not None
+            and span.record.link.task is not None
+            and span.record.link.task.mou_id == self.pk
+        )
+        return seconds / 3600
+
+    def required_hours_per_week(
+        self, rate: float, today: datetime.date | None = None
+    ) -> float | None:
+        """Weekly hours still needed to use up the personal budget by the
+        deadline, or None without a deadline or personal budget. Zero once
+        the budget is used up, and everything still left once the
+        deadline has passed.
+        """
+        total = self.total_personal_budget
+        if self.deadline is None or total is None:
+            return None
+        today = today or datetime.date.today()
+        left = max(total - self.submitted_budget - self.worked_budget, 0.0) / rate
+        weeks_left = ((self.deadline - today).days + 1) / 7
+        return left / weeks_left if weeks_left > 0 else left
+
+    @property
+    def submitted_budget(self) -> float:
+        """Budget (EUR) already submitted: the baseline plus reported time."""
+        return sum(task.used_budget + task.reported_budget for task in self.tasks.all())
+
+    @property
+    def worked_budget(self) -> float:
+        """Budget (EUR) of tracked time not submitted in a report yet."""
+        return sum(
+            (task.budget or 0.0) - task.reported_budget for task in self.tasks.all()
+        )
+
+    def expected_budget(self, today: datetime.date | None = None) -> float | None:
+        """Where the used budget should be today if the personal budget is
+        used up evenly from the start date to the deadline, or None
+        without a start date, deadline or personal budget.
+        """
+        start = self.start_date
+        total = self.total_personal_budget
+        if start is None or self.deadline is None or total is None:
+            return None
+        today = today or datetime.date.today()
+        duration = (self.deadline - start).days
+        if duration <= 0:
+            return total
+        elapsed = min(max((today - start).days, 0), duration)
+        return total * elapsed / duration
+
+    @property
+    def start_date(self) -> datetime.date | None:
+        """Date of the first time record on any of this MoU's tasks."""
+        from .time_record import TimeRecord
+
+        first = (
+            TimeRecord.objects.filter(link__task__mou=self)
+            .order_by("start_time")
+            .first()
+        )
+        if first is None:
+            return None
+        return first.start_time.date()
+
+    def days_to_deadline(self, today: datetime.date | None = None) -> int | None:
+        """Days from `today` until the deadline (negative once passed)."""
+        if self.deadline is None:
+            return None
+        return (self.deadline - (today or datetime.date.today())).days
+
+    @property
     def budget_line(self) -> BudgetLine | None:
-        total = self.total_budget
+        total = self.total_personal_budget
         if total is None:
             return None
         return BudgetLine(

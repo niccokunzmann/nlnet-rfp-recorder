@@ -10,6 +10,7 @@ dependencies = [
     "django>=5.1",
     "django-environ",
     "niquests>=3.21.1",
+    "termgraph>=0.7.6",
     "typer>=0.15",
 ]
 

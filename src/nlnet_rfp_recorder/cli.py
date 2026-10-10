@@ -1,11 +1,12 @@
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
 import warnings
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from importlib.metadata import version as get_version
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
@@ -463,18 +464,22 @@ def _complete_mou_name(incomplete: str) -> list[str]:
 
 
 def _complete_task_name(incomplete: str) -> list[str]:
+    """Task ids and aliases that are valid in the selected MoU."""
     try:
         django.setup()
-        from nlnet_rfp_recorder.timetracking.models import Alias, Task
+        from nlnet_rfp_recorder.timetracking.models import Alias, MoU, Task
 
+        mou = MoU.get_selected()
+        if mou is None:
+            return []
         names = list(
-            Task.objects.filter(name__startswith=incomplete).values_list(
+            Task.objects.filter(mou=mou, name__startswith=incomplete).values_list(
                 "name", flat=True
             )
         )
         aliases = list(
             Alias.objects.filter(
-                item_type="task", alias__startswith=incomplete
+                item_type="task", mou=mou, alias__startswith=incomplete
             ).values_list("alias", flat=True)
         )
         return names + aliases
@@ -730,6 +735,20 @@ def _echo_mou_status(mou: MoU) -> None:
     typer.echo(f"MoU: {mou.display_name}")
     if mou.budget_line is not None:
         typer.echo(str(mou.budget_line))
+    if mou.start_date is not None:
+        typer.echo(f"Started: {mou.start_date}")
+    days = mou.days_to_deadline()
+    if days is not None:
+        if days < 0:
+            when = f"{-days} day(s) ago"
+        elif days == 0:
+            when = "today"
+        else:
+            when = f"in {days} day(s)"
+        typer.echo(f"Deadline: {mou.deadline} ({when})")
+        left = mou.personal_budget_left
+        if left > 0:
+            typer.echo(f"Personal budget to use up by then: {left:.0f}€")
 
 
 @mou_app.command("status")
@@ -741,6 +760,47 @@ def mou_status(db: Path | None = DbOption, test: bool = TestOption) -> None:
     selected = MoU.get_selected()
     if selected is None:
         _fail("No MoU selected. Run `rfp mou add <name>` first.")
+
+    _echo_mou_status(selected)
+
+
+@mou_app.command("deadline")
+def mou_deadline(
+    date: str | None = typer.Argument(
+        None, help="Deadline as YYYY-MM-DD. Omit to show the current one."
+    ),
+    clear: bool = typer.Option(False, "--clear", help="Remove the deadline."),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Show, set or clear the selected MoU's deadline.
+
+    The deadline is the date until which all assigned personal budget
+    needs to be used up.
+    """
+    _setup(db, test)
+    from datetime import date as date_type
+
+    from nlnet_rfp_recorder.timetracking.models import MoU
+
+    selected = MoU.get_selected()
+    if selected is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+
+    if clear and date is not None:
+        _fail("Give either a date or --clear, not both.")
+    if clear:
+        selected.deadline = None
+        selected.save(update_fields=["deadline"])
+    elif date is not None:
+        try:
+            selected.deadline = date_type.fromisoformat(date)
+        except ValueError:
+            _fail(f"Invalid date {date!r}, expected YYYY-MM-DD.")
+        selected.save(update_fields=["deadline"])
+    elif selected.deadline is None:
+        typer.echo("No deadline set. Run `rfp mou deadline YYYY-MM-DD`.")
+        return
 
     _echo_mou_status(selected)
 
@@ -1687,6 +1747,523 @@ stats_app = typer.Typer(
     cls=AlphabeticalGroup,
 )
 app.add_typer(stats_app, name="stats")
+
+
+CALENDAR_LABEL_WIDTH = 5  # termgraph's "Mon: " row label
+LIGHT_GREEN = "bright_green"
+LIGHT_YELLOW = "bright_yellow"
+DARK_GREEN = 28  # 256-colour palette; the plain "green" is too bright to tell apart
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _truncate_visible(line: str, width: int) -> str:
+    """Cut `line` to `width` visible characters, keeping ANSI colour codes."""
+    parts = ANSI_ESCAPE.split(line)
+    codes = ANSI_ESCAPE.findall(line)
+    result = ""
+    remaining = width
+    for index, part in enumerate(parts):
+        result += part[:remaining]
+        remaining -= len(part[:remaining])
+        if index < len(codes):
+            result += codes[index]
+    return result
+
+
+plot_app = typer.Typer(
+    help="Plot time worked.", no_args_is_help=True, cls=AlphabeticalGroup
+)
+mou_app.add_typer(plot_app, name="plot")
+
+
+@plot_app.callback()
+def plot_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Plot time worked."""
+    if test:
+        db = TEST_DB_FILE
+    if db is not None:
+        os.environ["RFP_DB"] = str(db)
+
+
+@plot_app.command("complete")
+def plot_complete(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Show how far the personal budget is used, against the deadline.
+
+    The top bar is the whole personal budget: light green is already
+    submitted, green worked since. The bar below is yellow up to where
+    you should be today when the budget is used up evenly from the start
+    date to the deadline. Then it says how many hours you are behind or
+    in front of that.
+    """
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import MoU
+
+    mou = MoU.get_selected()
+    if mou is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+    total = mou.total_personal_budget
+    if not total:
+        _fail("No personal budget yet. Run `rfp mou import` first.")
+
+    submitted = mou.submitted_budget
+    worked = mou.worked_budget
+    expected = mou.expected_budget()
+
+    columns = shutil.get_terminal_size(fallback=(0, 0)).columns
+    labels = ["personal", "should be"]
+    label_width = max(len(label) for label in labels)
+    width = max(columns - label_width - 4, 1) if columns else 50
+
+    # One scale for both bars; an overspent budget stretches it.
+    scale = max(total, submitted + worked)
+    cells = _split_bar([submitted, worked, scale - submitted - worked], width)
+    top = (
+        typer.style("█" * cells[0], fg=LIGHT_GREEN)
+        + typer.style("█" * cells[1], fg=DARK_GREEN)
+        + "░" * cells[2]
+    )
+    typer.echo(f"{mou.display_name}")
+    typer.echo(f"{labels[0].ljust(label_width)} : {top}  {total:.0f}€")
+    typer.echo(
+        f"{'':{label_width}}   "
+        + typer.style(f"█ submitted {submitted:.0f}€", fg=LIGHT_GREEN)
+        + "  "
+        + typer.style(f"█ worked {worked:.0f}€", fg=DARK_GREEN)
+    )
+    if expected is None:
+        typer.echo("Set a deadline (`rfp mou deadline`) to see where you should be.")
+        return
+    should = round(expected / scale * width)
+    typer.echo(
+        f"{labels[1].ljust(label_width)} : "
+        + typer.style("█" * should, fg="yellow")
+        + " " * (width - should)
+        + f"  {expected:.0f}€"
+    )
+
+    from django.conf import settings
+
+    difference = submitted + worked - expected
+    rate = settings.RFP_EUROS_PER_HOUR
+    amount = (
+        f"{format_duration_hours(abs(difference) / rate)} hours"
+        if rate
+        else f"{abs(difference):.0f}€"
+    )
+    if round(abs(difference)) == 0:
+        typer.echo("On schedule.")
+    elif difference < 0:
+        typer.echo(f"{amount} behind schedule.")
+    else:
+        typer.echo(f"{amount} in front of schedule.")
+    if rate:
+        _echo_work_pace(mou, total - submitted - worked, rate)
+
+
+def _echo_work_pace(mou: MoU, budget_left: float, rate: float) -> None:
+    """Print the average work pace so far and the pace still required."""
+
+    from nlnet_rfp_recorder.timetracking.models.mou import count_workdays
+
+    def hours(value: float) -> str:
+        return format_duration_hours(max(value, 0.0))
+
+    today = date.today()
+    start = mou.start_date
+    if start is None or mou.deadline is None:
+        return
+    weeks = max((today - start).days + 1, 1) / 7
+    weekly = mou.tracked_duration.total_seconds() / 3600 / weeks
+    typer.echo("")
+    typer.echo("Average total")
+    typer.echo(f"  {hours(weekly / 5)} daily work (Mo-Fr)")
+    typer.echo(f"  {hours(weekly)} weekly work")
+
+    # The last 30 days, or the days since the start if that is shorter.
+    first = max(today - timedelta(days=29), start)
+    recent_weeks = ((today - first).days + 1) / 7
+    recent = mou.hours_worked(first, today) / recent_weeks
+    typer.echo("Average 30 days")
+    typer.echo(f"  {hours(recent / 5)} daily work (Mo-Fr)")
+    typer.echo(f"  {hours(recent)} weekly work")
+
+    left = budget_left / rate
+    workdays = count_workdays(today, mou.deadline)
+    weeks_left = ((mou.deadline - today).days + 1) / 7
+    typer.echo("Required for completion")
+    if workdays <= 0 or weeks_left <= 0:
+        typer.echo(f"  {hours(left)} before the deadline has passed")
+        return
+    typer.echo(f"  {hours(left / workdays)} daily work (Mo-Fr)")
+    typer.echo(f"  {hours(left / weeks_left)} weekly work")
+
+
+def _format_week_date(day: date) -> str:
+    """'28. 9.2026': day and month padded with a space, not a zero."""
+    return f"{day.day:2d}.{day.month:2d}.{day.year}"
+
+
+@plot_app.command("weeks")
+def plot_weeks(
+    weeks: int | None = typer.Option(
+        None,
+        "--weeks",
+        min=1,
+        help="Only show the most recent weeks (default: all since the start).",
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Show the hours worked in every week since the MoU started against
+    the pace required for completion.
+
+    The widest value sets the bar width. A week worked over the required
+    hours is green; a week that fell short is yellow, followed by red for
+    what is missing. The current week is projected: the time worked so far
+    divided by the time passed this week, times the 7 days of the week.
+    """
+    _setup(db, test)
+
+    from django.conf import settings
+
+    from nlnet_rfp_recorder.timetracking.models import MoU
+
+    mou = MoU.get_selected()
+    if mou is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+    rate = settings.RFP_EUROS_PER_HOUR
+    if not rate:
+        _fail("RFP_EUROS_PER_HOUR is needed to convert the budget to hours.")
+
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())
+    required = mou.required_hours_per_week(rate, today)
+
+    rows: list[tuple[float, str]] = []
+    so_far = mou.hours_worked(monday, today)
+    # Time worked this week, divided by the time passed this week and
+    # multiplied by the whole week (7 days).
+    passed = datetime.now() - datetime.combine(monday, datetime.min.time())
+    projected = so_far * timedelta(days=7) / passed if passed else so_far
+    rows.append((so_far, "this week (actual)"))
+    rows.append((projected, "this week (projected)"))
+    names = {1: "last week"}
+    start = mou.start_date
+    since_start = (
+        (monday - (start - timedelta(days=start.weekday()))).days // 7 + 1
+        if start
+        else 1
+    )
+    weeks = min(weeks, since_start) if weeks else since_start
+    for ago in range(1, weeks):
+        first = monday - timedelta(weeks=ago)
+        last = first + timedelta(days=6)
+        label = names.get(ago, f"{ago} weeks ago")
+        rows.append(
+            (
+                mou.hours_worked(first, last),
+                f"{label} ({_format_week_date(first)} - {_format_week_date(last)})",
+            )
+        )
+
+    values = [value for value, _ in rows] + ([required] if required else [])
+    biggest = max(values)
+    prefix_width = max(len(format_duration_hours(biggest)), 5)
+    required_label = "required for completion"
+    label_width = max(len(label) for _, label in [*rows, (0, required_label)])
+    columns = shutil.get_terminal_size(fallback=(0, 0)).columns
+    width = max(columns - prefix_width - label_width - 6, 1) if columns else 50
+
+    def cells(value: float) -> int:
+        return round(value / biggest * width) if biggest > 0 else 0
+
+    typer.echo(
+        "Weeks since the start:" if weeks == since_start else "Most recent weeks:"
+    )
+    if required is not None:
+        typer.echo(
+            f"{format_duration_hours(required):>{prefix_width}}  "
+            f"{required_label.ljust(label_width)} : "
+            + typer.style("█" * cells(required), fg="yellow")
+        )
+    for value, label in rows:
+        if required is None or value >= required:
+            bar = typer.style("█" * cells(value), fg=LIGHT_GREEN)
+        else:
+            # Yellow for what was worked, red for what is missing after it.
+            total = cells(required)
+            worked_cells, missing_cells = _split_bar([value, required - value], total)
+            bar = typer.style("█" * worked_cells, fg="yellow") + typer.style(
+                "█" * missing_cells, fg="red"
+            )
+        typer.echo(
+            f"{format_duration_hours(value):>{prefix_width}}  "
+            f"{label.ljust(label_width)} : {bar}"
+        )
+
+
+@plot_app.command("calendar")
+def plot_calendar(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Show a heat map of the hours worked per day.
+
+    Covers the dates of the selected MoU, from its start date (its first
+    time record) until its deadline, or until today without one.
+    """
+    _setup(db, test)
+    import subprocess
+    from collections import defaultdict
+    from datetime import date, time
+
+    from nlnet_rfp_recorder.timetracking.models import MoU, TimeRecord
+
+    selected = MoU.get_selected()
+    if selected is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+    start = selected.start_date
+    if start is None:
+        _fail("No time recorded for this MoU's tasks yet.")
+    end = selected.deadline or date.today()
+
+    hours: dict[date, float] = defaultdict(float)
+    for span in TimeRecord.get_statistics(start, end + timedelta(days=1)):
+        if span.record.link is None or span.record.link.task is None:
+            continue
+        if span.record.link.task.mou_id != selected.pk:
+            continue
+        # Clipped per day so an entry over midnight is split between days.
+        day = span.start.date()
+        while True:
+            day_end = datetime.combine(day + timedelta(days=1), time.min)
+            piece = min(span.end, day_end) - max(
+                span.start, datetime.combine(day, time.min)
+            )
+            hours[day] += piece.total_seconds() / 3600
+            if span.end <= day_end:
+                break
+            day += timedelta(days=1)
+
+    # termgraph draws one character per week after a 5-character label. A
+    # narrower terminal only shows the latest weeks that fit; without a
+    # known terminal width, the minimal width the graph needs is used.
+    columns = shutil.get_terminal_size(fallback=(0, 0)).columns
+    if columns:
+        fit_weeks = max(columns - CALENDAR_LABEL_WIDTH, 1)
+        if (end - start).days // 7 >= fit_weeks:
+            start = end - timedelta(weeks=fit_weeks - 1)
+
+    data = "".join(
+        f"{day},{value:.2f}\n" for day, value in sorted(hours.items()) if day >= start
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from termgraph.termgraph import main; main()",
+            "--calendar",
+            "--start-dt",
+            start.isoformat(),
+        ],
+        input=data,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        _fail(result.stderr.strip() or "termgraph failed.")
+    output = f"Hours worked on {selected.display_name}\n{result.stdout}"
+    if columns:
+        output = "\n".join(
+            _truncate_visible(line, columns) for line in output.split("\n")
+        )
+    typer.echo(output, nl=False)
+
+
+task_plot_app = typer.Typer(
+    help="Plot tasks.", no_args_is_help=True, cls=AlphabeticalGroup
+)
+task_app.add_typer(task_plot_app, name="plot")
+
+
+def _split_bar(parts: list[float], width: int) -> list[int]:
+    """Split `width` cells between `parts` in proportion, using whole
+    cells that add up to exactly `width` (largest remainder rounding), so
+    bars of different tasks end in the same column.
+    """
+    total = sum(parts)
+    if total <= 0:
+        return [0] * len(parts)
+    exact = [part / total * width for part in parts]
+    cells = [int(value) for value in exact]
+    by_remainder = sorted(
+        range(len(parts)), key=lambda i: exact[i] - cells[i], reverse=True
+    )
+    for index in by_remainder[: width - sum(cells)]:
+        cells[index] += 1
+    return cells
+
+
+@task_plot_app.command("complete")
+def task_plot_complete(
+    hours: bool = typer.Option(
+        False, "--hours", help="Show h:mm instead of euros next to the bars."
+    ),
+    percent: bool = typer.Option(
+        False,
+        "--percent",
+        help="Show percent of the maximum budget instead of euros next to the bars.",
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Show each task's completion as a stacked bar.
+
+    Every bar is the same width (percent of the task's maximum budget); a
+    task without an assigned budget is left out, and a blank line
+    separates the task groups (5g, 6a), each headed by a line with its
+    totals. Light green is the budget submitted, dark green the budget
+    worked since, light yellow what is over the budget, yellow the rest of the
+    budget (the assigned personal budget), red the rest of the
+    maximum budget. The bars fill the terminal width; without a known
+    width, 50 cells are used.
+    """
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import MoU, Task
+
+    mou = MoU.get_selected()
+    if mou is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+
+    rows: list[tuple[str, str, list[float], float, float, float]] = []
+    for task in sorted(Task.objects.filter(mou=mou), key=lambda task: task.sort_key):
+        line = task.budget_line
+        submitted = task.used_budget + task.reported_budget
+        worked = (task.budget or 0.0) - task.reported_budget
+        used = submitted + worked
+        assigned = line.total if line is not None else 0.0
+        if assigned <= 0 and used <= 0:
+            continue
+        total = max(task.max_budget or 0.0, assigned, used)
+        # What was spent beyond the budget gets its own colour instead of
+        # being drawn as submitted/worked.
+        submitted_in_budget = min(submitted, assigned)
+        worked_in_budget = min(used, assigned) - submitted_in_budget
+        rows.append(
+            (
+                task.name,
+                task.display_name,
+                [
+                    submitted_in_budget,
+                    worked_in_budget,
+                    max(assigned - used, 0.0),
+                    max(used - assigned, 0.0),
+                    max(total - max(assigned, used), 0.0),
+                ],
+                used,
+                assigned,
+                worked,
+            )
+        )
+    if not rows:
+        _fail("No tasks yet. Run `rfp mou import` first.")
+
+    # Each task group (1a, 1b -> 1) gets a summary line over its tasks, with
+    # a blank line between the groups, e.g. between 5g and 6a.
+    # The last number is the worked budget that is not submitted yet.
+    entries: list[tuple[str, list[float], float, float, float] | None] = []
+    groups: dict[str, list[tuple[str, list[float], float, float, float]]] = {}
+    for task_name, name, parts, used, assigned, unsubmitted in rows:
+        group = re.match(r"\d*", task_name)[0]
+        groups.setdefault(group, []).append((name, parts, used, assigned, unsubmitted))
+    for index, (group, members) in enumerate(groups.items()):
+        if index:
+            entries.append(None)
+        if group:
+            entries.append(
+                (
+                    group,
+                    [sum(part) for part in zip(*(m[1] for m in members), strict=True)],
+                    sum(m[2] for m in members),
+                    sum(m[3] for m in members),
+                    sum(m[4] for m in members),
+                )
+            )
+        entries.extend(members)
+
+    if hours and percent:
+        _fail("Give either --hours or --percent, not both.")
+    if hours:
+        from django.conf import settings
+
+        rate = settings.RFP_EUROS_PER_HOUR
+        if not rate:
+            _fail("RFP_EUROS_PER_HOUR is needed to show hours.")
+
+        def amount(value: float, maximum: float) -> str:
+            return format_duration_hours(value / rate)
+
+    elif percent:
+        # The bar parts add up to the task's (or group's) whole bar, the
+        # same 100% the bars are drawn against.
+        def amount(value: float, maximum: float) -> str:
+            return f"{value / maximum * 100:.0f}%" if maximum > 0 else "0%"
+
+    else:
+
+        def amount(value: float, maximum: float) -> str:
+            return f"{value:.0f}€"
+
+    lines = [entry for entry in entries if entry is not None]
+    label_width = max(len(name) for name, *_ in lines)
+    used_width = max(len(amount(line[2], sum(line[1]))) for line in lines)
+    assigned_width = max(len(amount(line[3], sum(line[1]))) for line in lines)
+    # Right-aligned numbers keep the euro signs (or colons) above each other.
+    amount_width = used_width + assigned_width + len(" / ")
+    columns = shutil.get_terminal_size(fallback=(0, 0)).columns
+    # "label : " in front of the bar, one spare column at the end.
+    width = max(columns - label_width - amount_width - 6, 1) if columns else 50
+    colors = (LIGHT_GREEN, DARK_GREEN, "yellow", LIGHT_YELLOW, "red")
+
+    typer.echo(f"Completion of {mou.display_name}")
+    typer.echo(
+        " ".join(
+            typer.style("█ " + name, fg=color)
+            for name, color in zip(
+                ("submitted", "worked", "budget", "over budget", "max"),
+                colors,
+                strict=True,
+            )
+        )
+    )
+    for entry in entries:
+        if entry is None:
+            typer.echo("")
+            continue
+        name, parts, used, assigned, unsubmitted = entry
+        bar = "".join(
+            typer.style("█" * cells, fg=color)
+            for cells, color in zip(_split_bar(parts, width), colors, strict=True)
+        )
+        # Coloured like the legend: used is what was worked (bright green
+        # once all of it is submitted), the budget is the assigned
+        # (yellow) part - unless none is left, then it matches the used
+        # amount. Over budget, the used amount turns light yellow and the budget red.
+        all_submitted = used > 0 and round(unsubmitted, 2) <= 0
+        used_color = LIGHT_GREEN if all_submitted else DARK_GREEN
+        over_budget = round(used - assigned, 2) > 0
+        if over_budget:
+            used_color = LIGHT_YELLOW  # like its part of the bar
+        budget_left = round(assigned - used, 2) > 0
+        budget_color = "yellow" if budget_left else used_color
+        if over_budget:
+            budget_color = "red"
+        amounts = (
+            typer.style(amount(used, sum(parts)).rjust(used_width), fg=used_color)
+            + " / "
+            + typer.style(
+                amount(assigned, sum(parts)).rjust(assigned_width),
+                fg=budget_color,
+            )
+        )
+        typer.echo(f"{name.ljust(label_width)}  {amounts} : {bar}")
 
 
 @stats_app.callback()
