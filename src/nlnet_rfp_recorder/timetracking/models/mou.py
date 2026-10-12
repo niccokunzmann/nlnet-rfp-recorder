@@ -11,6 +11,7 @@ from django.core.validators import RegexValidator
 from django.db import models
 
 from nlnet_rfp_recorder.budget import BudgetLine
+from nlnet_rfp_recorder.csvutil import read_dict_rows
 from nlnet_rfp_recorder.mou_budget import parse_milestone_budgets
 
 if TYPE_CHECKING:
@@ -192,7 +193,9 @@ class MoU(models.Model):
         from .task import Task
 
         rows = [
-            row for row in csv.DictReader(io.StringIO(text)) if not _is_blank_row(row)
+            row
+            for row in read_dict_rows(text, TASK_CSV_FIELDNAMES)
+            if not _is_blank_row(row)
         ]
 
         def _parse_float(

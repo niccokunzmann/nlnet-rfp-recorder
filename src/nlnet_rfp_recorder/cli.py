@@ -580,6 +580,14 @@ def _complete_backup_name(incomplete: str) -> list[str]:
 
 
 def _complete_csv_path(incomplete: str) -> list[str]:
+    return _complete_path(incomplete, ".csv")
+
+
+def _complete_any_path(incomplete: str) -> list[str]:
+    return _complete_path(incomplete, None)
+
+
+def _complete_path(incomplete: str, suffix: str | None) -> list[str]:
     """Filesystem completion for `report export`/`import`'s CSV path.
 
     typer's own Path type provides none of its own - TyperPath.
@@ -600,7 +608,7 @@ def _complete_csv_path(incomplete: str) -> list[str]:
                 continue
             if entry.is_dir():
                 matches.append(f"{lead}{entry.name}/")
-            elif entry.suffix == ".csv":
+            elif suffix is None or entry.suffix == suffix:
                 matches.append(f"{lead}{entry.name}")
         return matches
     except Exception:
@@ -880,6 +888,7 @@ def mou_import(
         None,
         exists=True,
         dir_okay=False,
+        autocompletion=_complete_any_path,
         help=(
             "Path to a budget document (milestone table or takentaal). "
             "Omit to paste it via stdin."
@@ -1316,6 +1325,7 @@ def task_remove(
 def task_export(
     path: Path | None = typer.Argument(
         None,
+        autocompletion=_complete_csv_path,
         help=(
             "Output CSV file (id, alias, personal_budget, max_budget, "
             "used_budget, description), one row per task. Omit for stdout."
@@ -1342,7 +1352,9 @@ def task_export(
 
 @task_app.command("import")
 def task_import(
-    path: Path = typer.Argument(..., exists=True, dir_okay=False),
+    path: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, autocompletion=_complete_csv_path
+    ),
     yes: bool = typer.Option(
         False,
         "--yes",
@@ -1465,7 +1477,9 @@ def timesheet_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
 @timesheet_app.command("export")
 def timesheet_export(
     path: Path | None = typer.Argument(
-        None, help="Output CSV file. Omit to print to stdout."
+        None,
+        autocompletion=_complete_csv_path,
+        help="Output CSV file. Omit to print to stdout.",
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
@@ -1486,7 +1500,9 @@ def timesheet_export(
 
 @timesheet_app.command("import")
 def timesheet_import(
-    path: Path = typer.Argument(..., exists=True, dir_okay=False),
+    path: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, autocompletion=_complete_csv_path
+    ),
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:

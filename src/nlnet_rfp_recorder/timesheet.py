@@ -3,6 +3,8 @@ import io
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 
+from nlnet_rfp_recorder.csvutil import read_dict_rows
+
 FIELDNAMES = ["pk", "mou", "task", "start", "duration", "link", "tags", "report"]
 
 
@@ -58,9 +60,8 @@ def _is_blank_row(row: dict[str, str | None]) -> bool:
 
 
 def read_csv(text: str) -> list[TimesheetRow]:
-    reader = csv.DictReader(io.StringIO(text))
     rows = []
-    for line in reader:
+    for line in read_dict_rows(text, FIELDNAMES):
         if _is_blank_row(line):
             continue
         pk = line["pk"].strip() if line.get("pk") else ""

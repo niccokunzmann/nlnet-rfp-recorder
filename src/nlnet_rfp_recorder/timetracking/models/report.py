@@ -10,6 +10,7 @@ from datetime import timedelta
 from django.conf import settings
 from django.db import models
 
+from nlnet_rfp_recorder.csvutil import read_dict_rows
 from nlnet_rfp_recorder.github import Status, fetch_statuses, fetch_titles
 
 from .github_token import GitHubToken
@@ -581,7 +582,7 @@ class Report(models.Model):
         doesn't resolve to a task of this report's MoU (including a blank
         column) clears the link's task rather than leaving it unchanged.
         """
-        rows = list(csv.DictReader(io.StringIO(text)))
+        rows = read_dict_rows(text, REPORT_LINE_FIELDNAMES)
         wanted_links: set[Link] = set()
 
         for row in rows:

@@ -6336,7 +6336,9 @@ def test_task_plot_complete_shows_submitted_and_worked_separately(settings):
 
 
 def test_mou_plot_weeks_shows_required_and_recent_weeks(settings):
-    _mou_for_plot_complete(settings, 10, 10)
+    # Started last Sunday, so the MoU spans this week and last week only,
+    # whatever weekday the test runs on.
+    _mou_for_plot_complete(settings, date.today().weekday() + 1, 10)
 
     result = runner.invoke(app, ["mou", "plot", "weeks"])
 
