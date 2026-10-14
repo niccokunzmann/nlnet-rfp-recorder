@@ -8,7 +8,7 @@ from django.conf import settings
 from django.utils import timezone
 
 if TYPE_CHECKING:
-    from nlnet_rfp_recorder.timetracking.models import Task
+    from nlnet_rfp_recorder.timetracking.models import MoU, Task
 
 
 @dataclass
@@ -55,7 +55,9 @@ class Statistics:
     threshold: float
 
     @classmethod
-    def _for_window(cls, start: date | None, end: date | None) -> Statistics:
+    def _for_window(
+        cls, start: date | None, end: date | None, mou: MoU | None = None
+    ) -> Statistics:
         from nlnet_rfp_recorder.timetracking.models import TimeRecord
 
         spans = TimeRecord.get_statistics(start=start, end=end)
@@ -66,6 +68,8 @@ class Statistics:
         new_durations: dict[Task | None, timedelta] = {}
         for span in spans:
             task = span.record.link.task if span.record.link else None
+            if mou is not None and (task is None or task.mou_id != mou.pk):
+                continue
             durations[task] = durations.get(task, timedelta()) + span.duration
             if span.record.report_line_id is None:
                 new_durations[task] = (
@@ -119,21 +123,24 @@ class Statistics:
         )
 
     @classmethod
-    def today(cls) -> Statistics:
-        """Time tracked since midnight today, through now."""
-        return cls._for_window(timezone.now().date(), None)
+    def today(cls, mou: MoU | None = None) -> Statistics:
+        """Time tracked since midnight today, through now.
+
+        With `mou`, only that MoU's tasks count (untracked time is left out).
+        """
+        return cls._for_window(timezone.now().date(), None, mou)
 
     @classmethod
-    def days(cls, n: int) -> Statistics:
+    def days(cls, n: int, mou: MoU | None = None) -> Statistics:
         """Time tracked in the last `n` calendar days (including today),
         through now.
         """
         if n <= 0:
             raise ValueError("Number of days must be positive.")
         since = timezone.now().date() - timedelta(days=n - 1)
-        return cls._for_window(since, None)
+        return cls._for_window(since, None, mou)
 
     @classmethod
-    def total(cls) -> Statistics:
+    def total(cls, mou: MoU | None = None) -> Statistics:
         """Time tracked across all recorded history, through now."""
-        return cls._for_window(None, None)
+        return cls._for_window(None, None, mou)

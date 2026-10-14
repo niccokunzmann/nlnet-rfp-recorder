@@ -4324,6 +4324,7 @@ def test_status_shows_running_time_entry_and_duration():
 
 
 def test_stats_today_reports_no_time_when_nothing_tracked():
+    MoU.objects.create(name="nlnet-2026", selected=True)
     result = runner.invoke(app, ["stats", "today"])
 
     assert result.exit_code == 0, result.output
@@ -4332,7 +4333,7 @@ def test_stats_today_reports_no_time_when_nothing_tracked():
 
 def test_stats_today_shows_per_task_time_and_budget(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     now = timezone.now()
@@ -4352,7 +4353,7 @@ def test_stats_today_shows_per_task_time_and_budget(settings):
 
 def test_stats_hides_the_total_row_with_only_one_task(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     now = timezone.now()
@@ -4369,7 +4370,7 @@ def test_stats_hides_the_total_row_with_only_one_task(settings):
 
 def test_stats_today_excludes_records_from_before_today(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     yesterday = timezone.now() - timedelta(days=1)
@@ -4387,7 +4388,7 @@ def test_stats_today_excludes_records_from_before_today(settings):
 
 def test_stats_days_includes_records_within_the_window(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     two_days_ago = timezone.now() - timedelta(days=2)
@@ -4406,7 +4407,7 @@ def test_stats_days_includes_records_within_the_window(settings):
 
 def test_stats_days_excludes_records_outside_the_window(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     ten_days_ago = timezone.now() - timedelta(days=10)
@@ -4423,6 +4424,7 @@ def test_stats_days_excludes_records_outside_the_window(settings):
 
 
 def test_stats_days_rejects_a_non_positive_n():
+    MoU.objects.create(name="nlnet-2026", selected=True)
     result = runner.invoke(app, ["stats", "days", "0"])
 
     assert result.exit_code != 0
@@ -4430,6 +4432,7 @@ def test_stats_days_rejects_a_non_positive_n():
 
 
 def test_stats_total_reports_no_time_when_nothing_tracked():
+    MoU.objects.create(name="nlnet-2026", selected=True)
     result = runner.invoke(app, ["stats", "total"])
 
     assert result.exit_code == 0, result.output
@@ -4438,7 +4441,7 @@ def test_stats_total_reports_no_time_when_nothing_tracked():
 
 def test_stats_total_includes_records_regardless_of_age(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     long_ago = timezone.now() - timedelta(days=3650)
@@ -4456,7 +4459,7 @@ def test_stats_total_includes_records_regardless_of_age(settings):
 
 def test_stats_total_sums_records_across_different_days(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link_a = Link.objects.create(task=task, url="https://example.com/issues/1")
     link_b = Link.objects.create(task=task, url="https://example.com/issues/2")
@@ -4478,7 +4481,7 @@ def test_stats_total_sums_records_across_different_days(settings):
 
 def test_stats_sums_multiple_records_per_task(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link_a = Link.objects.create(task=task, url="https://example.com/issues/1")
     link_b = Link.objects.create(task=task, url="https://example.com/issues/2")
@@ -4500,7 +4503,7 @@ def test_stats_sums_multiple_records_per_task(settings):
 
 def test_stats_groups_two_tasks_separately_with_a_total(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task_a = Task.objects.create(mou=mou, name="10a")
     task_b = Task.objects.create(mou=mou, name="11b")
     link_a = Link.objects.create(task=task_a, url="https://example.com/issues/1")
@@ -4523,23 +4526,36 @@ def test_stats_groups_two_tasks_separately_with_a_total(settings):
     assert "40€" in result.output
 
 
-def test_stats_groups_time_with_no_task_under_a_question_mark(settings):
+def test_stats_ignores_other_mous_and_untracked_time(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    link = Link.objects.create(url="https://example.com/issues/1")
+    MoU.objects.create(name="nlnet-2026", selected=True)
+    other = MoU.objects.create(name="nlnet-2025")
+    task = Task.objects.create(mou=other, name="10a")
     now = timezone.now()
-    TimeRecord.objects.create(
-        link=link, start_time=now - timedelta(hours=1), end_time=now
-    )
+    for link in (
+        Link.objects.create(task=task, url="https://example.com/issues/1"),
+        Link.objects.create(url="https://example.com/issues/2"),
+    ):
+        TimeRecord.objects.create(
+            link=link, start_time=now - timedelta(hours=1), end_time=now
+        )
 
     result = runner.invoke(app, ["stats", "today"])
 
     assert result.exit_code == 0, result.output
-    assert "?" in result.output
+    assert "No time tracked in this period." in result.output
+
+
+def test_stats_fails_without_a_selected_mou():
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code != 0
+    assert "No MoU selected" in result.output
 
 
 def test_stats_hides_budget_when_rfp_euros_per_hour_is_unset(settings):
     settings.RFP_EUROS_PER_HOUR = None
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     now = timezone.now()
@@ -4556,7 +4572,7 @@ def test_stats_hides_budget_when_rfp_euros_per_hour_is_unset(settings):
 
 def test_stats_has_a_header_row_with_id_time_euro_new(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     now = timezone.now()
@@ -4573,7 +4589,7 @@ def test_stats_has_a_header_row_with_id_time_euro_new(settings):
 
 def test_stats_header_omits_euro_and_new_when_rate_is_unset(settings):
     settings.RFP_EUROS_PER_HOUR = None
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     now = timezone.now()
@@ -4590,7 +4606,7 @@ def test_stats_header_omits_euro_and_new_when_rate_is_unset(settings):
 
 def test_stats_shows_an_alias_column_when_a_task_has_one(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     Alias.create("task", "10a", "foo", mou=mou)
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
@@ -4609,7 +4625,7 @@ def test_stats_shows_an_alias_column_when_a_task_has_one(settings):
 
 def test_stats_omits_the_alias_column_when_no_task_has_one(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     now = timezone.now()
@@ -4626,7 +4642,7 @@ def test_stats_omits_the_alias_column_when_no_task_has_one(settings):
 
 def test_stats_new_column_shows_unclaimed_budget(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     now = timezone.now()
@@ -4663,7 +4679,7 @@ def test_stats_new_column_is_blank_once_claimed_by_a_report(settings):
 def test_stats_threshold_column_shows_new_budget_at_or_above_the_threshold(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     settings.REVIEW_DEFAULT_EXCLUDE_BELOW = 50
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     now = timezone.now()
@@ -4682,7 +4698,7 @@ def test_stats_threshold_column_shows_new_budget_at_or_above_the_threshold(setti
 def test_stats_threshold_column_is_blank_below_the_threshold(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     settings.REVIEW_DEFAULT_EXCLUDE_BELOW = 50
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task = Task.objects.create(mou=mou, name="10a")
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     now = timezone.now()
@@ -4700,7 +4716,7 @@ def test_stats_threshold_column_is_blank_below_the_threshold(settings):
 def test_stats_threshold_column_totals_only_qualifying_tasks(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     settings.REVIEW_DEFAULT_EXCLUDE_BELOW = 50
-    mou = MoU.objects.create(name="nlnet-2026")
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
     task_a = Task.objects.create(mou=mou, name="10a")
     task_b = Task.objects.create(mou=mou, name="11b")
     link_a = Link.objects.create(task=task_a, url="https://example.com/issues/1")

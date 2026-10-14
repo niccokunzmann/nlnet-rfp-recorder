@@ -1756,8 +1756,7 @@ STATS_COLUMNS_HELP = (
 stats_app = typer.Typer(
     help=(
         "Show time/budget statistics.\n\n"
-        "Covers every task across every MoU, not just the selected one - "
-        "a personal 'how much did I work' view, not a report. " + STATS_COLUMNS_HELP
+        "Covers only the tasks of the selected MoU. " + STATS_COLUMNS_HELP
     ),
     no_args_is_help=True,
     cls=AlphabeticalGroup,
@@ -2282,6 +2281,15 @@ def task_plot_complete(
         typer.echo(f"{name.ljust(label_width)}  {amounts} : {bar}")
 
 
+def _stats_mou() -> MoU:
+    from nlnet_rfp_recorder.timetracking.models import MoU
+
+    mou = MoU.get_selected()
+    if mou is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+    return mou
+
+
 @stats_app.callback()
 def stats_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Show time/budget statistics."""
@@ -2297,7 +2305,7 @@ def stats_today(db: Path | None = DbOption, test: bool = TestOption) -> None:
     _setup(db, test)
     from nlnet_rfp_recorder.statistics import Statistics
 
-    _echo_stats(Statistics.today())
+    _echo_stats(Statistics.today(_stats_mou()))
 
 
 @stats_app.command("days", epilog=STATS_COLUMNS_HELP)
@@ -2311,7 +2319,7 @@ def stats_days(
     from nlnet_rfp_recorder.statistics import Statistics
 
     try:
-        stats = Statistics.days(n)
+        stats = Statistics.days(n, _stats_mou())
     except ValueError as error:
         _fail(str(error))
     _echo_stats(stats)
@@ -2323,7 +2331,7 @@ def stats_total(db: Path | None = DbOption, test: bool = TestOption) -> None:
     _setup(db, test)
     from nlnet_rfp_recorder.statistics import Statistics
 
-    _echo_stats(Statistics.total())
+    _echo_stats(Statistics.total(_stats_mou()))
 
 
 def _enable_task_completion(mou: MoU) -> Callable[[], None]:
