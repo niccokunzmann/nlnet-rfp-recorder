@@ -331,3 +331,29 @@ def test_statistics_total_budget_sums_the_rounded_per_task_values(settings):
 
     assert [ts.budget for ts in stats.per_task] == [1, 1]
     assert stats.total_budget == 2
+
+
+def test_histogram_rows_collapse_runs_of_empty_columns():
+    from nlnet_rfp_recorder.statistics import histogram_rows
+
+    minutes = [5, 15, 35, 36, 95]
+    rows = histogram_rows([timedelta(minutes=m) for m in minutes])
+    assert rows == [
+        ("0-10 min", 1),
+        ("10-20 min", 1),
+        ("20-30 min", 0),
+        ("30-40 min", 2),
+        None,
+        ("90-100 min", 1),
+    ]
+
+
+def test_median_duration():
+    from nlnet_rfp_recorder.statistics import median_duration
+
+    assert median_duration([timedelta(minutes=m) for m in (1, 9, 5)]) == timedelta(
+        minutes=5
+    )
+    assert median_duration([timedelta(minutes=m) for m in (2, 4)]) == timedelta(
+        minutes=3
+    )

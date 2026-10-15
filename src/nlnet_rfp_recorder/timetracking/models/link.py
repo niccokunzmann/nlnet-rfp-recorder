@@ -1,13 +1,29 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Iterable
+from datetime import datetime
 
 from django.db import models
+from django.utils import timezone
 
-from nlnet_rfp_recorder.github import Discussion, Issue, PullRequest
+from nlnet_rfp_recorder.github import (
+    Discussion,
+    Issue,
+    PullRequest,
+    Status,
+    fetch_states,
+)
 
 from .tag import TAG_NAMES, Tag
 from .task import Task
+
+
+def _local_naive(moment: datetime | None) -> datetime | None:
+    """GitHub's UTC time as local naive time - the database stores no zones."""
+    if moment is None or moment.tzinfo is None:
+        return moment
+    return moment.astimezone().replace(tzinfo=None)
 
 
 class Link(models.Model):
@@ -53,6 +69,17 @@ class Link(models.Model):
         ),
     )
 
+    closed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When GitHub says this issue/PR was closed, or None if not "
+            "known to be closed. A closed (or merged) issue/PR is assumed "
+            "to stay closed, so its status is not fetched again (see "
+            "statistics.closed_link_durations)."
+        ),
+    )
+
     class Meta:
         constraints = [
             # An empty url means "no link yet" - each such entry gets its
@@ -86,6 +113,52 @@ class Link(models.Model):
                 stacklevel=2,
             )
         return link
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether GitHub is known to have closed (or merged) this link.
+
+        Only true after update_from_github saw it closed - never fetched
+        on its own.
+        """
+        return self.closed_at is not None
+
+    @classmethod
+    def update_from_github(
+        cls, links: Iterable[Link], token: str | None = None
+    ) -> None:
+        """Refresh closed_at and title of issue/PR links from GitHub.
+
+        The one place GitHub data is stored on links: one batched request
+        per link that still needs it, none for anything else. A link
+        needs a request unless it is already known closed (closed stays
+        closed) and has its title. Discussions and plain links are ignored.
+        """
+        pending = [
+            link
+            for link in links
+            if (link.is_issue or link.is_pr) and (not link.is_closed or not link.title)
+        ]
+        if not pending:
+            return
+        states = fetch_states(
+            [link.pr or link.issue or link.discussion for link in pending], token=token
+        )
+        changed = []
+        for link, state in zip(pending, states, strict=True):
+            if (
+                state.status is Status.CLOSED
+                and not link.is_discussion
+                and not link.is_closed
+            ):
+                link.closed_at = _local_naive(state.closed_at) or timezone.now()
+                changed.append(link)
+            if state.title and not link.title:
+                link.title = state.title
+                if link not in changed:
+                    changed.append(link)
+        if changed:
+            cls.objects.bulk_update(changed, ["closed_at", "title"])
 
     def add_tag(self, name: str) -> Tag:
         if name not in TAG_NAMES:

@@ -2,7 +2,7 @@ import csv
 import io
 import os
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,7 +13,7 @@ from django.utils import timezone
 from typer.testing import CliRunner
 
 from nlnet_rfp_recorder.cli import app
-from nlnet_rfp_recorder.github import TIMEOUT_SECONDS, Status
+from nlnet_rfp_recorder.github import TIMEOUT_SECONDS, GitHubState, Status
 from nlnet_rfp_recorder.timetracking.models import (
     Alias,
     GitHubToken,
@@ -42,7 +42,7 @@ def _mock_github_session(state: str = "closed"):
 def _mock_github_title_session(title: str = "Some title"):
     """A mock niquests.AsyncSession() context manager returning `title`."""
     response = MagicMock(status_code=200)
-    response.json = MagicMock(return_value={"title": title})
+    response.json = MagicMock(return_value={"state": "open", "title": title})
     session = MagicMock()
     session.get = AsyncMock(return_value=response)
     session.__aenter__ = AsyncMock(return_value=session)
@@ -2529,7 +2529,7 @@ def test_report_create_and_print_fetch_statuses_once_for_many_tasks(settings):
     # Report.create batches every task's PR status check into a single
     # GitHub round trip, and generate_report (used by `report print`) never
     # hits the network at all - so across many tasks and PRs, the whole
-    # create+print flow should call fetch_statuses_async exactly once.
+    # create+print flow should call fetch_states_async exactly once.
     settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026", selected=True)
     now = timezone.now()
@@ -2549,12 +2549,12 @@ def test_report_create_and_print_fetch_statuses_once_for_many_tasks(settings):
                 end_time=now,
             )
 
-    async def fake_fetch_statuses_async(references, token=None):
-        return [Status.CLOSED for _ in references]
+    async def fake_fetch_states_async(references, token=None):
+        return [GitHubState(Status.CLOSED, None, "title") for _ in references]
 
     with patch(
-        "nlnet_rfp_recorder.github.fetch_statuses_async",
-        AsyncMock(side_effect=fake_fetch_statuses_async),
+        "nlnet_rfp_recorder.github.fetch_states_async",
+        AsyncMock(side_effect=fake_fetch_states_async),
     ) as mock_fetch:
         create_result = runner.invoke(app, ["report", "create"])
         result = runner.invoke(app, ["report", "print", "nlnet-2026-1"])
@@ -4957,7 +4957,13 @@ def test_stats_help_lists_subcommands_alphabetically():
     result = runner.invoke(app, ["stats", "--help"])
 
     assert result.exit_code == 0, result.output
-    assert _subcommand_names("stats") == ["days", "today", "total"]
+    assert _subcommand_names("stats") == [
+        "days",
+        "implementation",
+        "review",
+        "today",
+        "total",
+    ]
 
 
 def test_report_help_lists_subcommands_alphabetically():
@@ -5525,7 +5531,6 @@ def test_mou_import_stops_the_running_time_entry(tmp_path):
 
 def _stopped_record(start_hm: tuple[int, int], minutes: int) -> TimeRecord:
     """A stopped entry today starting at `start_hm`, `minutes` long."""
-    from datetime import datetime
 
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
     runner.invoke(app, ["task", "select", "10a"])
@@ -5628,14 +5633,12 @@ def _start_running_entry() -> TimeRecord:
 
 
 def _fake_clock(*times):
-    from datetime import datetime
 
     iterator = iter(times)
     return lambda: datetime(2026, 10, 6) + timedelta(seconds=next(iterator))
 
 
 def test_background_task_stops_the_entry_at_the_time_before_suspend():
-    from datetime import datetime
 
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
 
@@ -5664,7 +5667,6 @@ def test_background_task_leaves_the_entry_running_without_a_gap():
 
 
 def test_background_task_updates_the_db_entry_every_minute():
-    from datetime import datetime
 
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
 
@@ -5721,7 +5723,6 @@ def test_background_task_with_a_dead_pid_is_not_alive():
 
 
 def test_background_task_reports_the_suspend_and_the_stopped_entry(caplog):
-    from datetime import datetime
 
     from nlnet_rfp_recorder.cli import _report_suspend
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
@@ -5798,7 +5799,6 @@ def test_background_task_restarts_itself_when_the_schema_changed(background_log)
 
 
 def test_background_task_survives_a_query_failing_against_a_newer_schema():
-    from datetime import datetime
 
     from django.db import connection
     from django.db.migrations.recorder import MigrationRecorder
@@ -5880,7 +5880,6 @@ def _dead_background_task(last_seen):
 
 
 def test_background_task_recovers_after_an_unclean_shutdown(background_log):
-    from datetime import datetime
 
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
 
@@ -5903,7 +5902,6 @@ def test_background_task_recovers_after_an_unclean_shutdown(background_log):
 
 
 def test_background_task_recovery_leaves_a_newer_entry_running(background_log):
-    from datetime import datetime
 
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
 
@@ -5924,7 +5922,6 @@ def test_background_task_recovery_leaves_a_newer_entry_running(background_log):
 
 
 def test_background_task_no_recovery_after_a_clean_exit(background_log):
-    from datetime import datetime
 
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
 
@@ -5941,7 +5938,6 @@ def test_background_task_no_recovery_after_a_clean_exit(background_log):
 
 
 def test_background_task_check_reports_a_killed_task_awaiting_recovery():
-    from datetime import datetime
 
     _dead_background_task(datetime(2026, 10, 5, 18, 30))
 
@@ -5955,7 +5951,6 @@ def test_background_task_check_reports_a_killed_task_awaiting_recovery():
 
 
 def test_background_task_recover_recovers_and_loops_once(background_log):
-    from datetime import datetime
     from unittest.mock import ANY
 
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
@@ -5998,7 +5993,6 @@ def test_background_task_recover_aborts_while_a_task_is_running(background_log):
 
 
 def test_background_task_recovery_logs_when_no_entry_is_running(background_log):
-    from datetime import datetime
 
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
 
@@ -6064,7 +6058,6 @@ def test_stop_reason_is_edit_when_a_duration_edit_moves_the_end():
 
 
 def test_stop_reason_is_suspend_for_a_background_task_suspend():
-    from datetime import datetime
 
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
 
@@ -6080,7 +6073,6 @@ def test_stop_reason_is_suspend_for_a_background_task_suspend():
 
 
 def test_stop_reason_is_restart_after_recovering_from_a_shutdown(background_log):
-    from datetime import datetime
 
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
 
@@ -6584,3 +6576,54 @@ def test_task_plot_complete_rejects_hours_together_with_percent():
     result = runner.invoke(app, ["task", "plot", "complete", "--hours", "--percent"])
 
     assert result.exit_code != 0
+
+
+def test_stats_review_histograms_closed_issues_and_pull_requests():
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    now = timezone.now()
+    statuses = {}
+    for url, minutes, status in [
+        ("https://github.com/o/r/issues/1", 5, Status.CLOSED),
+        ("https://github.com/o/r/issues/2", 45, Status.CLOSED),
+        ("https://github.com/o/r/issues/3", 25, Status.OPEN),
+        ("https://github.com/o/r/pull/4", 12, Status.CLOSED),
+    ]:
+        link = Link.objects.create(task=task, url=url)
+        link.add_tag("review")
+        statuses[url] = status
+        TimeRecord.objects.create(
+            link=link, start_time=now - timedelta(minutes=minutes), end_time=now
+        )
+
+    def fake_fetch(references, token=None):
+        return [
+            GitHubState(statuses[reference.url], None, "title")
+            for reference in references
+        ]
+
+    with patch("nlnet_rfp_recorder.timetracking.models.link.fetch_states", fake_fetch):
+        result = runner.invoke(app, ["stats", "review"])
+
+    assert result.exit_code == 0, result.output
+    assert "Closed issues (review) (2" in result.output
+    assert "  0-10 min | █ 1" in result.output
+    assert "..." in result.output
+    assert "40-50 min | █ 1" in result.output
+    assert "Closed pull requests (review) (1" in result.output
+    assert "median: 0:25  average: 0:25" in result.output
+    assert Link.objects.get(url="https://github.com/o/r/issues/1").closed_at
+    assert Link.objects.get(url="https://github.com/o/r/issues/3").closed_at is None
+
+    # Closed links are not asked about again.
+    asked = []
+
+    def spy(references, token=None):
+        asked.extend(reference.url for reference in references)
+        return [GitHubState(Status.OPEN, None, None) for _ in references]
+
+    with patch("nlnet_rfp_recorder.timetracking.models.link.fetch_states", spy):
+        again = runner.invoke(app, ["stats", "review"])
+    assert again.exit_code == 0, again.output
+    assert asked == ["https://github.com/o/r/issues/3"]
+    assert "median: 0:25" in again.output

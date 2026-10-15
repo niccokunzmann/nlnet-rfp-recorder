@@ -2334,6 +2334,56 @@ def stats_total(db: Path | None = DbOption, test: bool = TestOption) -> None:
     _echo_stats(Statistics.total(_stats_mou()))
 
 
+def _echo_histogram(title: str, durations: list[timedelta]) -> None:
+    from nlnet_rfp_recorder.statistics import histogram_rows, median_duration
+
+    typer.echo(f"{title} ({len(durations)}, count is per URL)")
+    if not durations:
+        typer.echo("  none closed")
+        return
+    rows = histogram_rows(durations)
+    label_width = max(len(row[0]) for row in rows if row is not None)
+    for row in rows:
+        if row is None:
+            typer.echo("  ...")
+            continue
+        label, count = row
+        typer.echo(f"  {label.rjust(label_width)} | {'█' * count} {count}")
+    average = sum(durations, timedelta()) / len(durations)
+    typer.echo(
+        f"  median: {_format_duration(median_duration(durations))}"
+        f"  average: {_format_duration(average)}"
+    )
+
+
+def _stats_closed_histogram(tag: str, db: Path | None, test: bool) -> None:
+    _setup(db, test)
+    from nlnet_rfp_recorder.statistics import closed_link_durations
+    from nlnet_rfp_recorder.timetracking.models import GitHubToken
+
+    try:
+        issues, pull_requests = closed_link_durations(
+            _stats_mou(), tag, GitHubToken.get()
+        )
+    except Exception as error:
+        _fail(f"Could not fetch the GitHub status: {error}")
+    _echo_histogram(f"Closed issues ({tag})", issues)
+    typer.echo()
+    _echo_histogram(f"Closed pull requests ({tag})", pull_requests)
+
+
+@stats_app.command("review")
+def stats_review(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Histogram of review time invested per closed issue / pull request."""
+    _stats_closed_histogram("review", db, test)
+
+
+@stats_app.command("implementation")
+def stats_implementation(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Histogram of implementation time invested per closed issue / pull request."""
+    _stats_closed_histogram("implementation", db, test)
+
+
 def _enable_task_completion(mou: MoU) -> Callable[[], None]:
     """Best-effort tab-completion of `mou`'s task names/aliases for the
     next input() call (e.g. via typer.prompt) - readline isn't available

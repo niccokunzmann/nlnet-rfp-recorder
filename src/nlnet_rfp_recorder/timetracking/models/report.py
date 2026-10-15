@@ -11,7 +11,6 @@ from django.conf import settings
 from django.db import models
 
 from nlnet_rfp_recorder.csvutil import read_dict_rows
-from nlnet_rfp_recorder.github import Status, fetch_statuses, fetch_titles
 
 from .github_token import GitHubToken
 from .link import Link
@@ -164,31 +163,6 @@ def _task_sort_key(task: Task | None) -> tuple:
     return (1,) if task is None else (0, task.sort_key)
 
 
-def _fetch_missing_titles(links: Iterable[Link], token: str | None) -> None:
-    """Cache each issue/PR/discussion link's title, for those without one yet.
-
-    Plain links, and links whose title was already fetched by an earlier
-    call, cost no network request at all. Fetches whatever is pending in
-    one batched, concurrent request (see fetch_titles).
-    """
-    pending = [
-        link
-        for link in links
-        if not link.title and (link.is_issue or link.is_pr or link.is_discussion)
-    ]
-    if not pending:
-        return
-    references = [link.pr or link.issue or link.discussion for link in pending]
-    titles = fetch_titles(references, token=token)
-    fetched = []
-    for link, title in zip(pending, titles, strict=True):
-        if title:
-            link.title = title
-            fetched.append(link)
-    if fetched:
-        Link.objects.bulk_update(fetched, ["title"])
-
-
 def _billable_and_excluded_links(mou: MoU) -> tuple[list[TimeRecord], list[Link]]:
     """Unreported billable records and excluded (open PR) links for `mou`.
 
@@ -203,31 +177,18 @@ def _billable_and_excluded_links(mou: MoU) -> tuple[list[TimeRecord], list[Link]
     all_pr_links = [
         link for links in links_by_task.values() for link in links if link.is_pr
     ]
-    references = [link.pr for link in all_pr_links]
-    token = GitHubToken.get()
-    statuses = fetch_statuses(references, token=token) if references else []
-    status_by_link_id = dict(
-        zip((link.id for link in all_pr_links), statuses, strict=True)
-    )
+    Link.update_from_github(all_pr_links, token=GitHubToken.get())
 
     records: list[TimeRecord] = []
     excluded_links: list[Link] = []
     for links in links_by_task.values():
-        billable_ids = {
-            link.id
-            for link in links
-            if not link.is_pr or status_by_link_id.get(link.id) == Status.CLOSED
-        }
+        billable_ids = {link.id for link in links if not link.is_pr or link.is_closed}
         records += list(
             TimeRecord.objects.filter(
                 link_id__in=billable_ids, report_line__isnull=True
             )
         )
-        excluded_links += [
-            link
-            for link in links
-            if link.is_pr and status_by_link_id.get(link.id) != Status.CLOSED
-        ]
+        excluded_links += [link for link in links if link.is_pr and not link.is_closed]
     return records, excluded_links
 
 
@@ -357,14 +318,10 @@ class Report(models.Model):
         ]
         if not candidates:
             return []
-        references = [line.link.issue for line in candidates]
-        token = GitHubToken.get()
-        statuses = fetch_statuses(references, token=token)
-        return [
-            line
-            for line, status in zip(candidates, statuses, strict=True)
-            if status == Status.OPEN
-        ]
+        Link.update_from_github(
+            [line.link for line in candidates], token=GitHubToken.get()
+        )
+        return [line for line in candidates if not line.link.is_closed]
 
     def remove_link(self, link: Link) -> None:
         """Drop this report's line for `link` specifically, e.g. after
@@ -511,7 +468,9 @@ class Report(models.Model):
         network requests only for links seen for the first time.
         """
         links = [report_line.link for report_line in self.lines.select_related("link")]
-        _fetch_missing_titles(links, GitHubToken.get())
+        Link.update_from_github(
+            [link for link in links if not link.title], GitHubToken.get()
+        )
 
     def export_lines(self) -> str:
         """Export this report's lines as CSV, sorted by task then link.

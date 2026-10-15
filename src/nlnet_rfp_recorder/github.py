@@ -3,6 +3,7 @@ import inspect
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import ClassVar
 
@@ -10,6 +11,9 @@ import niquests
 
 GITHUB_API = "https://api.github.com"
 TIMEOUT_SECONDS = 10
+# GitHub allows at most 100 concurrent requests (REST and GraphQL share
+# the limit); stay below it in case something else runs in parallel.
+MAX_CONCURRENT_REQUESTS = 90
 
 ISSUE_URL = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/issues/(?P<number>\d+)/?$"
@@ -35,6 +39,15 @@ class Status(StrEnum):
     OPEN = "open"
     CLOSED = "closed"
     NONEXISTENT = "nonexistent"
+
+
+@dataclass
+class GitHubState:
+    """What one GitHub request tells us about an issue or PR."""
+
+    status: Status
+    closed_at: datetime | None
+    title: str | None
 
 
 def _detail_from_response(response: niquests.Response) -> str | None:
@@ -175,13 +188,19 @@ class GitHubReference:
     async def current_status_async(
         self, session: niquests.AsyncSession, token: str | None = None
     ) -> Status:
+        return (await self.current_state_async(session, token)).status
+
+    async def current_state_async(
+        self, session: niquests.AsyncSession, token: str | None = None
+    ) -> GitHubState:
+        """Status, closing time and title - all from one request."""
         path = f"repos/{self.owner}/{self.repo}/{self._api_resource}/{self.number}"
         headers = {"Authorization": f"Bearer {token}"} if token else None
         response = await session.get(
             f"{GITHUB_API}/{path}", headers=headers, timeout=TIMEOUT_SECONDS
         )
         if response.status_code == 404:
-            return Status.NONEXISTENT
+            return GitHubState(Status.NONEXISTENT, None, None)
         try:
             response.raise_for_status()
         except niquests.exceptions.HTTPError as error:
@@ -191,7 +210,14 @@ class GitHubReference:
         data = response.json()
         if inspect.isawaitable(data):
             data = await data
-        return Status(data["state"])
+        closed_at = data.get("closed_at")
+        if isinstance(closed_at, str):
+            closed_at = datetime.fromisoformat(closed_at)
+        else:
+            closed_at = None
+        return GitHubState(
+            Status(data.get("state", Status.OPEN)), closed_at, data.get("title")
+        )
 
     async def current_title_async(
         self, session: niquests.AsyncSession, token: str | None = None
@@ -254,6 +280,22 @@ class Discussion(GitHubReference):
         )
 
 
+async def _gather_limited(awaitables: Iterable) -> list:
+    """asyncio.gather the awaitables, at most MAX_CONCURRENT_REQUESTS at once.
+
+    Failures are returned in the result like gather(return_exceptions=True).
+    """
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+    async def limited(awaitable):
+        async with semaphore:
+            return await awaitable
+
+    return await asyncio.gather(
+        *(limited(awaitable) for awaitable in awaitables), return_exceptions=True
+    )
+
+
 async def fetch_statuses_async(
     references: Iterable[GitHubReference], token: str | None = None
 ) -> list[Status]:
@@ -266,12 +308,8 @@ async def fetch_statuses_async(
     has actually finished.
     """
     async with niquests.AsyncSession() as session:
-        results = await asyncio.gather(
-            *(
-                reference.current_status_async(session, token)
-                for reference in references
-            ),
-            return_exceptions=True,
+        results = await _gather_limited(
+            reference.current_status_async(session, token) for reference in references
         )
     for result in results:
         if isinstance(result, BaseException):
@@ -296,12 +334,8 @@ async def fetch_titles_async(
     re-raised early) deadlocks instead of raising.
     """
     async with niquests.AsyncSession() as session:
-        results = await asyncio.gather(
-            *(
-                reference.current_title_async(session, token)
-                for reference in references
-            ),
-            return_exceptions=True,
+        results = await _gather_limited(
+            reference.current_title_async(session, token) for reference in references
         )
     for result in results:
         if isinstance(result, BaseException):
@@ -314,3 +348,24 @@ def fetch_titles(
 ) -> list[str | None]:
     """Sync entry point for fetch_titles_async."""
     return asyncio.run(fetch_titles_async(list(references), token))
+
+
+async def fetch_states_async(
+    references: Iterable[GitHubReference], token: str | None = None
+) -> list[GitHubState]:
+    """Like fetch_statuses_async, but also returns when each was closed."""
+    async with niquests.AsyncSession() as session:
+        results = await _gather_limited(
+            reference.current_state_async(session, token) for reference in references
+        )
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
+
+
+def fetch_states(
+    references: Iterable[GitHubReference], token: str | None = None
+) -> list[GitHubState]:
+    """Sync entry point for fetch_states_async."""
+    return asyncio.run(fetch_states_async(list(references), token))

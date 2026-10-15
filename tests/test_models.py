@@ -2562,7 +2562,7 @@ def test_report_ensure_link_titles_caches_issue_and_pr_titles(settings):
     def fake_get(url, **kwargs):
         response = MagicMock(status_code=200)
         title = "Issue title" if url.endswith("/issues/1") else "PR title"
-        response.json = MagicMock(return_value={"title": title})
+        response.json = MagicMock(return_value={"state": "open", "title": title})
         return response
 
     session = MagicMock()

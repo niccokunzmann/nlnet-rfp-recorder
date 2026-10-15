@@ -15,8 +15,6 @@ from nlnet_rfp_recorder.github import (
     Discussion,
     Issue,
     PullRequest,
-    Status,
-    fetch_statuses,
 )
 from nlnet_rfp_recorder.warnings import TaskWarning
 
@@ -281,13 +279,14 @@ class Task(models.Model):
         ).distinct()
 
     @cached_property
-    def _pr_link_statuses(self) -> dict[int, Status]:
+    def _links_with_unreported_time(self) -> list[Link]:
+        from .link import Link
+
         links = list(self.links_with_unreported_time)
-        pr_links = [link for link in links if link.is_pr]
-        references = [link.pr for link in pr_links]
-        token = GitHubToken.get()
-        statuses = fetch_statuses(references, token=token) if references else []
-        return dict(zip((link.id for link in pr_links), statuses, strict=True))
+        Link.update_from_github(
+            [link for link in links if link.is_pr], token=GitHubToken.get()
+        )
+        return links
 
     @cached_property
     def billable_links(self) -> list[Link]:
@@ -300,23 +299,19 @@ class Task(models.Model):
         # unreported links are considered - once time is part of a report,
         # its contribution comes from the report line's (possibly
         # overridden) budget instead; see reported_budget.
-        links = list(self.links_with_unreported_time)
-        statuses = self._pr_link_statuses
         return [
             link
-            for link in links
-            if not link.is_pr or statuses.get(link.id) == Status.CLOSED
+            for link in self._links_with_unreported_time
+            if not link.is_pr or link.is_closed
         ]
 
     @cached_property
     def excluded_pull_request_links(self) -> list[Link]:
         """Tracked PR links held back from billable_links because still open."""
-        links = list(self.links_with_unreported_time)
-        statuses = self._pr_link_statuses
         return [
             link
-            for link in links
-            if link.is_pr and statuses.get(link.id) != Status.CLOSED
+            for link in self._links_with_unreported_time
+            if link.is_pr and not link.is_closed
         ]
 
     @property
