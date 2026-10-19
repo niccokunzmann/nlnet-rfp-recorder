@@ -610,8 +610,8 @@ def test_task_reported_budget_reflects_a_manual_override(settings):
     line.budget = 999.0
     line.save(update_fields=["budget"])
 
-    assert task.reported_budget == 999.0
-    assert task.budget == 999.0
+    assert task.reported_budget == 1000.0  # rounded up to 5 like a report
+    assert task.budget == 1000.0
 
 
 def test_set_max_budget_sets_the_value():
@@ -3879,3 +3879,196 @@ def test_count_workdays_skips_weekends():
     assert count_workdays(date(2026, 10, 5), date(2026, 10, 11)) == 5
     assert count_workdays(date(2026, 10, 10), date(2026, 10, 11)) == 0
     assert count_workdays(date(2026, 10, 5), date(2026, 10, 4)) == 0
+
+
+def test_used_by_others_is_used_minus_reported(settings):
+    from nlnet_rfp_recorder.timetracking.models import MoU, Task
+
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="1a", max_budget=500.0, used_budget=300.0)
+
+    assert task.used_by_others == 300.0  # nothing of mine reported yet
+    task.used_budget = 0.0
+    assert task.used_by_others == 0.0  # never negative
+
+
+def test_used_by_others_uses_the_reports_rounding(settings):
+    from nlnet_rfp_recorder.timetracking.models import (
+        Link,
+        MoU,
+        Report,
+        ReportLine,
+        Task,
+    )
+
+    settings.RFP_EUROS_PER_HOUR = 50.0
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="1l", max_budget=300.0, used_budget=85.0)
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    report = Report.objects.create(id="nlnet-2026-1", mou=mou)
+    ReportLine.objects.create(report=report, link=link, budget=83.91666666666666)
+
+    assert task.used_by_others == 0.0
+    task.used_budget = 200.0
+    assert task.reported_budget == 85.0  # rounded up to 5 like a report
+    assert task.used_by_others == 115.0
+
+
+def _reported_task(settings, hours=1.0, rate=50.0):
+    from nlnet_rfp_recorder.timetracking.models import ReportTask
+
+    settings.RFP_EUROS_PER_HOUR = rate
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="1l")
+    link = Link.objects.create(task=task, url="https://example.com/issues/1")
+    now = timezone.now()
+    record = TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=hours), end_time=now
+    )
+    report = Report.create(mou)
+    report.add_time_record(record)
+    return task, link, report, ReportTask
+
+
+def test_report_records_the_requested_figure_per_task(settings):
+    task, _, report, ReportTask = _reported_task(settings, hours=83.9166 / 50)
+
+    entry = ReportTask.objects.get(report=report, task=task)
+
+    assert entry.budget == 85  # 83.92€ tracked, 85€ as the report prints it
+    assert task.reported_budget == 85.0
+
+
+def test_report_task_follows_the_reports_lines(settings):
+    task, link, report, ReportTask = _reported_task(settings)
+    line = ReportLine.objects.get(report=report, link=link)
+
+    line.budget = 120.0
+    line.save(update_fields=["budget"])
+    assert ReportTask.objects.get(report=report, task=task).budget == 120
+
+    line.delete()
+    assert not ReportTask.objects.filter(report=report).exists()
+
+
+def test_report_task_moves_with_the_link(settings):
+    task, link, report, ReportTask = _reported_task(settings)
+    other = Task.objects.create(mou=task.mou, name="1m")
+
+    link.task = other
+    link.save()
+
+    assert not ReportTask.objects.filter(task=task).exists()
+    assert ReportTask.objects.get(task=other, report=report).budget == 50
+
+
+def _request(request_id="r1", **fields):
+    from nlnet_rfp_recorder.rfp_page import RfpRequest
+
+    values = {
+        "id": request_id,
+        "index": 4,
+        "date": date(2026, 9, 23),
+        "amount": 90.0,
+        "recipient": "me",
+        "confirmed": True,
+    }
+    values.update(fields)
+    return RfpRequest(**values)
+
+
+def _detail(request_id="r1", tasks=None, links=()):
+    from nlnet_rfp_recorder.rfp_page import RfpRequestDetail
+
+    return RfpRequestDetail(id=request_id, tasks=tasks or {}, links=set(links))
+
+
+def test_request_goes_to_the_closest_report_and_renames_it(settings):
+    task, link, report, ReportTask = _reported_task(settings, hours=83.9166 / 50)
+    other = Report.create(task.mou)
+    other_link = Link.objects.create(task=task, url="https://example.com/issues/9")
+    now = timezone.now()
+    other.add_time_record(
+        TimeRecord.objects.create(
+            link=other_link, start_time=now - timedelta(hours=2), end_time=now
+        )
+    )
+    request = _request(approved_date=date(2026, 10, 14))
+    detail = _detail(tasks={"1l": 90.0}, links={link.url, "https://x.org/1"})
+
+    matches = ReportTask.record_requests(task.mou, [(request, detail)])
+
+    renamed = Report.objects.get(rfp_request="r1")
+    assert [(r.pk, q) for r, q in matches] == [(renamed.pk, request)]
+    assert renamed.pk == "nlnet-2026-2026-09-23-me-4"
+    assert renamed.lines.count() == 1  # the lines moved with it
+    assert (renamed.confirmed, renamed.approved_date) == (
+        True,
+        date(2026, 10, 14),
+    )
+    entry = ReportTask.objects.get(report=renamed, task=task)
+    assert (entry.budget, entry.requested) == (90, True)
+    assert ReportTask.objects.get(report=other, task=task).budget == 100
+    assert not Report.objects.filter(pk=report.pk).exists()
+
+
+def test_request_without_a_shared_link_becomes_a_report_of_someone_else(settings):
+    task, _, report, ReportTask = _reported_task(settings)
+    request = _request("r2", recipient="tobixen", index=3, amount=50.0)
+
+    ReportTask.record_requests(
+        task.mou, [(request, _detail("r2", {"1l": 50.0}, {"https://x.org/1"}))]
+    )
+
+    theirs = Report.objects.get(rfp_request="r2")
+    assert theirs.pk == "nlnet-2026-2026-09-23-tobixen-3"
+    assert not theirs.lines.exists()
+    assert ReportTask.objects.get(report=theirs, task=task).budget == 50
+    assert Report.objects.get(pk=report.pk).rfp_request == ""
+    # Not mine: it does not count as reported, it is used by others.
+    assert task.reported_budget == 50.0  # only my own report (1h at 50€)
+    task.used_budget = 100.0
+    assert task.used_by_others == 50.0
+
+
+def test_known_request_is_updated_not_duplicated(settings):
+    task, link, _, ReportTask = _reported_task(settings)
+    detail = _detail(tasks={"1l": 50.0}, links={link.url})
+    ReportTask.record_requests(task.mou, [(_request(), detail)])
+
+    ReportTask.record_requests(
+        task.mou, [(_request(paid_date=date(2026, 10, 20)), detail)]
+    )
+
+    assert Report.objects.count() == 1
+    assert Report.objects.get().paid_date == date(2026, 10, 20)
+
+
+def test_declined_report_claims_no_money(settings):
+    task, link, report, ReportTask = _reported_task(settings)
+    assert task.reported_budget == 50.0
+
+    ReportTask.record_requests(
+        task.mou,
+        [(_request(declined=True), _detail(tasks={"1l": 50.0}, links={link.url}))],
+    )
+
+    task = Task.objects.get(pk=task.pk)
+    assert Report.objects.get().declined
+    assert task.reported_budget == 0.0
+    assert task.unreported_budget == 50.0  # the work still needs requesting
+
+
+def test_requested_figure_is_not_recomputed_from_the_lines(settings):
+    task, link, report, ReportTask = _reported_task(settings)
+    ReportTask.record_requests(
+        task.mou, [(_request(), _detail(tasks={"1l": 90.0}, links={link.url}))]
+    )
+    report = Report.objects.get()
+
+    line = ReportLine.objects.get(report=report, link=link)
+    line.budget = 500.0
+    line.save(update_fields=["budget"])
+
+    assert ReportTask.objects.get(report=report, task=task).budget == 90

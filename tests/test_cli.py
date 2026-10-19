@@ -761,6 +761,7 @@ def test_task_export_writes_a_csv_row_per_task(tmp_path):
             "personal_budget": "200.0",
             "max_budget": "500.0",
             "used_budget": "50.0",
+            "remaining_budget": "",
             "description": "Do the thing",
         }
     ]
@@ -4961,6 +4962,7 @@ def test_stats_help_lists_subcommands_alphabetically():
         "days",
         "implementation",
         "review",
+        "tags",
         "today",
         "total",
     ]
@@ -4994,8 +4996,10 @@ def test_mou_help_lists_subcommands_alphabetically():
         "list",
         "plot",
         "remove",
+        "secret",
         "select",
         "status",
+        "update",
     ]
 
 
@@ -6326,10 +6330,19 @@ def test_mou_plot_complete_asks_for_a_deadline(settings):
     assert "deadline" in result.output
 
 
+def _task_with_report(mou, name, reported, **fields):
+    """A task whose own reports hold `reported` EUR; used_budget matches it."""
+    task = Task.objects.create(mou=mou, name=name, used_budget=reported, **fields)
+    link = Link.objects.create(task=task, url=f"https://example.com/issues/{name}")
+    report = Report.objects.create(id=f"{mou.name}-{name}", mou=mou)
+    ReportLine.objects.create(report=report, link=link, budget=reported)
+    return task
+
+
 def test_task_plot_complete_shows_submitted_and_worked_separately(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
-    task = Task.objects.create(mou=mou, name="10a", max_budget=400.0, used_budget=100)
+    task = _task_with_report(mou, "10a", 100, max_budget=400.0)
     link = Link.objects.create(task=task, url="https://example.com/issues/1")
     now = timezone.now()
     TimeRecord.objects.create(
@@ -6339,7 +6352,7 @@ def test_task_plot_complete_shows_submitted_and_worked_separately(settings):
     result = runner.invoke(app, ["task", "plot", "complete"])
 
     assert result.exit_code == 0, result.output
-    assert "submitted" in result.output
+    assert "reported" in result.output
     assert "worked" in result.output
 
 
@@ -6381,10 +6394,11 @@ def test_mou_plot_weeks_fails_without_rate(settings):
     assert result.exit_code != 0
 
 
-def test_task_plot_complete_shows_right_aligned_budget_amounts():
+def test_task_plot_complete_shows_right_aligned_budget_amounts(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
-    Task.objects.create(mou=mou, name="1a", max_budget=1200.0, used_budget=50)
-    Task.objects.create(mou=mou, name="1b", max_budget=300.0, used_budget=5)
+    _task_with_report(mou, "1a", 50, max_budget=1200.0)
+    _task_with_report(mou, "1b", 5, max_budget=300.0)
 
     result = runner.invoke(app, ["task", "plot", "complete"])
 
@@ -6400,8 +6414,8 @@ def test_task_plot_complete_shows_right_aligned_budget_amounts():
 def test_task_plot_complete_hours_replaces_euros_with_time(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
-    Task.objects.create(mou=mou, name="1a", max_budget=1200.0, used_budget=50)
-    Task.objects.create(mou=mou, name="1b", max_budget=300.0, used_budget=5)
+    _task_with_report(mou, "1a", 50, max_budget=1200.0)
+    _task_with_report(mou, "1b", 5, max_budget=300.0)
 
     result = runner.invoke(app, ["task", "plot", "complete", "--hours"])
 
@@ -6486,9 +6500,7 @@ def test_complete_task_name_offers_nothing_without_a_selected_mou():
 def test_task_plot_complete_marks_spending_over_the_budget(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
-    Task.objects.create(
-        mou=mou, name="10a", max_budget=400.0, used_budget=150
-    ).set_budget(100.0)
+    _task_with_report(mou, "10a", 150, max_budget=400.0).set_budget(100.0)
 
     result = runner.invoke(app, ["task", "plot", "complete"], color=True)
 
@@ -6501,9 +6513,7 @@ def test_task_plot_complete_marks_spending_over_the_budget(settings):
 def test_task_plot_complete_amount_is_bright_green_when_all_is_submitted(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
-    submitted = Task.objects.create(
-        mou=mou, name="1a", max_budget=400.0, used_budget=80
-    )
+    submitted = _task_with_report(mou, "1a", 80, max_budget=400.0)
     submitted.set_budget(200.0)
     worked = Task.objects.create(mou=mou, name="2a", max_budget=400.0)
     worked.set_budget(200.0)
@@ -6525,12 +6535,8 @@ def test_task_plot_complete_amount_is_bright_green_when_all_is_submitted(setting
 def test_task_plot_complete_budget_amount_matches_used_when_none_is_left(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
-    Task.objects.create(
-        mou=mou, name="1a", max_budget=400.0, used_budget=200
-    ).set_budget(200.0)
-    Task.objects.create(
-        mou=mou, name="2a", max_budget=400.0, used_budget=100
-    ).set_budget(200.0)
+    _task_with_report(mou, "1a", 200, max_budget=400.0).set_budget(200.0)
+    _task_with_report(mou, "2a", 100, max_budget=400.0).set_budget(200.0)
 
     result = runner.invoke(app, ["task", "plot", "complete"], color=True)
 
@@ -6547,7 +6553,7 @@ def test_task_plot_complete_budget_amount_matches_used_when_none_is_left(setting
 def test_task_plot_complete_amounts_turn_yellow_and_red_when_over_budget(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
-    over = Task.objects.create(mou=mou, name="1a", max_budget=400.0, used_budget=300)
+    over = _task_with_report(mou, "1a", 300, max_budget=400.0)
     over.set_budget(200.0)
 
     result = runner.invoke(app, ["task", "plot", "complete"], color=True)
@@ -6556,11 +6562,10 @@ def test_task_plot_complete_amounts_turn_yellow_and_red_when_over_budget(setting
     assert "\x1b[93m300€\x1b[0m / \x1b[31m200€" in row
 
 
-def test_task_plot_complete_percent_shows_percent_of_the_maximum():
+def test_task_plot_complete_percent_shows_percent_of_the_maximum(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
     mou = MoU.objects.create(name="nlnet-2026")
-    Task.objects.create(
-        mou=mou, name="1a", max_budget=400.0, used_budget=100
-    ).set_budget(200.0)
+    _task_with_report(mou, "1a", 100, max_budget=400.0).set_budget(200.0)
 
     result = runner.invoke(app, ["task", "plot", "complete", "--percent"])
 
@@ -6611,7 +6616,7 @@ def test_stats_review_histograms_closed_issues_and_pull_requests():
     assert "..." in result.output
     assert "40-50 min | █ 1" in result.output
     assert "Closed pull requests (review) (1" in result.output
-    assert "median: 0:25  average: 0:25" in result.output
+    assert "review total: 0:50  average: 0:25" in result.output
     assert Link.objects.get(url="https://github.com/o/r/issues/1").closed_at
     assert Link.objects.get(url="https://github.com/o/r/issues/3").closed_at is None
 
@@ -6627,3 +6632,201 @@ def test_stats_review_histograms_closed_issues_and_pull_requests():
     assert again.exit_code == 0, again.output
     assert asked == ["https://github.com/o/r/issues/3"]
     assert "median: 0:25" in again.output
+
+
+def test_stats_tags_compares_implementation_and_review_in_colour():
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    task = Task.objects.create(mou=mou, name="10a")
+    now = timezone.now()
+    url = "https://github.com/o/r/issues/1"
+    link = Link.objects.create(task=task, url=url)
+    link.add_tag("implementation")
+    link.add_tag("review")
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(minutes=15), end_time=now
+    )
+    requested = []
+
+    def fake_fetch(references, token=None):
+        requested.extend(reference.url for reference in references)
+        return [GitHubState(Status.CLOSED, None, "title") for _ in references]
+
+    with patch("nlnet_rfp_recorder.timetracking.models.link.fetch_states", fake_fetch):
+        result = runner.invoke(app, ["stats", "tags"], color=True)
+
+    assert result.exit_code == 0, result.output
+    assert requested == [url]
+    assert "\x1b[33m" in result.output  # yellow: implementation
+    assert "\x1b[35m" in result.output  # magenta: review
+    assert "10-20 min" in result.output
+    assert "implementation total: 0:15" in result.output
+    assert "poisson median:" in result.output
+
+
+RFP_SECRET = "05c87d16-06e5-4a78-8bae-7fc6e96ec0c1"
+RFP_LINK = f"https://nlnet.nl/rfp/?project=2026-04-3e6&secret={RFP_SECRET}"
+RFP_FIXTURE = Path(__file__).parent / "data" / "rfp_new_request.html"
+
+
+def _mock_rfp_requests(requests=()):
+    return patch(
+        "nlnet_rfp_recorder.rfp_page.fetch_rfp_requests", return_value=list(requests)
+    )
+
+
+def _invoke_mou_update(*args: str):
+    with patch("nlnet_rfp_recorder.cli.shutil.copy2"):
+        return runner.invoke(app, ["mou", "update", *args])
+
+
+def test_mou_secret_from_link_saves_project_and_secret():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["mou", "secret", RFP_LINK])
+
+    assert result.exit_code == 0, result.output
+    mou = MoU.objects.get()
+    assert (mou.rfp_project, mou.rfp_secret) == ("2026-04-3e6", RFP_SECRET)
+
+
+def test_mou_secret_bare_secret_needs_a_known_project():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["mou", "secret", RFP_SECRET])
+
+    assert result.exit_code != 0
+    assert MoU.objects.get().rfp_secret == ""
+
+
+def test_mou_secret_bare_secret_uses_project_named_mou():
+    runner.invoke(app, ["mou", "add", "2026-04-3e6"])
+
+    result = runner.invoke(app, ["mou", "secret", RFP_SECRET])
+
+    assert result.exit_code == 0, result.output
+    assert MoU.objects.get().rfp_project == "2026-04-3e6"
+
+
+def test_mou_update_fails_without_secret():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = _invoke_mou_update()
+
+    assert result.exit_code != 0
+    assert "rfp mou secret" in result.output
+
+
+def test_mou_update_sets_descriptions_and_numbers():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["mou", "secret", RFP_LINK])
+
+    with _mock_rfp_requests():
+        result = _invoke_mou_update(str(RFP_FIXTURE))
+
+    assert result.exit_code == 0, result.output
+    task = Task.objects.get(name="1b")
+    assert task.description == "Bug fixes"
+    assert task.max_budget == 4800.0
+    assert task.remaining_budget == 4690.0
+    assert task.used_budget == 110.0
+    # The tasks' remaining budgets (3500 + 4690 + 0), not stored on the MoU.
+    assert MoU.objects.get().rfp_budget_left == 8190.0
+    assert "NLnet budget left: 8190€" in runner.invoke(app, ["mou", "status"]).output
+
+
+def test_mou_import_from_link_saves_the_secret_and_reads_the_requests():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    with _mock_rfp_requests() as fetch:
+        result = _invoke_mou_import(RFP_LINK)
+
+    assert result.exit_code == 0, result.output
+    assert MoU.objects.get().rfp_secret == RFP_SECRET
+    fetch.assert_called_once_with("2026-04-3e6", RFP_SECRET)
+
+
+def test_mou_update_never_sends_a_post_request():
+    import niquests
+
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["mou", "secret", RFP_LINK])
+    forbidden = AssertionError("a POST request was sent")
+    with (
+        patch.object(niquests, "post", side_effect=forbidden),
+        patch.object(niquests.Session, "post", side_effect=forbidden),
+        patch.object(niquests, "get", side_effect=RuntimeError("get only")) as get,
+    ):
+        result = _invoke_mou_update(str(RFP_FIXTURE))
+
+    assert get.call_count == 1  # only the overview was asked for, with GET
+    assert "a POST request was sent" not in result.output
+
+
+def test_rfp_page_module_has_no_post_request():
+    source = (
+        Path(__file__).parent.parent / "src" / "nlnet_rfp_recorder" / "rfp_page.py"
+    ).read_text()
+
+    assert ".post(" not in source
+
+
+def test_mou_import_of_a_missing_file_fails(tmp_path):
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = _invoke_mou_import(str(tmp_path / "nope.txt"))
+
+    assert result.exit_code != 0
+
+
+def _plot_with_remaining(remaining_budget):
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(
+        mou=mou, name="10a", max_budget=300.0, remaining_budget=remaining_budget
+    )
+    task.set_budget(100.0)
+    return runner.invoke(
+        app, ["task", "plot", "complete"], color=True, terminal_width=80
+    )
+
+
+def test_task_plot_complete_marks_unclaimable_rest_light_red():
+    result = _plot_with_remaining(150.0)
+
+    assert result.exit_code == 0, result.output
+    assert "unavailable" in result.output
+    assert "\x1b[91m█" in result.output  # bright red cells
+
+
+def test_task_plot_complete_without_unclaimable_rest_has_no_light_red():
+    for remaining in (None, 300.0):
+        result = _plot_with_remaining(remaining)
+
+        assert result.exit_code == 0, result.output
+        assert "unavailable" not in result.output
+        MoU.objects.all().delete()
+
+
+def test_task_plot_complete_shows_used_by_others_in_grey():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a", max_budget=300.0, used_budget=100)
+    task.set_budget(100.0)
+
+    result = runner.invoke(app, ["task", "plot", "complete"], color=True)
+
+    assert result.exit_code == 0, result.output
+    assert "used by others" in result.output
+    assert "\x1b[90m█" in result.output  # bright black cells
+
+
+def test_task_plot_complete_all_shows_tasks_without_personal_budget():
+    mou = MoU.objects.create(name="nlnet-2026")
+    Task.objects.create(mou=mou, name="1a", max_budget=300.0, personal_budget=100.0)
+    Task.objects.create(mou=mou, name="1b", max_budget=200.0, personal_budget=0.0)
+
+    without = runner.invoke(app, ["task", "plot", "complete"])
+    everything = runner.invoke(app, ["task", "plot", "complete", "--all"])
+
+    assert without.exit_code == 0, without.output
+    assert "1b" not in without.output
+    assert everything.exit_code == 0, everything.output
+    assert "1b" in everything.output

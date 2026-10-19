@@ -390,6 +390,8 @@ def _echo_task_status(task: Task) -> None:
         typer.echo(task.description)
     if task.budget_line is not None:
         typer.echo(str(task.budget_line))
+    if task.remaining_budget is not None:
+        typer.echo(f"NLnet budget remaining: {task.remaining_budget:.0f}€")
 
 
 def _read_budget_from_stdin() -> str:
@@ -743,6 +745,8 @@ def _echo_mou_status(mou: MoU) -> None:
     typer.echo(f"MoU: {mou.display_name}")
     if mou.budget_line is not None:
         typer.echo(str(mou.budget_line))
+    if mou.rfp_budget_left is not None:
+        typer.echo(f"NLnet budget left: {mou.rfp_budget_left:.0f}€")
     if mou.start_date is not None:
         typer.echo(f"Started: {mou.start_date}")
     days = mou.days_to_deadline()
@@ -884,14 +888,13 @@ def mou_remove(
 
 @mou_app.command("import")
 def mou_import(
-    path: Path | None = typer.Argument(
+    source: str | None = typer.Argument(
         None,
-        exists=True,
-        dir_okay=False,
         autocompletion=_complete_any_path,
         help=(
-            "Path to a budget document (milestone table or takentaal). "
-            "Omit to paste it via stdin."
+            "Path to a budget document (milestone table or takentaal), or "
+            "an NLnet RfP link (https://nlnet.nl/rfp/?project=...&secret=...) "
+            "to scrape. Omit to paste a document via stdin."
         ),
     ),
     mou: str | None = typer.Option(
@@ -903,7 +906,7 @@ def mou_import(
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Read milestone budgets from a file (or stdin) and cap matching tasks."""
+    """Read milestone budgets from a file, RfP link or stdin and cap matching tasks."""
     _setup(db, test)
     from django.core.exceptions import ValidationError
 
@@ -924,8 +927,16 @@ def mou_import(
     _, backup_file = _backup_database("mou-import")
     typer.echo(f"Backed up database to {backup_file}")
 
-    text = path.read_text() if path is not None else _read_budget_from_stdin()
-    tasks = selected.set_budget(text)
+    is_link = source is not None and source.startswith(("http://", "https://"))
+    path = None if is_link or source is None else Path(source)
+    if path is not None and not path.is_file():
+        _fail(f"No such file: {source}")
+    if is_link:
+        # The task list needs the saved form: see `rfp mou update`.
+        tasks = _update_from_rfp(selected, link=source)
+    else:
+        text = path.read_text() if path is not None else _read_budget_from_stdin()
+        tasks = selected.set_budget(text)
     # Newly created tasks default to selected, which would leave several
     # selected at once - start with none, like a fresh `rfp task select`.
     from nlnet_rfp_recorder.timetracking.models import Task, TimeRecord
@@ -935,11 +946,133 @@ def mou_import(
     stopped = TimeRecord.stop()
     if stopped is not None:
         _echo_stopped(stopped)
-    source = str(path) if path is not None else "stdin"
+    source = source if source is not None else "stdin"
     typer.echo(
         f"Imported budget for MoU {selected.display_name} from {source} "
         f"({len(tasks)} tasks)."
     )
+
+
+def _update_from_rfp(
+    mou: MoU, link: str | None = None, page_file: Path | None = None
+) -> dict[str, Task]:
+    """Read the MoU's RfP pages (after remembering `link`, if given).
+
+    Only GET requests are ever made. The tasks come from `page_file`, a
+    saved "New request" form; the reports from the overview and request
+    pages.
+    """
+    from nlnet_rfp_recorder.rfp_page import parse_rfp_page
+
+    if link is not None:
+        try:
+            mou.set_rfp_link(link)
+        except ValueError as error:
+            _fail(str(error))
+    if not mou.rfp_secret or not mou.rfp_project:
+        _fail("No RfP secret set. Run `rfp mou secret <link>` first.")
+    tasks: dict[str, Task] = {}
+    if page_file is not None:
+        page = parse_rfp_page(page_file.read_text())
+        if not page.milestones:
+            _fail(f"No milestones found in {page_file}.")
+        tasks = mou.update_from_rfp_page(page)
+        if mou.rfp_budget_left is not None:
+            typer.echo(f"NLnet budget left: {mou.rfp_budget_left:.0f}€")
+    _update_reports_from_rfp(mou)
+    return tasks
+
+
+def _update_reports_from_rfp(mou: MoU) -> None:
+    """Record the status and figures of every request on NLnet's pages."""
+    from nlnet_rfp_recorder.rfp_page import fetch_rfp_requests
+    from nlnet_rfp_recorder.timetracking.models import ReportTask
+
+    try:
+        requests = fetch_rfp_requests(mou.rfp_project, mou.rfp_secret)
+    except Exception as error:
+        _fail(f"Could not read the RfP requests: {error}")
+    for report, request in ReportTask.record_requests(mou, requests):
+        status = (
+            "declined"
+            if request.declined
+            else "retracted"
+            if request.retracted
+            else "paid"
+            if request.paid_date
+            else "approved"
+            if request.approved_date
+            else "confirmed"
+            if request.confirmed
+            else "unconfirmed"
+        )
+        typer.echo(f"{report.id}: {request.amount:.0f}€ {status}")
+
+
+@mou_app.command("secret")
+def mou_secret(
+    link: str = typer.Argument(
+        ..., help="NLnet RfP link (with project and secret) or just the secret."
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Set the selected MoU's RfP page secret from a link or directly.
+
+    A bare secret works when the project id is known already (from an
+    earlier link) or is the MoU's name, e.g. 2026-04-3e6.
+    """
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import MoU
+
+    selected = MoU.get_selected()
+    if selected is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+    try:
+        selected.set_rfp_link(link)
+    except ValueError as error:
+        _fail(str(error))
+    typer.echo(f"Saved RfP secret for project {selected.rfp_project}.")
+    typer.echo("Run `rfp mou update` to read the tasks and budget from NLnet.")
+
+
+@mou_app.command("update")
+def mou_update(
+    page: Path | None = typer.Argument(
+        None,
+        exists=True,
+        dir_okay=False,
+        autocompletion=_complete_any_path,
+        help=(
+            'The "New request" form saved from your browser (HTML): '
+            "updates the task descriptions, budgets and what is left."
+        ),
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Update tasks and reports from NLnet's RfP pages.
+
+    Reads the overview and every request with GET requests - never a
+    POST, so nothing can be submitted. Each request goes to the matching
+    report (a report of this tool is renamed to <MoU>-<date>-<recipient>-
+    <index>, other people's requests become reports of their own) with its
+    status: confirmed, approved and paid date, declined or retracted -
+    those claim no money - and what was requested per task. The task
+    list is only on the "New request" form: open it in your browser, save
+    the page and pass the file to also update the task descriptions and
+    budgets.
+    """
+    _setup(db, test)
+    from nlnet_rfp_recorder.timetracking.models import MoU
+
+    selected = MoU.get_selected()
+    if selected is None:
+        _fail("No MoU selected. Run `rfp mou add <name>` first.")
+    _, backup_file = _backup_database("mou-update")
+    typer.echo(f"Backed up database to {backup_file}")
+    tasks = _update_from_rfp(selected, page_file=page)
+    typer.echo(f"Updated {len(tasks)} tasks of MoU {selected.display_name}.")
 
 
 @mou_app.command("export")
@@ -1767,6 +1900,8 @@ app.add_typer(stats_app, name="stats")
 CALENDAR_LABEL_WIDTH = 5  # termgraph's "Mon: " row label
 LIGHT_GREEN = "bright_green"
 LIGHT_YELLOW = "bright_yellow"
+LIGHT_RED = "bright_red"
+GREY = "bright_black"
 DARK_GREEN = 28  # 256-colour palette; the plain "green" is too bright to tell apart
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -2126,19 +2261,27 @@ def task_plot_complete(
         "--percent",
         help="Show percent of the maximum budget instead of euros next to the bars.",
     ),
+    all_tasks: bool = typer.Option(
+        False,
+        "--all",
+        help="Also show tasks without a personal budget (0) and nothing used.",
+    ),
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
     """Show each task's completion as a stacked bar.
 
     Every bar is the same width (percent of the task's maximum budget); a
-    task without an assigned budget is left out, and a blank line
+    task without an assigned budget is left out (unless `--all`), and a blank line
     separates the task groups (5g, 6a), each headed by a line with its
-    totals. Light green is the budget submitted, dark green the budget
+    totals. Light green is the budget reported, dark green the budget
     worked since, light yellow what is over the budget, yellow the rest of the
-    budget (the assigned personal budget), red the rest of the
-    maximum budget. The bars fill the terminal width; without a known
-    width, 50 cells are used.
+    budget (the assigned personal budget), red the rest of the maximum
+    budget, light red the part of that rest NLnet has no budget left for
+    (see `rfp mou update`), and right-most grey what others used on the
+    RfP page (used minus reported) - the limit for what to claim. The
+    bars fill the terminal width; without a known width, 50 cells are
+    used.
     """
     _setup(db, test)
     from nlnet_rfp_recorder.timetracking.models import MoU, Task
@@ -2150,15 +2293,27 @@ def task_plot_complete(
     rows: list[tuple[str, str, list[float], float, float, float]] = []
     for task in sorted(Task.objects.filter(mou=mou), key=lambda task: task.sort_key):
         line = task.budget_line
-        submitted = task.used_budget + task.reported_budget
-        worked = (task.budget or 0.0) - task.reported_budget
+        # Mine: reported in a report (light green) and worked since. What
+        # others used on the RfP page is drawn apart from it.
+        submitted = task.reported_budget
+        worked = task.unreported_budget
         used = submitted + worked
         assigned = line.total if line is not None else 0.0
-        if assigned <= 0 and used <= 0:
+        if assigned <= 0 and used <= 0 and not all_tasks:
             continue
         total = max(task.max_budget or 0.0, assigned, used)
         # What was spent beyond the budget gets its own colour instead of
         # being drawn as submitted/worked.
+        # Of the unclaimed rest of the maximum, what NLnet has no budget
+        # left for (its remaining budget is lower) is not claimable.
+        rest = max(total - max(assigned, used), 0.0)
+        by_others = min(task.used_by_others, rest)
+        unclaimable = 0.0
+        if task.remaining_budget is not None and task.max_budget is not None:
+            unclaimable = min(
+                rest - by_others,
+                max(task.max_budget - task.used_budget - task.remaining_budget, 0.0),
+            )
         submitted_in_budget = min(submitted, assigned)
         worked_in_budget = min(used, assigned) - submitted_in_budget
         rows.append(
@@ -2170,7 +2325,9 @@ def task_plot_complete(
                     worked_in_budget,
                     max(assigned - used, 0.0),
                     max(used - assigned, 0.0),
-                    max(total - max(assigned, used), 0.0),
+                    rest - by_others - unclaimable,
+                    unclaimable,
+                    by_others,
                 ],
                 used,
                 assigned,
@@ -2235,17 +2392,37 @@ def task_plot_complete(
     columns = shutil.get_terminal_size(fallback=(0, 0)).columns
     # "label : " in front of the bar, one spare column at the end.
     width = max(columns - label_width - amount_width - 6, 1) if columns else 50
-    colors = (LIGHT_GREEN, DARK_GREEN, "yellow", LIGHT_YELLOW, "red")
+    colors = (
+        LIGHT_GREEN,
+        DARK_GREEN,
+        "yellow",
+        LIGHT_YELLOW,
+        "red",
+        LIGHT_RED,
+        GREY,
+    )
 
     typer.echo(f"Completion of {mou.display_name}")
     typer.echo(
         " ".join(
             typer.style("█ " + name, fg=color)
-            for name, color in zip(
-                ("submitted", "worked", "budget", "over budget", "max"),
-                colors,
-                strict=True,
+            for index, (name, color) in enumerate(
+                zip(
+                    (
+                        "reported",
+                        "worked",
+                        "budget",
+                        "over budget",
+                        "max",
+                        "unavailable",
+                        "used by others",
+                    ),
+                    colors,
+                    strict=True,
+                )
             )
+            # Only explain the colours some bar actually has.
+            if index < 5 or any(entry and entry[1][index] for entry in entries)
         )
     )
     for entry in entries:
@@ -2334,54 +2511,122 @@ def stats_total(db: Path | None = DbOption, test: bool = TestOption) -> None:
     _echo_stats(Statistics.total(_stats_mou()))
 
 
-def _echo_histogram(title: str, durations: list[timedelta]) -> None:
-    from nlnet_rfp_recorder.statistics import histogram_rows, median_duration
+# (tag, colour) of each histogram series; "yellow"/"magenta" are the
+# terminal's own palette entries, so they follow the user's theme.
+TAG_COLORS = {"implementation": "yellow", "review": "magenta"}
 
-    typer.echo(f"{title} ({len(durations)}, count is per URL)")
-    if not durations:
+
+def _echo_histogram(
+    title: str, series: list[tuple[str, str | None, list[timedelta]]]
+) -> None:
+    """Print a histogram of (name, colour, durations) series in shared columns.
+
+    With several series the bars are stacked on one line, each in its
+    own colour, followed by the counts in the same colours.
+    """
+    from nlnet_rfp_recorder.statistics import (
+        average_duration,
+        histogram_rows,
+        median_duration,
+        poisson_median_duration,
+        poisson_stdev_duration,
+        stdev_duration,
+    )
+
+    def paint(text: str, color: str | None) -> str:
+        return typer.style(text, fg=color) if color else text
+
+    total = sum(len(durations) for _, _, durations in series)
+    typer.echo(f"{title} ({total}, count is per URL)")
+    rows = histogram_rows([durations for _, _, durations in series])
+    if not rows:
         typer.echo("  none closed")
         return
-    rows = histogram_rows(durations)
+    if len(series) > 1:
+        typer.echo(
+            "  " + "  ".join(paint(f"█ {name}", color) for name, color, _ in series)
+        )
     label_width = max(len(row[0]) for row in rows if row is not None)
     for row in rows:
         if row is None:
             typer.echo("  ...")
             continue
-        label, count = row
-        typer.echo(f"  {label.rjust(label_width)} | {'█' * count} {count}")
-    average = sum(durations, timedelta()) / len(durations)
-    typer.echo(
-        f"  median: {_format_duration(median_duration(durations))}"
-        f"  average: {_format_duration(average)}"
-    )
+        label, counts = row
+        bars = "".join(
+            paint("█" * count, color) for count, (_, color, _) in zip(counts, series)
+        )
+        numbers = " ".join(
+            paint(str(count), color) for count, (_, color, _) in zip(counts, series)
+        )
+        typer.echo(f"  {label.rjust(label_width)} | {bars} {numbers}")
+    for name, color, durations in series:
+        if not durations:
+            continue
+        fmt = _format_duration
+        typer.echo(
+            paint(
+                f"  {name} total: {fmt(sum(durations, timedelta()))}"
+                f"  average: {fmt(average_duration(durations))}",
+                color,
+            )
+        )
+        typer.echo(
+            paint(
+                f"     poisson median: {fmt(poisson_median_duration(durations))}"
+                f"  std deviation: {fmt(poisson_stdev_duration(durations))}",
+                color,
+            )
+        )
+        typer.echo(
+            paint(
+                f"    (normal  median: {fmt(median_duration(durations))}"
+                f"  std deviation: {fmt(stdev_duration(durations))})",
+                color,
+            )
+        )
 
 
-def _stats_closed_histogram(tag: str, db: Path | None, test: bool) -> None:
+def _stats_closed_histograms(
+    tags: tuple[str, ...], db: Path | None, test: bool, colored: bool = False
+) -> None:
     _setup(db, test)
     from nlnet_rfp_recorder.statistics import closed_link_durations
     from nlnet_rfp_recorder.timetracking.models import GitHubToken
 
     try:
-        issues, pull_requests = closed_link_durations(
-            _stats_mou(), tag, GitHubToken.get()
-        )
+        durations = closed_link_durations(_stats_mou(), tags, GitHubToken.get())
     except Exception as error:
         _fail(f"Could not fetch the GitHub status: {error}")
-    _echo_histogram(f"Closed issues ({tag})", issues)
-    typer.echo()
-    _echo_histogram(f"Closed pull requests ({tag})", pull_requests)
+    label = " / ".join(tags)
+    for index, kind in enumerate(("issues", "pull requests")):
+        if index:
+            typer.echo()
+        _echo_histogram(
+            f"Closed {kind} ({label})",
+            [
+                (tag, TAG_COLORS[tag] if colored else None, durations[tag][index])
+                for tag in tags
+            ],
+        )
 
 
 @stats_app.command("review")
 def stats_review(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Histogram of review time invested per closed issue / pull request."""
-    _stats_closed_histogram("review", db, test)
+    _stats_closed_histograms(("review",), db, test)
 
 
 @stats_app.command("implementation")
 def stats_implementation(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Histogram of implementation time invested per closed issue / pull request."""
-    _stats_closed_histogram("implementation", db, test)
+    _stats_closed_histograms(("implementation",), db, test)
+
+
+@stats_app.command("tags")
+def stats_tags(db: Path | None = DbOption, test: bool = TestOption) -> None:
+    """Compare implementation (yellow) and review (purple) time per closed
+    issue / pull request in one histogram."""
+    _stats_closed_histograms(("implementation", "review"), db, test, colored=True)
 
 
 def _enable_task_completion(mou: MoU) -> Callable[[], None]:

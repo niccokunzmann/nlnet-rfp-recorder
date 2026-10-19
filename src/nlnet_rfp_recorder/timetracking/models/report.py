@@ -3,12 +3,16 @@ from __future__ import annotations
 import csv
 import io
 import math
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 from django.conf import settings
 from django.db import models
+from django.db.models.signals import post_delete, post_save
+from django.dispatch import receiver
 
 from nlnet_rfp_recorder.csvutil import read_dict_rows
 
@@ -18,6 +22,9 @@ from .mou import MoU
 from .tag import Tag
 from .task import Task
 from .time_record import TimeRecord
+
+if TYPE_CHECKING:
+    from nlnet_rfp_recorder.rfp_page import RfpRequest, RfpRequestDetail
 
 
 def _is_blank_row(row: dict[str, str | None]) -> bool:
@@ -212,6 +219,40 @@ class Report(models.Model):
     created = models.DateTimeField(
         auto_now_add=True, help_text="When this report was generated."
     )
+    rfp_request = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "Id of this report's request on NLnet's RfP page, set by `rfp mou update`."
+        ),
+    )
+    recipient = models.CharField(
+        max_length=80,
+        blank=True,
+        default="",
+        help_text="Who the request pays, as listed on NLnet's RfP page.",
+    )
+    confirmed = models.BooleanField(
+        default=False, help_text="Whether the submitter verified the request by email."
+    )
+    retracted = models.BooleanField(
+        default=False, help_text="Whether the request was retracted by the submitter."
+    )
+    declined = models.BooleanField(
+        default=False, help_text="Whether NLnet declined the request."
+    )
+    approved_date = models.DateField(
+        null=True, blank=True, help_text="When NLnet approved the request."
+    )
+    paid_date = models.DateField(
+        null=True, blank=True, help_text="When NLnet paid the request."
+    )
+
+    @property
+    def claims_money(self) -> bool:
+        """Declined and retracted requests claim no money."""
+        return not (self.declined or self.retracted)
 
     @classmethod
     def create(cls, mou: MoU) -> Report:
@@ -229,6 +270,25 @@ class Report(models.Model):
         ]
         next_number = max(numbers, default=0) + 1
         return cls.objects.create(id=f"{prefix}{next_number}", mou=mou)
+
+    def rename(self, new_id: str) -> Report:
+        """Give this report another id (the id is the primary key, so the
+        report is copied under the new id, its lines and task budgets are
+        moved over and the old one is removed). Returns the report; it stays
+        as it is if the id is taken.
+        """
+        if new_id == self.pk or Report.objects.filter(pk=new_id).exists():
+            return self
+        old_id = self.pk
+        created = self.created
+        self.pk = new_id
+        self.save(force_insert=True)
+        Report.objects.filter(pk=new_id).update(created=created)
+        ReportLine.objects.filter(report_id=old_id).update(report_id=new_id)
+        ReportTask.objects.filter(report_id=old_id).update(report_id=new_id)
+        Report.objects.filter(pk=old_id).delete()
+        self.refresh_from_db()
+        return self
 
     def add_time_record(self, record: TimeRecord) -> None:
         task = record.link.task if record.link else None
@@ -740,6 +800,174 @@ class ReportLine(models.Model):
 
     def __str__(self) -> str:
         return f"{self.report_id}: {self.link}"
+
+
+class ReportTask(models.Model):
+    """What a report requests for one task - the task-report link.
+
+    The figure is the task's total as the report prints it (see
+    _task_budget: every link rounded up to 5, the small ones pooled and
+    rounded up to 10), recorded so it stays what was actually requested.
+    It is kept up to date whenever the report's lines change.
+    """
+
+    report = models.ForeignKey(
+        Report,
+        on_delete=models.CASCADE,
+        related_name="task_budgets",
+        help_text="The report requesting the budget.",
+    )
+    task = models.ForeignKey(
+        Task,
+        on_delete=models.CASCADE,
+        related_name="report_budgets",
+        help_text="The task the budget is requested for.",
+    )
+    budget = models.IntegerField(
+        help_text="The amount (EUR) this report requests for the task."
+    )
+    requested = models.BooleanField(
+        default=False,
+        help_text=(
+            "Whether the budget was read back from NLnet's request page "
+            "(`rfp mou update`) - then it is what was requested and the "
+            "report's lines no longer change it."
+        ),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["report", "task"], name="unique_report_task"
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.report_id}: {self.task_id} {self.budget}€"
+
+    @classmethod
+    def sync(cls, report_id: str) -> None:
+        """Record the requested figure of every task in the report."""
+        lines_by_task: dict[int, list[ReportLine]] = {}
+        for line in ReportLine.objects.filter(
+            report_id=report_id, link__task__isnull=False
+        ).select_related("link"):
+            lines_by_task.setdefault(line.link.task_id, []).append(line)
+        for task_id, lines in lines_by_task.items():
+            # What NLnet confirmed having received is not recomputed.
+            if cls.objects.filter(
+                report_id=report_id, task_id=task_id, requested=True
+            ).exists():
+                continue
+            cls.objects.update_or_create(
+                report_id=report_id,
+                task_id=task_id,
+                defaults={"budget": _task_budget(lines)[0]},
+            )
+        cls.objects.filter(report_id=report_id).exclude(
+            task_id__in=lines_by_task
+        ).delete()
+
+    @classmethod
+    def record_requests(
+        cls, mou: MoU, requests: Iterable[tuple[RfpRequest, RfpRequestDetail]]
+    ) -> list[tuple[Report, RfpRequest]]:
+        """Bring the reports in line with NLnet's requests.
+
+        A request goes to the report already holding its id, else to the
+        report of this tool sharing the most links and task totals with it
+        (at least one link; each report and request is used once), else a
+        new report is made for it - that is how other people's requests
+        come in. The report takes the request's status and the requested
+        task totals, and a report made by this tool is renamed to
+        `<MoU>-<date>-<recipient>-<index>`. Returns the (report, request)
+        pairs.
+        """
+        requests = list(requests)
+        by_request = {
+            report.rfp_request: report
+            for report in Report.objects.filter(mou=mou).exclude(rfp_request="")
+        }
+        own = {
+            report: {line.link.url for line in report.lines.select_related("link")}
+            for report in Report.objects.filter(mou=mou, rfp_request="")
+            if report.lines.exists()
+        }
+        pairs: dict[str, Report] = {
+            request.id: by_request[request.id]
+            for request, _ in requests
+            if request.id in by_request
+        }
+        scored = []
+        for request, detail in requests:
+            if request.id in pairs:
+                continue
+            for report, urls in own.items():
+                shared = len(urls & detail.links)
+                if not shared:
+                    continue
+                totals = {
+                    budget.task.name: budget.budget
+                    for budget in report.task_budgets.select_related("task")
+                }
+                equal = sum(
+                    1
+                    for name, amount in detail.tasks.items()
+                    if totals.get(name) == amount
+                )
+                scored.append((shared + equal, request.id, report))
+        scored.sort(key=lambda item: -item[0])
+        taken: set[str] = set()
+        for _, request_id, report in scored:
+            if request_id not in pairs and report.pk not in taken:
+                pairs[request_id] = report
+                taken.add(report.pk)
+
+        tasks = {task.name: task for task in mou.tasks.all()}
+        result = []
+        for request, detail in requests:
+            report = pairs.get(request.id)
+            if report is None:
+                report = Report(id=_request_report_id(mou, request), mou=mou)
+                if Report.objects.filter(pk=report.pk).exists():
+                    continue
+                report.save()
+            report.rfp_request = request.id
+            report.recipient = request.recipient
+            report.confirmed = request.confirmed
+            report.retracted = request.retracted
+            report.declined = request.declined
+            report.approved_date = request.approved_date
+            report.paid_date = request.paid_date
+            report.save()
+            for name, amount in detail.tasks.items():
+                if name in tasks:
+                    cls.objects.update_or_create(
+                        report=report,
+                        task=tasks[name],
+                        defaults={"budget": round(amount), "requested": True},
+                    )
+            result.append((report.rename(_request_report_id(mou, request)), request))
+        return result
+
+
+def _request_report_id(mou: MoU, request: RfpRequest) -> str:
+    """`<MoU>-<date>-<recipient>-<index on the page>`."""
+    recipient = re.sub(r"[^\w.-]+", "_", request.recipient)
+    return f"{mou.name}-{request.date}-{recipient}-{request.index}"
+
+
+@receiver([post_save, post_delete], sender=ReportLine)
+def _sync_report_task_budgets(sender, instance: ReportLine, **kwargs) -> None:
+    if Report.objects.filter(pk=instance.report_id).exists():
+        ReportTask.sync(instance.report_id)
+
+
+@receiver(post_save, sender=Link)
+def _sync_moved_link(sender, instance: Link, **kwargs) -> None:
+    """A link moved to another task moves its reported budget with it."""
+    for report_id in set(instance.report_lines.values_list("report_id", flat=True)):
+        ReportTask.sync(report_id)
 
 
 @dataclass

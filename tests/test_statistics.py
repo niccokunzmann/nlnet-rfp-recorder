@@ -337,14 +337,27 @@ def test_histogram_rows_collapse_runs_of_empty_columns():
     from nlnet_rfp_recorder.statistics import histogram_rows
 
     minutes = [5, 15, 35, 36, 95]
-    rows = histogram_rows([timedelta(minutes=m) for m in minutes])
+    rows = histogram_rows([[timedelta(minutes=m) for m in minutes]])
     assert rows == [
-        ("0-10 min", 1),
-        ("10-20 min", 1),
-        ("20-30 min", 0),
-        ("30-40 min", 2),
+        ("0-10 min", (1,)),
+        ("10-20 min", (1,)),
+        ("20-30 min", (0,)),
+        ("30-40 min", (2,)),
         None,
-        ("90-100 min", 1),
+        ("90-100 min", (1,)),
+    ]
+
+
+def test_histogram_rows_share_columns_between_series():
+    from nlnet_rfp_recorder.statistics import histogram_rows
+
+    rows = histogram_rows(
+        [[timedelta(minutes=5)], [timedelta(minutes=5), timedelta(minutes=25)]]
+    )
+    assert rows == [
+        ("0-10 min", (1, 1)),
+        ("10-20 min", (0, 0)),
+        ("20-30 min", (0, 1)),
     ]
 
 
@@ -357,3 +370,24 @@ def test_median_duration():
     assert median_duration([timedelta(minutes=m) for m in (2, 4)]) == timedelta(
         minutes=3
     )
+
+
+def test_stdev_duration():
+    from nlnet_rfp_recorder.statistics import stdev_duration
+
+    assert stdev_duration([timedelta(minutes=5)]) == timedelta()
+    assert stdev_duration([timedelta(minutes=m) for m in (10, 20)]) == timedelta(
+        seconds=(2 * 300**2) ** 0.5
+    )
+
+
+def test_poisson_functions_use_ten_minute_units():
+    from nlnet_rfp_recorder.statistics import (
+        poisson_median_duration,
+        poisson_stdev_duration,
+    )
+
+    durations = [timedelta(minutes=m) for m in (30, 50)]  # lambda = 4 units
+    assert poisson_stdev_duration(durations) == timedelta(minutes=20)
+    # Poisson(4): P(<=3) = 0.43 < 0.5 <= P(<=4) = 0.63
+    assert poisson_median_duration(durations) == timedelta(minutes=40)

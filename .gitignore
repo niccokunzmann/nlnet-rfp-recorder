@@ -11,3 +11,6 @@ wheels/
 .prompts
 todo.txt
 /.prompts/
+
+/new_request.html
+ignore/

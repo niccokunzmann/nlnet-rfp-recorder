@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import TYPE_CHECKING
@@ -8,7 +10,6 @@ from django.conf import settings
 from django.utils import timezone
 
 if TYPE_CHECKING:
-    from nlnet_rfp_recorder.github import GitHubReference
     from nlnet_rfp_recorder.timetracking.models import MoU, Task
 
 
@@ -151,57 +152,70 @@ BIN_MINUTES = 10
 
 
 def closed_link_durations(
-    mou: MoU, tag: str, token: str | None = None
-) -> tuple[list[timedelta], list[timedelta]]:
-    """Total time per closed issue and per closed pull request.
+    mou: MoU, tags: Sequence[str], token: str | None = None
+) -> dict[str, tuple[list[timedelta], list[timedelta]]]:
+    """Total time per closed issue and per closed pull request, per tag.
 
-    Returns (issue_durations, pull_request_durations), one entry per URL:
-    the summed time of its finished records. Only links of `mou`'s tasks
-    tagged `tag` ("implementation" or "review") whose GitHub state is
-    closed are counted; other kinds of link are ignored.
+    Maps each tag ("implementation" or "review") to (issue_durations,
+    pull_request_durations), one entry per URL: the summed time of its
+    finished records. Only links of `mou`'s tasks carrying that tag whose
+    GitHub state is closed are counted; other kinds of link are ignored.
+    GitHub is asked once for all tags together (see Link.update_from_github).
     """
     from nlnet_rfp_recorder.timetracking.models import Link
 
-    links = Link.objects.filter(task__mou=mou, tags__name=tag).distinct()
-    totals: list[tuple[Link, GitHubReference, timedelta]] = []
-    for link in links:
-        reference = link.pr or link.issue
-        if reference is None:
-            continue
-        total = sum(
-            (
-                record.end_time - record.start_time
-                for record in link.time_records.exclude(end_time=None)
-            ),
-            timedelta(),
-        )
-        if total > timedelta():
-            totals.append((link, reference, total))
-    Link.update_from_github([link for link, _, _ in totals], token)
-    issues, pull_requests = [], []
-    for link, _, total in totals:
-        if link.is_closed:
-            (pull_requests if link.is_pr else issues).append(total)
-    return issues, pull_requests
+    # A link carrying several tags is one object, so it is updated once.
+    links: dict[int, Link] = {}
+    totals: dict[str, list[tuple[Link, timedelta]]] = {}
+    for tag in tags:
+        totals[tag] = []
+        for found in Link.objects.filter(task__mou=mou, tags__name=tag).distinct():
+            link = links.setdefault(found.id, found)
+            if not (link.is_pr or link.is_issue):
+                continue
+            total = sum(
+                (
+                    record.end_time - record.start_time
+                    for record in link.time_records.exclude(end_time=None)
+                ),
+                timedelta(),
+            )
+            if total > timedelta():
+                totals[tag].append((link, total))
+    Link.update_from_github(
+        [link for link in links.values() if link.is_pr or link.is_issue], token
+    )
+    result = {}
+    for tag, entries in totals.items():
+        issues = [total for link, total in entries if link.is_closed and not link.is_pr]
+        pull_requests = [
+            total for link, total in entries if link.is_closed and link.is_pr
+        ]
+        result[tag] = (issues, pull_requests)
+    return result
 
 
-def histogram_rows(durations: list[timedelta]) -> list[tuple[str, int] | None]:
-    """Count durations in 10-minute columns, from the first to the last
-    non-empty one. Two or more empty columns in a row become one None
-    (shown as "..."); a single empty column stays as a zero-count row.
+def histogram_rows(
+    series: Sequence[list[timedelta]],
+) -> list[tuple[str, tuple[int, ...]] | None]:
+    """Count each series' durations in shared 10-minute columns, from the
+    first to the last column any series uses. Two or more columns in a row
+    that are empty in every series become one None (shown as "..."); a
+    single such column stays as a row of zero counts.
     """
-    counts: dict[int, int] = {}
-    for duration in durations:
-        index = int(duration.total_seconds() // 60) // BIN_MINUTES
-        counts[index] = counts.get(index, 0) + 1
+    counts: dict[int, list[int]] = {}
+    for position, durations in enumerate(series):
+        for duration in durations:
+            index = int(duration.total_seconds() // 60) // BIN_MINUTES
+            counts.setdefault(index, [0] * len(series))[position] += 1
     if not counts:
         return []
-    rows: list[tuple[str, int] | None] = []
+    rows: list[tuple[str, tuple[int, ...]] | None] = []
     empty_run: list[int] = []
 
     def flush() -> None:
         if len(empty_run) == 1:
-            rows.append(_bin_row(empty_run[0], 0))
+            rows.append(_bin_row(empty_run[0], [0] * len(series)))
         elif empty_run:
             rows.append(None)
         empty_run.clear()
@@ -215,9 +229,9 @@ def histogram_rows(durations: list[timedelta]) -> list[tuple[str, int] | None]:
     return rows
 
 
-def _bin_row(index: int, count: int) -> tuple[str, int]:
+def _bin_row(index: int, counts: list[int]) -> tuple[str, tuple[int, ...]]:
     low = index * BIN_MINUTES
-    return f"{low}-{low + BIN_MINUTES} min", count
+    return f"{low}-{low + BIN_MINUTES} min", tuple(counts)
 
 
 def median_duration(durations: list[timedelta]) -> timedelta:
@@ -226,3 +240,43 @@ def median_duration(durations: list[timedelta]) -> timedelta:
     if len(ordered) % 2:
         return ordered[middle]
     return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def average_duration(durations: list[timedelta]) -> timedelta:
+    """The mean - also the Poisson rate (lambda) estimate, so one function
+    serves both the normal and the Poisson view."""
+    return sum(durations, timedelta()) / len(durations)
+
+
+def stdev_duration(durations: list[timedelta]) -> timedelta:
+    """Sample standard deviation (normal distribution); zero for fewer
+    than two durations."""
+    if len(durations) < 2:
+        return timedelta()
+    seconds = [duration.total_seconds() for duration in durations]
+    mean = sum(seconds) / len(seconds)
+    variance = sum((value - mean) ** 2 for value in seconds) / (len(seconds) - 1)
+    return timedelta(seconds=variance**0.5)
+
+
+def poisson_stdev_duration(durations: list[timedelta]) -> timedelta:
+    """Standard deviation if durations were Poisson counts of 10-minute
+    units: the variance equals the mean, so sqrt(lambda) units.
+    """
+    rate = average_duration(durations) / timedelta(minutes=BIN_MINUTES)
+    return timedelta(minutes=BIN_MINUTES) * rate**0.5
+
+
+def poisson_median_duration(durations: list[timedelta]) -> timedelta:
+    """Median of the Poisson distribution fitted to the durations (counted
+    in 10-minute units): the smallest k whose cumulative probability
+    reaches one half, so always a whole number of units.
+    """
+    rate = average_duration(durations) / timedelta(minutes=BIN_MINUTES)
+    cumulative = 0.0
+    k = 0
+    while True:
+        cumulative += math.exp(-rate + k * math.log(rate) - math.lgamma(k + 1))
+        if cumulative >= 0.5:
+            return timedelta(minutes=BIN_MINUTES) * k
+        k += 1

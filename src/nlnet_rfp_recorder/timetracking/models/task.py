@@ -59,16 +59,25 @@ class Task(models.Model):
         null=True,
         blank=True,
         help_text=(
-            "The maximum amount (EUR) the MoU allows for this task, e.g. "
-            "as imported from a milestone budget table."
+            "The maximum amount (EUR) the MoU allows for this task (fixed), "
+            "e.g. as imported from a milestone budget table."
+        ),
+    )
+    remaining_budget = models.FloatField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Budget (EUR) NLnet still has available for this task, as "
+            "scraped by `rfp mou update` (max_budget minus used_budget)."
         ),
     )
     used_budget = models.FloatField(
         default=0.0,
         help_text=(
-            "Budget (EUR) already spent on this task before this tool "
-            "started tracking it, e.g. from an earlier milestone report. "
-            "Set via `rfp mou import` or `rfp task set used`."
+            "Budget (EUR) NLnet's RfP page counts as used for this task, "
+            "independent of reported_budget (the reports of your own time "
+            "records). Set via `rfp mou update`, `rfp mou import` or "
+            "`rfp task set used`. What others used is used_by_others."
         ),
     )
     personal_budget = models.FloatField(
@@ -76,7 +85,8 @@ class Task(models.Model):
         blank=True,
         help_text=(
             "The amount (EUR) you've personally decided to spend on this "
-            "task, up to max_budget - used as the budget_line total for "
+            "task (fixed, but you can change it), up to max_budget - used "
+            "as the budget_line total for "
             "completion/time-left purposes. Set via `rfp task set "
             "--budget`. Falls back to max_budget when unset - see "
             "effective_personal_budget."
@@ -339,19 +349,67 @@ class Task(models.Model):
 
     @property
     def reported_budget(self) -> float:
-        """Budget already locked in by report lines for this task's links."""
+        """Budget requested for this task by the reports (see ReportTask),
+        i.e. rounded the way a report prints it.
+        """
+        from .report import ReportTask
+
+        if settings.RFP_EUROS_PER_HOUR is None:
+            return 0.0
+        # Only my own reports (they have lines), and only those that claim money.
+        budgets = ReportTask.objects.filter(
+            task=self,
+            report__declined=False,
+            report__retracted=False,
+            report__lines__isnull=False,
+        ).distinct()
+        return float(sum(budget.budget for budget in budgets))
+
+    @property
+    def declined_budget(self) -> float:
+        """Budget of lines in declined or retracted reports: those claim no
+        money, so the work counts as not requested yet.
+        """
+        from django.db.models import Q
+
         from .report import ReportLine
 
         if settings.RFP_EUROS_PER_HOUR is None:
             return 0.0
-        return sum(line.budget for line in ReportLine.objects.filter(link__task=self))
+        lines = ReportLine.objects.filter(link__task=self).filter(
+            Q(report__declined=True) | Q(report__retracted=True)
+        )
+        return sum(line.budget for line in lines)
+
+    @property
+    def unreported_budget(self) -> float:
+        """Budget (EUR) of the tracked time that is in no (claiming) report."""
+        return (self.budget or 0.0) - self.reported_budget
+
+    @property
+    def submitted_budget(self) -> float:
+        """Budget (EUR) submitted, without counting anything twice.
+
+        My reports are normally part of what the RfP page counts as used
+        once paid, so it is the larger of the two, not their sum.
+        """
+        return max(self.used_budget, self.reported_budget)
+
+    @property
+    def used_by_others(self) -> float:
+        """Budget (EUR) used on the RfP page beyond what my reports hold.
+
+        used_budget is what the RfP page says is used; reported_budget is
+        the part of it that is in my own reports for this task.
+        """
+        return max(self.used_budget - self.reported_budget, 0.0)
 
     @property
     def budget(self) -> float | None:
         if settings.RFP_EUROS_PER_HOUR is None:
             return None
         live = self.duration.total_seconds() / 3600 * settings.RFP_EUROS_PER_HOUR
-        return live + self.reported_budget
+        return live + self.declined_budget + self.reported_budget
 
     @property
     def effective_personal_budget(self) -> float | None:
@@ -368,7 +426,7 @@ class Task(models.Model):
         total = self.effective_personal_budget
         if total is None:
             return None
-        used = self.used_budget + (self.budget or 0.0)
+        used = self.submitted_budget + self.unreported_budget
         return BudgetLine(used=used, total=total, rate=settings.RFP_EUROS_PER_HOUR)
 
     def set_budget(self, amount: float) -> None:

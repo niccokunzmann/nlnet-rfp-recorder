@@ -15,6 +15,8 @@ from nlnet_rfp_recorder.csvutil import read_dict_rows
 from nlnet_rfp_recorder.mou_budget import parse_milestone_budgets
 
 if TYPE_CHECKING:
+    from nlnet_rfp_recorder.rfp_page import RfpPage
+
     from .task import Task
 
 mou_name_validator = RegexValidator(
@@ -22,15 +24,17 @@ mou_name_validator = RegexValidator(
     message="MoU name must not contain spaces.",
 )
 
-# used_budget is exported for reference only - it is never applied on
-# import, since its baseline is only ever meant to be set by `rfp mou
-# import` or `rfp task set used`, not by hand-editing a spreadsheet.
+# used_budget and remaining_budget are exported for reference only - they are
+# never applied on import, since used_budget's baseline is only ever meant to
+# be set by `rfp mou import`/`update` or `rfp task set used`, and
+# remaining_budget by `rfp mou update`, not by hand-editing a spreadsheet.
 TASK_CSV_FIELDNAMES = [
     "id",
     "alias",
     "personal_budget",
     "max_budget",
     "used_budget",
+    "remaining_budget",
     "description",
 ]
 
@@ -90,6 +94,22 @@ class MoU(models.Model):
         ),
     )
 
+    rfp_project = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="NLnet project id (e.g. 2026-04-3e6). Set via `rfp mou secret`.",
+    )
+    rfp_secret = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "Secret of this MoU's NLnet Request for Payment page. Set via "
+            "`rfp mou secret`; used by `rfp mou update`."
+        ),
+    )
+
     @classmethod
     def select(cls, name: str) -> MoU:
         cls(name=name).full_clean(
@@ -140,6 +160,50 @@ class MoU(models.Model):
             tasks[code] = task
         return tasks
 
+    def set_rfp_link(self, text: str) -> None:
+        """Remember the RfP page's project and secret from a link or bare secret.
+
+        A bare secret needs the project id from an earlier link, or an MoU
+        named like the project (2026-04-3e6).
+        """
+        from nlnet_rfp_recorder.rfp_page import PROJECT_ID, parse_rfp_link
+
+        project, secret = parse_rfp_link(text)
+        if project is None:
+            project = self.rfp_project or (
+                self.name if PROJECT_ID.match(self.name) else ""
+            )
+        if not project:
+            raise ValueError(
+                "Give the whole link (with project=...), the project id is unknown."
+            )
+        self.rfp_project = project
+        self.rfp_secret = secret
+        self.save(update_fields=["rfp_project", "rfp_secret"])
+
+    def update_from_rfp_page(self, page: RfpPage) -> dict[str, Task]:
+        """Create/update tasks from a scraped RfP page.
+
+        Sets each task's description, max_budget (the MoU amount),
+        remaining_budget and used_budget (what NLnet already paid out).
+        """
+        from .task import Task
+
+        tasks: dict[str, Task] = {}
+        for code, milestone in page.milestones.items():
+            task, _ = Task.objects.update_or_create(
+                mou=self,
+                name=code,
+                defaults={
+                    "max_budget": milestone.amount,
+                    "remaining_budget": milestone.available,
+                    "used_budget": max(milestone.amount - milestone.available, 0.0),
+                    "description": milestone.description,
+                },
+            )
+            tasks[code] = task
+        return tasks
+
     def export_tasks(self) -> str:
         """Export this MoU's tasks as CSV, one row per task, sorted by id."""
         from .alias import Alias
@@ -165,6 +229,9 @@ class MoU(models.Model):
                     ),
                     "max_budget": "" if task.max_budget is None else task.max_budget,
                     "used_budget": task.used_budget,
+                    "remaining_budget": (
+                        "" if task.remaining_budget is None else task.remaining_budget
+                    ),
                     "description": task.description,
                 }
             )
@@ -182,7 +249,8 @@ class MoU(models.Model):
         column). The caller asks about removing both (see `rfp task
         import`).
 
-        used_budget is read back but ignored - see TASK_CSV_FIELDNAMES.
+        used_budget and remaining_budget are read back but ignored - see
+        TASK_CSV_FIELDNAMES.
 
         This import is the source of truth for which task has which
         alias: a row's alias always wins, stealing it from whatever task
@@ -281,6 +349,14 @@ class MoU(models.Model):
         return sum(amount or 0.0 for amount in amounts)
 
     @property
+    def rfp_budget_left(self) -> float | None:
+        """Budget (EUR) NLnet still has available, summed over the tasks."""
+        amounts = [task.remaining_budget for task in self.tasks.all()]
+        if all(amount is None for amount in amounts):
+            return None
+        return sum(amount or 0.0 for amount in amounts)
+
+    @property
     def total_personal_budget(self) -> float | None:
         """Sum of the tasks' effective personal budgets (EUR), if any is known."""
         amounts = [task.effective_personal_budget for task in self.tasks.all()]
@@ -290,7 +366,10 @@ class MoU(models.Model):
 
     @property
     def total_used(self) -> float:
-        return sum(task.used_budget + (task.budget or 0.0) for task in self.tasks.all())
+        """Budget (EUR) used: submitted plus unreported, see Task.budget_line."""
+        return sum(
+            task.submitted_budget + task.unreported_budget for task in self.tasks.all()
+        )
 
     @property
     def personal_budget_left(self) -> float:
@@ -344,15 +423,13 @@ class MoU(models.Model):
 
     @property
     def submitted_budget(self) -> float:
-        """Budget (EUR) already submitted: the baseline plus reported time."""
-        return sum(task.used_budget + task.reported_budget for task in self.tasks.all())
+        """Budget (EUR) already submitted, see Task.submitted_budget."""
+        return sum(task.submitted_budget for task in self.tasks.all())
 
     @property
     def worked_budget(self) -> float:
         """Budget (EUR) of tracked time not submitted in a report yet."""
-        return sum(
-            (task.budget or 0.0) - task.reported_budget for task in self.tasks.all()
-        )
+        return sum(task.unreported_budget for task in self.tasks.all())
 
     def expected_budget(self, today: datetime.date | None = None) -> float | None:
         """Where the used budget should be today if the personal budget is

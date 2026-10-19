@@ -17,6 +17,7 @@ from .report import (
     REPORT_LINE_FIELDNAMES,
     Report,
     ReportLine,
+    ReportTask,
     format_report_link,
 )
 from .tag import TAG_NAMES, Tag
@@ -36,6 +37,7 @@ __all__ = [
     "MoU",
     "Report",
     "ReportLine",
+    "ReportTask",
     "Tag",
     "Task",
     "TaskWarning",
