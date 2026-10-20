@@ -4527,19 +4527,50 @@ def test_stats_groups_two_tasks_separately_with_a_total(settings):
     assert "40€" in result.output
 
 
-def test_stats_ignores_other_mous_and_untracked_time(settings):
+def _track_hour(task_or_none, url, hours=1):
+    link = Link.objects.create(task=task_or_none, url=url)
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=hours), end_time=now
+    )
+
+
+def test_stats_lists_every_mou_with_tracked_time(settings):
     settings.RFP_EUROS_PER_HOUR = 20.0
     MoU.objects.create(name="nlnet-2026", selected=True)
-    other = MoU.objects.create(name="nlnet-2025")
-    task = Task.objects.create(mou=other, name="10a")
-    now = timezone.now()
-    for link in (
-        Link.objects.create(task=task, url="https://example.com/issues/1"),
-        Link.objects.create(url="https://example.com/issues/2"),
-    ):
-        TimeRecord.objects.create(
-            link=link, start_time=now - timedelta(hours=1), end_time=now
-        )
+    old = MoU.objects.create(name="nlnet-2025")
+    new = MoU.objects.create(name="nlnet-2027")
+    MoU.objects.create(name="nlnet-empty")
+    _track_hour(Task.objects.create(mou=old, name="10a"), "https://example.com/1")
+    _track_hour(Task.objects.create(mou=new, name="20b"), "https://example.com/2", 2)
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.index("MoU: nlnet-2025") < result.output.index("10a")
+    assert result.output.index("10a") < result.output.index("MoU: nlnet-2027")
+    assert result.output.index("MoU: nlnet-2027") < result.output.index("20b")
+    assert "nlnet-empty" not in result.output
+    assert "nlnet-2026" not in result.output
+    total = result.output.splitlines()[-1].split()
+    assert total == ["All", "MoUs", "3:00", "60€", "60€"]
+
+
+def test_stats_with_one_mou_has_no_all_mous_total(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    mou = MoU.objects.create(name="nlnet-2026", selected=True)
+    _track_hour(Task.objects.create(mou=mou, name="10a"), "https://example.com/1")
+
+    result = runner.invoke(app, ["stats", "today"])
+
+    assert "All MoUs" not in result.output
+    assert "MoU:" not in result.output
+
+
+def test_stats_leaves_out_untracked_time(settings):
+    settings.RFP_EUROS_PER_HOUR = 20.0
+    MoU.objects.create(name="nlnet-2026", selected=True)
+    _track_hour(None, "https://example.com/issues/2")
 
     result = runner.invoke(app, ["stats", "today"])
 
@@ -4547,11 +4578,11 @@ def test_stats_ignores_other_mous_and_untracked_time(settings):
     assert "No time tracked in this period." in result.output
 
 
-def test_stats_fails_without_a_selected_mou():
+def test_stats_without_any_mou_says_nothing_was_tracked():
     result = runner.invoke(app, ["stats", "today"])
 
-    assert result.exit_code != 0
-    assert "No MoU selected" in result.output
+    assert result.exit_code == 0, result.output
+    assert "No time tracked in this period." in result.output
 
 
 def test_stats_hides_budget_when_rfp_euros_per_hour_is_unset(settings):

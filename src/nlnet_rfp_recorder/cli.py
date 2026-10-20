@@ -1772,13 +1772,13 @@ def status(db: Path | None = DbOption, test: bool = TestOption) -> None:
         typer.echo(f"Running: {url} ({_format_duration(running.duration)})")
 
 
-def _echo_stats(stats: Statistics) -> None:
+def _echo_stats(stats: Statistics, total_only: str | None = None) -> None:
     """Print a Statistics result as a table: id, alias, time, Euro, new,
     <threshold>+ - then a Total row (skipped when there's only one task,
     since that row already is the total).
 
-    Covers every task across every MoU, not just the selected one - this
-    is a personal "how much did I work" view, not a report. The alias
+    Covers the tasks of the one MoU it is given (see _echo_stats_per_mou,
+    which prints one such table per MoU). The alias
     column is dropped entirely when no task in the result has one; the
     money columns (Euro, new, <threshold>+) are dropped together when the
     hourly rate is unknown. A task's "new" cell is its budget not yet
@@ -1831,7 +1831,7 @@ def _echo_stats(stats: Statistics) -> None:
         headers += ["Euro", "new", threshold_header]
 
     rows = [headers]
-    for ts in stats.per_task:
+    for ts in [] if total_only else stats.per_task:
         id_ = ts.task.name if ts.task is not None else "?"
         rows.append(
             _row(
@@ -1843,12 +1843,12 @@ def _echo_stats(stats: Statistics) -> None:
                 ts.new_above_threshold,
             )
         )
-    if len(stats.per_task) > 1:
+    if total_only or len(stats.per_task) > 1:
         # A single task's row already is the total - repeating it would
         # be redundant.
         rows.append(
             _row(
-                "Total",
+                total_only or "Total",
                 None,
                 stats.total_duration,
                 stats.total_budget,
@@ -2467,6 +2467,44 @@ def _stats_mou() -> MoU:
     return mou
 
 
+def _combined_stats(parts: list[Statistics]) -> Statistics:
+    """The sum of several MoUs' statistics, for their shared Total row."""
+    from nlnet_rfp_recorder.statistics import Statistics
+
+    def _sum(values: list[int | None]) -> int | None:
+        return None if any(v is None for v in values) else sum(values)
+
+    return Statistics(
+        per_task=[task for stats in parts for task in stats.per_task],
+        total_duration=sum((s.total_duration for s in parts), timedelta()),
+        total_budget=_sum([s.total_budget for s in parts]),
+        total_new_budget=_sum([s.total_new_budget for s in parts]),
+        total_new_above_threshold=_sum([s.total_new_above_threshold for s in parts]),
+        threshold=parts[0].threshold,
+    )
+
+
+def _echo_stats_per_mou(compute: Callable[[MoU], Statistics]) -> None:
+    """Print the statistics of every MoU that has any tracked time, each
+    under its name (a single one is printed without a heading).
+    """
+    from nlnet_rfp_recorder.timetracking.models import MoU
+
+    results = [(mou, compute(mou)) for mou in MoU.objects.order_by("name")]
+    results = [(mou, stats) for mou, stats in results if stats.per_task]
+    if not results:
+        typer.echo("No time tracked in this period.")
+    for index, (mou, stats) in enumerate(results):
+        if len(results) > 1:
+            if index:
+                typer.echo()
+            typer.echo(f"MoU: {mou.display_name}")
+        _echo_stats(stats)
+    if len(results) > 1:
+        typer.echo()
+        _echo_stats(_combined_stats([stats for _, stats in results]), "All MoUs")
+
+
 @stats_app.callback()
 def stats_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Show time/budget statistics."""
@@ -2478,11 +2516,11 @@ def stats_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
 @stats_app.command("today", epilog=STATS_COLUMNS_HELP)
 def stats_today(db: Path | None = DbOption, test: bool = TestOption) -> None:
-    """Show time and budget worked today, per task and in total."""
+    """Show time and budget worked today, per task and in total, for each MoU."""
     _setup(db, test)
     from nlnet_rfp_recorder.statistics import Statistics
 
-    _echo_stats(Statistics.today(_stats_mou()))
+    _echo_stats_per_mou(Statistics.today)
 
 
 @stats_app.command("days", epilog=STATS_COLUMNS_HELP)
@@ -2491,24 +2529,22 @@ def stats_days(
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Show time and budget worked in the last N days, per task and in total."""
+    """Show time and budget worked in the last N days, per MoU, task and in total."""
     _setup(db, test)
     from nlnet_rfp_recorder.statistics import Statistics
 
-    try:
-        stats = Statistics.days(n, _stats_mou())
-    except ValueError as error:
-        _fail(str(error))
-    _echo_stats(stats)
+    if n <= 0:
+        _fail("Number of days must be positive.")
+    _echo_stats_per_mou(lambda mou: Statistics.days(n, mou))
 
 
 @stats_app.command("total", epilog=STATS_COLUMNS_HELP)
 def stats_total(db: Path | None = DbOption, test: bool = TestOption) -> None:
-    """Show time and budget worked across all recorded time, per task and in total."""
+    """Show time and budget worked across all recorded time, for each MoU."""
     _setup(db, test)
     from nlnet_rfp_recorder.statistics import Statistics
 
-    _echo_stats(Statistics.total(_stats_mou()))
+    _echo_stats_per_mou(Statistics.total)
 
 
 # (tag, colour) of each histogram series; "yellow"/"magenta" are the
