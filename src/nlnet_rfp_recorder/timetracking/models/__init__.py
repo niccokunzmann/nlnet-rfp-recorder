@@ -20,6 +20,7 @@ from .report import (
     ReportTask,
     format_report_link,
 )
+from .sync import SyncDeletion, SyncSettings, sync_now
 from .tag import TAG_NAMES, Tag
 from .task import Task, task_name_validator
 from .time_record import TimeRecord, TimeRecordManager, TimeSpan
@@ -38,6 +39,8 @@ __all__ = [
     "Report",
     "ReportLine",
     "ReportTask",
+    "SyncDeletion",
+    "SyncSettings",
     "Tag",
     "Task",
     "TaskWarning",
@@ -50,5 +53,6 @@ __all__ = [
     "resolve_link",
     "resolve_mou_name",
     "resolve_task_name",
+    "sync_now",
     "task_name_validator",
 ]

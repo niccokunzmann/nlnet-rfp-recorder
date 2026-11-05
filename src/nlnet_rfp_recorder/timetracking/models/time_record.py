@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -14,6 +15,7 @@ from nlnet_rfp_recorder.timesheet import TimesheetRow, format_hhmmss, parse_hhmm
 from .alias import Alias
 from .link import Link
 from .mou import MoU
+from .sync import sync_now
 from .tag import TAG_NAMES
 from .task import Task
 
@@ -63,6 +65,38 @@ class TimeRecordManager(models.Manager):
 
 
 class TimeRecord(models.Model):
+    uuid = models.UUIDField(
+        default=uuid.uuid4,
+        unique=True,
+        editable=False,
+        help_text="Identifies this time entry across computers for `rfp sync`.",
+    )
+    modified = models.CharField(
+        max_length=32,
+        default=sync_now,
+        editable=False,
+        help_text=(
+            "When this time entry last changed (UTC) - set by a database trigger, "
+            "whichever code changed it. The newest version wins in `rfp sync`."
+        ),
+    )
+    modified_by = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        editable=False,
+        help_text="The computer (`rfp sync` machine id) it last changed on.",
+    )
+    computer = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        editable=False,
+        help_text=(
+            "The computer (`rfp sync` machine id) this entry was started on - "
+            "only that computer's background task stops it on suspend."
+        ),
+    )
     link = models.ForeignKey(
         Link,
         null=True,
@@ -189,8 +223,16 @@ class TimeRecord(models.Model):
         return record if current == set(tags) else None
 
     @classmethod
-    def get_running(cls) -> TimeRecord | None:
-        return cls.objects.running().order_by("-start_time").first()
+    def get_running(cls, here_only: bool = False) -> TimeRecord | None:
+        """The running entry - with `here_only`, only one started on this
+        computer: another computer's timer synced here is that computer's
+        to stop, e.g. its own background task's when it suspends."""
+        running = cls.objects.running()
+        if here_only:
+            from .sync import SyncSettings
+
+            running = running.filter(computer__in=["", SyncSettings.get().machine])
+        return running.order_by("-start_time").first()
 
     @classmethod
     def get_last(cls) -> TimeRecord | None:
@@ -202,9 +244,11 @@ class TimeRecord(models.Model):
         url: str | None = None,
         end_time: datetime | None = None,
         reason: str = "user",
+        here_only: bool = False,
     ) -> TimeRecord | None:
-        """Stop the running entry, recording `reason` (one of STOP_REASONS)."""
-        record = cls.get_running()
+        """Stop the running entry, recording `reason` (one of STOP_REASONS).
+        `here_only`: see get_running()."""
+        record = cls.get_running(here_only=here_only)
         if record is None:
             return None
         if url is not None and record.link is not None and record.link.task is not None:

@@ -4965,6 +4965,7 @@ def test_help_lists_commands_alphabetically():
         "stats",
         "status",
         "stop",
+        "sync",
         "task",
         "timesheet",
         "token",

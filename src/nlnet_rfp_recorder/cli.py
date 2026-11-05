@@ -57,6 +57,11 @@ TestOption = typer.Option(
     "--test",
     help="Run against a throwaway database in /tmp, pre-filled with sample data.",
 )
+NoSyncOption = typer.Option(
+    False,
+    "--no-sync",
+    help="Don't sync with the other computers before and after this command.",
+)
 TagsOption = typer.Option(
     None,
     "--tags",
@@ -69,7 +74,9 @@ TagsOption = typer.Option(
 TEST_DB_FILE = Path(tempfile.gettempdir()) / "rfp-test.sqlite3"
 
 
-def _setup(db: Path | None, test: bool = False) -> None:
+def _setup(db: Path | None, test: bool = False, sync: bool = True) -> None:
+    """Point Django at the database, migrate it and - when `rfp sync` has
+    a repository and `sync` is set - sync before and after the command."""
     if test:
         db = TEST_DB_FILE
     if db is not None:
@@ -86,6 +93,99 @@ def _setup(db: Path | None, test: bool = False) -> None:
 
     if database_file == TEST_DB_FILE and is_new:
         call_command("loaddata", "sample_data", verbosity=0)
+
+    if sync and not test:
+        _sync_around_command()
+
+
+# Set once a command pulled: main() then pushes when the command ends.
+_sync_pending = False
+# Set by --no-sync on `rfp` or a command group, for this invocation.
+_no_sync = False
+
+
+def _skip_sync(no_sync: bool, reset: bool = False) -> None:
+    """Remember --no-sync given before the command, e.g. `rfp --no-sync
+    start` or `rfp task --no-sync list`. The root callback resets it."""
+    global _no_sync
+    if reset:
+        _no_sync = False
+    if no_sync:
+        _no_sync = True
+
+
+def _sync_around_command() -> None:
+    """Take the other computers' changes now and push this command's
+    changes when it ends (see main) - if a repository is set and git can
+    reach it. Ctrl+C skips the sync, not the command.
+    """
+    global _sync_pending
+    from nlnet_rfp_recorder.timetracking.models import SyncSettings
+
+    if (
+        _sync_pending
+        or _no_sync
+        or not SyncSettings.objects.exclude(url="").filter(auto=True).exists()
+    ):
+        return
+    _sync_pending = True
+    _run_sync_step("pull")
+
+
+def _push_after_command() -> None:
+    global _sync_pending
+    if _sync_pending:
+        _sync_pending = False
+        _run_sync_step("push")
+
+
+def _run_sync_step(step: str) -> None:
+    from nlnet_rfp_recorder.sync import Sync
+
+    show_progress = sys.stderr.isatty()
+    if show_progress:
+        sys.stderr.write("Syncing... (Ctrl+C skips)\r")
+        sys.stderr.flush()
+    try:
+        sync = Sync(interactive=False)
+        if step == "pull":
+            result = sync.pull()
+        else:
+            sync.push()
+            result = None
+    except KeyboardInterrupt:
+        _clear_progress(show_progress)
+        typer.echo("Sync interrupted.", err=True)
+        return
+    except Exception as error:
+        _clear_progress(show_progress)
+        typer.echo(f"Sync skipped: {error}", err=True)
+        return
+    _clear_progress(show_progress)
+    if result is not None:
+        _echo_import_result(result, err=True)
+
+
+def _clear_progress(show_progress: bool) -> None:
+    if show_progress:
+        sys.stderr.write("\r\033[K")
+        sys.stderr.flush()
+
+
+def _echo_import_result(result, err: bool = False) -> None:
+    for warning in result.warnings:
+        typer.echo(f"Sync: {warning}", err=err)
+    if result.total:
+        restored = (
+            f", {result.restored} kept and restored for time records"
+            if result.restored
+            else ""
+        )
+        typer.echo(
+            f"Synced from other computers: {result.changed} changed, "
+            f"{result.deleted} deleted{restored}.",
+            err=err,
+        )
 
 
 def _fail(message: str) -> NoReturn:
@@ -664,8 +764,11 @@ def _complete_report_edit_tasks(ctx: typer.Context, incomplete: str) -> list[str
 
 
 @app.callback()
-def callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def callback(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Create RfPs from work on issues and pull requests, record time."""
+    _skip_sync(no_sync, reset=True)
     if test:
         db = TEST_DB_FILE
     if db is not None:
@@ -673,9 +776,11 @@ def callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
 
 @app.command()
-def version(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def version(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Print the installed version."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     typer.echo(get_version("nlnet-rfp-recorder"))
 
 
@@ -701,9 +806,10 @@ def token(
     value: str | None = typer.Argument(None),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Save a GitHub token, or print how to create one if none is given."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     if value is None:
         typer.echo(TOKEN_HELP)
         return
@@ -733,8 +839,11 @@ app.add_typer(mou_app, name="mou")
 
 
 @mou_app.callback()
-def mou_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def mou_callback(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Manage MoUs."""
+    _skip_sync(no_sync)
     if test:
         db = TEST_DB_FILE
     if db is not None:
@@ -764,9 +873,11 @@ def _echo_mou_status(mou: MoU) -> None:
 
 
 @mou_app.command("status")
-def mou_status(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def mou_status(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Print the current MoU's total budget."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     selected = MoU.get_selected()
@@ -784,13 +895,14 @@ def mou_deadline(
     clear: bool = typer.Option(False, "--clear", help="Remove the deadline."),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Show, set or clear the selected MoU's deadline.
 
     The deadline is the date until which all assigned personal budget
     needs to be used up.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from datetime import date as date_type
 
     from nlnet_rfp_recorder.timetracking.models import MoU
@@ -818,9 +930,11 @@ def mou_deadline(
 
 
 @mou_app.command("list")
-def mou_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def mou_list(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """List all MoUs."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     mous = MoU.objects.all()
@@ -834,9 +948,14 @@ def mou_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
 
 @mou_app.command("add")
-def mou_add(name: str, db: Path | None = DbOption, test: bool = TestOption) -> None:
+def mou_add(
+    name: str,
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
+) -> None:
     """Add (and select) an MoU, creating it if it doesn't exist yet."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from django.core.exceptions import ValidationError
 
     from nlnet_rfp_recorder.timetracking.models import MoU
@@ -853,9 +972,10 @@ def mou_select(
     name: str = typer.Argument(..., autocompletion=_complete_mou_name),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Select an existing MoU without creating it."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU, resolve_mou_name
 
     name = resolve_mou_name(name)
@@ -872,9 +992,10 @@ def mou_remove(
     name: str = typer.Argument(..., autocompletion=_complete_mou_name),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Remove an MoU."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU, resolve_mou_name
 
     name = resolve_mou_name(name)
@@ -905,9 +1026,10 @@ def mou_import(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Read milestone budgets from a file, RfP link or stdin and cap matching tasks."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from django.core.exceptions import ValidationError
 
     from nlnet_rfp_recorder.timetracking.models import MoU, resolve_mou_name
@@ -1016,13 +1138,14 @@ def mou_secret(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Set the selected MoU's RfP page secret from a link or directly.
 
     A bare secret works when the project id is known already (from an
     earlier link) or is the MoU's name, e.g. 2026-04-3e6.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     selected = MoU.get_selected()
@@ -1050,6 +1173,7 @@ def mou_update(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Update tasks and reports from NLnet's RfP pages.
 
@@ -1063,7 +1187,7 @@ def mou_update(
     the page and pass the file to also update the task descriptions and
     budgets.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     selected = MoU.get_selected()
@@ -1080,9 +1204,10 @@ def mou_export(
     name: str | None = typer.Argument(None, autocompletion=_complete_mou_name),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Print the raw budget text last imported for a MoU (default: selected)."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU, resolve_mou_name
 
     if name is not None:
@@ -1114,9 +1239,13 @@ app.add_typer(task_app, name="task")
 
 @task_app.callback(invoke_without_command=True)
 def task_callback(
-    ctx: typer.Context, db: Path | None = DbOption, test: bool = TestOption
+    ctx: typer.Context,
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Show the current task's status, or manage tasks via a subcommand."""
+    _skip_sync(no_sync)
     if test:
         db = TEST_DB_FILE
     if db is not None:
@@ -1125,21 +1254,25 @@ def task_callback(
     if ctx.invoked_subcommand is not None:
         return
 
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     _show_task_status()
 
 
 @task_app.command("status")
-def task_status(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def task_status(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Print the current task's statistics."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     _show_task_status()
 
 
 @task_app.command("list")
-def task_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def task_list(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """List tasks for the current MoU, marking the selected one."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     mou = MoU.get_selected()
@@ -1232,12 +1365,13 @@ def task_select(
     name: str | None = typer.Argument(None, autocompletion=_complete_task_name),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Select a task, creating it if it doesn't exist yet.
 
     Run without a name to deselect the current task instead.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     if name is None:
         from nlnet_rfp_recorder.timetracking.models import Task
 
@@ -1345,6 +1479,7 @@ def task_set_budget(
     value: str = ValueArgument,
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Set one or more tasks' personal budget - up to their maximum.
 
@@ -1363,7 +1498,7 @@ def task_set_budget(
 
         rfp task set budget 4 0          Zero out every task starting with "4".
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Task
 
     _run_task_set(tasks, value, Task.set_budget, Task.set_budget_fraction)
@@ -1375,6 +1510,7 @@ def task_set_used(
     value: str = ValueArgument,
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Set one or more tasks' used-budget baseline (money already spent
     before this tool started tracking them).
@@ -1395,7 +1531,7 @@ def task_set_used(
 
         rfp task set used 4 0            Reset every task starting with "4".
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Task
 
     _run_task_set(tasks, value, Task.set_used_budget, Task.set_budget_used_fraction)
@@ -1407,6 +1543,7 @@ def task_set_max(
     value: str = ValueArgument,
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Set one or more tasks' maximum budget directly.
 
@@ -1428,7 +1565,7 @@ def task_set_max(
 
         rfp task set max 4 500           Set every task starting with "4" to 500 EUR.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Task
 
     _run_task_set(tasks, value, Task.set_max_budget, Task.set_max_budget_fraction)
@@ -1439,9 +1576,10 @@ def task_remove(
     name: str = typer.Argument(..., autocompletion=_complete_task_name),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Remove a task from the current MoU."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU, Task, resolve_task_name
 
     mou = MoU.get_selected()
@@ -1466,9 +1604,10 @@ def task_export(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Export the current MoU's tasks as CSV."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     mou = MoU.get_selected()
@@ -1496,6 +1635,7 @@ def task_import(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Import tasks from a CSV file produced by `task export`, creating or
     updating by id.
@@ -1505,7 +1645,7 @@ def task_import(
     task alias, no longer implied by the file is asked about
     individually - by default it's kept; confirming removes it.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Alias, MoU, Task
 
     mou = MoU.get_selected()
@@ -1550,8 +1690,11 @@ app.add_typer(timesheet_app, name="timesheet")
 
 
 @timesheet_app.callback()
-def timesheet_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def timesheet_callback(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Manage individual time entries."""
+    _skip_sync(no_sync)
     if test:
         db = TEST_DB_FILE
     if db is not None:
@@ -1589,13 +1732,15 @@ def _echo_timesheet_row(row: TimesheetRow, stop_reason: str = "") -> None:
 
 
 @timesheet_app.command("list")
-def timesheet_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def timesheet_list(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """List all time entries, one per line.
 
     The last column says why the background task stopped an entry
     (suspend, restart); it is empty for entries stopped by you.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import TimeRecord
 
     records = TimeRecord.objects.order_by("start_time")
@@ -1616,9 +1761,10 @@ def timesheet_export(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Export all time entries as CSV."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timesheet import write_csv
     from nlnet_rfp_recorder.timetracking.models import TimeRecord
 
@@ -1638,9 +1784,10 @@ def timesheet_import(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Import time entries from a CSV file, creating or updating by pk."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timesheet import read_csv
     from nlnet_rfp_recorder.timetracking.models import TimeRecord
 
@@ -1685,10 +1832,13 @@ def timesheet_import(
 
 @timesheet_app.command("remove")
 def timesheet_remove(
-    pk: int, db: Path | None = DbOption, test: bool = TestOption
+    pk: int,
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Remove a time entry by pk."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import TimeRecord
 
     deleted, _ = TimeRecord.objects.filter(pk=pk).delete()
@@ -1729,9 +1879,10 @@ def timesheet_edit(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Replace a time entry's fields by pk."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timesheet import TimesheetRow
     from nlnet_rfp_recorder.timetracking.models import TimeRecord
 
@@ -1747,9 +1898,11 @@ def timesheet_edit(
 
 
 @app.command()
-def status(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def status(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Print MoU, task, and running-timer status."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU, Task, TimeRecord
 
     task = Task.get_selected()
@@ -1927,8 +2080,11 @@ mou_app.add_typer(plot_app, name="plot")
 
 
 @plot_app.callback()
-def plot_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def plot_callback(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Plot time worked."""
+    _skip_sync(no_sync)
     if test:
         db = TEST_DB_FILE
     if db is not None:
@@ -1936,7 +2092,9 @@ def plot_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
 
 @plot_app.command("complete")
-def plot_complete(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def plot_complete(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Show how far the personal budget is used, against the deadline.
 
     The top bar is the whole personal budget: light green is already
@@ -1945,7 +2103,7 @@ def plot_complete(db: Path | None = DbOption, test: bool = TestOption) -> None:
     date to the deadline. Then it says how many hours you are behind or
     in front of that.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     mou = MoU.get_selected()
@@ -2063,6 +2221,7 @@ def plot_weeks(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Show the hours worked in every week since the MoU started against
     the pace required for completion.
@@ -2072,7 +2231,7 @@ def plot_weeks(
     what is missing. The current week is projected: the time worked so far
     divided by the time passed this week, times the 7 days of the week.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
 
     from django.conf import settings
 
@@ -2153,13 +2312,15 @@ def plot_weeks(
 
 
 @plot_app.command("calendar")
-def plot_calendar(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def plot_calendar(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Show a heat map of the hours worked per day.
 
     Covers the dates of the selected MoU, from its start date (its first
     time record) until its deadline, or until today without one.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     import subprocess
     from collections import defaultdict
     from datetime import date, time
@@ -2268,6 +2429,7 @@ def task_plot_complete(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Show each task's completion as a stacked bar.
 
@@ -2283,7 +2445,7 @@ def task_plot_complete(
     bars fill the terminal width; without a known width, 50 cells are
     used.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU, Task
 
     mou = MoU.get_selected()
@@ -2506,8 +2668,11 @@ def _echo_stats_per_mou(compute: Callable[[MoU], Statistics]) -> None:
 
 
 @stats_app.callback()
-def stats_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def stats_callback(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Show time/budget statistics."""
+    _skip_sync(no_sync)
     if test:
         db = TEST_DB_FILE
     if db is not None:
@@ -2515,9 +2680,11 @@ def stats_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
 
 
 @stats_app.command("today", epilog=STATS_COLUMNS_HELP)
-def stats_today(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def stats_today(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Show time and budget worked today, per task and in total, for each MoU."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.statistics import Statistics
 
     _echo_stats_per_mou(Statistics.today)
@@ -2528,9 +2695,10 @@ def stats_days(
     n: int = typer.Argument(..., help="How many days back to look, including today."),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Show time and budget worked in the last N days, per MoU, task and in total."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.statistics import Statistics
 
     if n <= 0:
@@ -2539,9 +2707,11 @@ def stats_days(
 
 
 @stats_app.command("total", epilog=STATS_COLUMNS_HELP)
-def stats_total(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def stats_total(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Show time and budget worked across all recorded time, for each MoU."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.statistics import Statistics
 
     _echo_stats_per_mou(Statistics.total)
@@ -2623,9 +2793,13 @@ def _echo_histogram(
 
 
 def _stats_closed_histograms(
-    tags: tuple[str, ...], db: Path | None, test: bool, colored: bool = False
+    tags: tuple[str, ...],
+    db: Path | None,
+    test: bool,
+    colored: bool = False,
+    sync: bool = True,
 ) -> None:
-    _setup(db, test)
+    _setup(db, test, sync=sync)
     from nlnet_rfp_recorder.statistics import closed_link_durations
     from nlnet_rfp_recorder.timetracking.models import GitHubToken
 
@@ -2647,22 +2821,30 @@ def _stats_closed_histograms(
 
 
 @stats_app.command("review")
-def stats_review(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def stats_review(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Histogram of review time invested per closed issue / pull request."""
-    _stats_closed_histograms(("review",), db, test)
+    _stats_closed_histograms(("review",), db, test, sync=not no_sync)
 
 
 @stats_app.command("implementation")
-def stats_implementation(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def stats_implementation(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Histogram of implementation time invested per closed issue / pull request."""
-    _stats_closed_histograms(("implementation",), db, test)
+    _stats_closed_histograms(("implementation",), db, test, sync=not no_sync)
 
 
 @stats_app.command("tags")
-def stats_tags(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def stats_tags(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Compare implementation (yellow) and review (purple) time per closed
     issue / pull request in one histogram."""
-    _stats_closed_histograms(("implementation", "review"), db, test, colored=True)
+    _stats_closed_histograms(
+        ("implementation", "review"), db, test, colored=True, sync=not no_sync
+    )
 
 
 def _enable_task_completion(mou: MoU) -> Callable[[], None]:
@@ -2892,9 +3074,10 @@ def start(
     tags: str | None = TagsOption,
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Start a time entry, optionally selecting its task first."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     task_name, link = _parse_task_and_link(args, "start")
     _start(link, tags, task_name)
 
@@ -2921,9 +3104,10 @@ def review(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Start a time entry tagged 'review', optionally selecting its task first."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     args = args or []
     if not batch:
         if not args:
@@ -2962,9 +3146,10 @@ def implement(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Start a time entry tagged 'implementation', optionally selecting its task."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     task_name, link = _parse_task_and_link(args, "implement")
     _start(link, "implementation", task_name)
 
@@ -3092,13 +3277,14 @@ def edit(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Edit a time entry's link, tags, MoU, task, start, end, and/or duration.
 
     Defaults to the most recent entry - pass TIMESHEET_PK to edit a
     different one.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Link
 
     record = _resolve_edit_record(timesheet_pk)
@@ -3308,7 +3494,8 @@ def background_task(
     output goes to the terminal and to a log file next to the database
     (see --log).
     """
-    _setup(db, test)
+    # Runs for the whole session: it must not wait on the network at start.
+    _setup(db, test, sync=False)
     from nlnet_rfp_recorder.timetracking.models import BackgroundTask
 
     log_path = _background_log_path()
@@ -3366,9 +3553,10 @@ def stop(
     link: str | None = typer.Argument(None, autocompletion=_complete_link_url),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Stop the currently running time entry, optionally replacing its link."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import TimeRecord
 
     if link is not None:
@@ -3415,6 +3603,7 @@ def continue_(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Start a new time entry for the same link as the last stopped one.
 
@@ -3431,7 +3620,7 @@ def continue_(
     without a TARGET - that entry is already "continuing" - this just
     reports it instead. With a TARGET, the running entry is stopped.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU, TimeRecord
 
     running = TimeRecord.get_running()
@@ -3486,8 +3675,11 @@ app.add_typer(report_app, name="report")
 
 
 @report_app.callback()
-def report_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def report_callback(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Generate and manage reports."""
+    _skip_sync(no_sync)
     if test:
         db = TEST_DB_FILE
     if db is not None:
@@ -3495,9 +3687,11 @@ def report_callback(db: Path | None = DbOption, test: bool = TestOption) -> None
 
 
 @report_app.command("create")
-def report_create(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def report_create(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Generate and persist a budget report grouped by task."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     import niquests
     from django.conf import settings
 
@@ -3546,9 +3740,10 @@ def report_print(
     report_id: str | None = typer.Argument(None, autocompletion=_complete_report_id),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Print a report by id, or a preview of currently unreported entries."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     import niquests
 
     from nlnet_rfp_recorder.timetracking.models import MoU, Report
@@ -3572,9 +3767,11 @@ def report_print(
 
 
 @report_app.command("list")
-def report_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def report_list(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """List reports for the selected MoU: id, creation date, budget used."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU, Report
 
     mou = MoU.get_selected()
@@ -3597,9 +3794,10 @@ def report_remove(
     report_id: str = typer.Argument(..., autocompletion=_complete_report_id),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Remove a report."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Report
 
     deleted, _ = Report.objects.filter(pk=report_id).delete()
@@ -3622,9 +3820,10 @@ def report_export(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Export a report's lines as CSV, to edit budgets, tags, or records."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     import niquests
 
     from nlnet_rfp_recorder.timetracking.models import Report
@@ -3656,6 +3855,7 @@ def report_import(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Replace a report's lines from a CSV file produced by `report export`.
 
@@ -3664,7 +3864,7 @@ def report_import(
     from this report, exclude it from reports permanently, or keep it
     after all.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Report
 
     try:
@@ -3737,6 +3937,7 @@ def report_review(
     report_id: str = typer.Argument(..., autocompletion=_complete_report_id),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Walk through a report task by task, deciding what actually gets reported.
 
@@ -3754,7 +3955,7 @@ def report_review(
     report; they stay reportable later. Nothing changes until you
     confirm the summary at the end.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from django.conf import settings
 
     from nlnet_rfp_recorder.timetracking.models import Report
@@ -3835,6 +4036,7 @@ def report_edit(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Walk through a report link by link, deciding what actually gets reported.
 
@@ -3844,7 +4046,7 @@ def report_edit(
     replacement URL to report it under instead. Nothing changes until
     you confirm the summary at the end.
     """
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Report, Task, format_report_link
 
     try:
@@ -3907,8 +4109,11 @@ app.add_typer(alias_app, name="alias")
 
 
 @alias_app.callback()
-def alias_callback(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def alias_callback(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Manage aliases for MoUs, tasks, and repository URLs."""
+    _skip_sync(no_sync)
     if test:
         db = TEST_DB_FILE
     if db is not None:
@@ -3926,9 +4131,10 @@ def alias_set(
     alias: str = typer.Argument(...),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Give a MoU, task, or repository URL a short alias."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Alias, MoU
 
     mou = MoU.get_selected() if item == "task" else None
@@ -3951,9 +4157,10 @@ def alias_remove(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Remove an alias, identified by its alias or the id it names."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Alias, MoU
 
     mou = MoU.get_selected() if item == "task" else None
@@ -3981,9 +4188,10 @@ def alias_rename(
     new_alias: str = typer.Argument(...),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Rename an existing alias."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Alias, MoU
 
     mou = MoU.get_selected() if item == "task" else None
@@ -4019,9 +4227,10 @@ def alias_list(
     item: AliasItemType | None = typer.Argument(None),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """List aliases, optionally filtered to one item type."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Alias
 
     aliases = Alias.objects.all()
@@ -4038,9 +4247,11 @@ def alias_list(
 
 
 @app.command()
-def migrate(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def migrate(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Create or update the database schema."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from django.conf import settings
 
     typer.echo(f"Migrated {settings.DATABASES['default']['NAME']}")
@@ -4073,9 +4284,11 @@ def _backup_database(action: str) -> tuple[Path, Path]:
 
 
 @app.command()
-def backup(db: Path | None = DbOption, test: bool = TestOption) -> None:
+def backup(
+    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
+) -> None:
     """Copy the database file, timestamped, next to itself."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     database_file, backup_file = _backup_database("backup")
     typer.echo(f"Backed up {database_file} to {backup_file}")
 
@@ -4085,9 +4298,10 @@ def restore(
     name: str = typer.Argument(..., autocompletion=_complete_backup_name),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Restore the database from a backup created by `rfp backup`."""
-    _setup(db, test)
+    _setup(db, test, sync=not no_sync)
     from django.conf import settings
 
     database_file = Path(settings.DATABASES["default"]["NAME"])
@@ -4145,6 +4359,198 @@ def _report_database_locked(error: Exception) -> None:
         )
 
 
+def _public_github_repository(url: str) -> str | None:
+    """'owner/repo' if `url` is a GitHub repository anyone can read.
+
+    Asks GitHub's API without a token: it only answers for public
+    repositories. None if it is private, not on GitHub or GitHub could
+    not be asked.
+    """
+    import niquests
+
+    match = re.search(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", url)
+    if match is None:
+        return None
+    name = f"{match[1]}/{match[2]}"
+    try:
+        response = niquests.get(f"https://api.github.com/repos/{name}", timeout=10)
+    except Exception:
+        return None
+    if response.status_code == 200 and not response.json().get("private", False):
+        return name
+    return None
+
+
+def _set_machine(settings, machine: str) -> None:
+    """Give this computer another id - refused if another computer has a
+    file by that name in the repository, as two computers writing one file
+    would take each other's changes away."""
+    from nlnet_rfp_recorder.sync import repository_path
+    from nlnet_rfp_recorder.timetracking.models import TimeRecord
+    from nlnet_rfp_recorder.timetracking.models.sync import MACHINE_PATTERN
+
+    if machine == settings.machine:
+        return
+    if not MACHINE_PATTERN.match(machine):
+        _fail(
+            f"{machine!r} can't be a computer id: use letters, digits, '.', '_' "
+            "and '-', at most 64, starting with a letter or digit."
+        )
+    if (repository_path() / f"{machine}.jsonl").exists():
+        _fail(
+            f"Another computer syncs as {machine} already. Pick another id - "
+            "two computers writing one file would undo each other's changes."
+        )
+    # Timers started here stay this computer's to stop.
+    TimeRecord.objects.filter(computer=settings.machine).update(computer=machine)
+    settings.machine = machine
+
+
+def _echo_sync_settings(settings) -> None:
+    from nlnet_rfp_recorder.sync import Sync
+
+    typer.echo(f"Repository: {settings.url or '(none - sync is off)'}")
+    typer.echo(f"Name:       {settings.name or '(from your git config)'}")
+    typer.echo(f"Email:      {settings.email or '(from your git config)'}")
+    typer.echo(f"Auto:       {'yes' if settings.auto else 'no'}")
+    typer.echo(f"This computer: {settings.machine}")
+    others = [name for name in Sync().machines() if name != settings.machine]
+    if others:
+        typer.echo(f"Other computers: {', '.join(others)}")
+
+
+@app.command("sync")
+def sync_command(
+    set_url: str | None = typer.Option(
+        None,
+        "--set-url",
+        help="The private git repository to sync with. An empty value turns sync off.",
+    ),
+    set_name: str | None = typer.Option(
+        None,
+        "--set-name",
+        help="Author name of the sync commits - for rfp only, no git config changes.",
+    ),
+    set_email: str | None = typer.Option(
+        None,
+        "--set-email",
+        help="Author email of the sync commits - for rfp only, no git config changes.",
+    ),
+    auto: str | None = typer.Option(
+        None,
+        "--auto",
+        help="yes/no: whether every command syncs before and after it runs "
+        "(default: yes).",
+    ),
+    set_machine: str | None = typer.Option(
+        None,
+        "--set-machine",
+        help="This computer's id: its file in the repository is <id>.jsonl and "
+        "its changes are marked with it. Default: the host name and a random part.",
+    ),
+    db: Path | None = DbOption,
+    test: bool = TestOption,
+) -> None:
+    """Sync time entries and links with your other computers through git.
+
+    Runs `rfp mou update` while it fetches, then takes the other
+    computers' changes and pushes this one's. Every other command syncs
+    too, before and after it runs, if the repository can be reached -
+    Ctrl+C or `--no-sync` skips that, `--auto no` turns it off.
+    """
+    _setup(db, test, sync=False)
+    import threading
+
+    from nlnet_rfp_recorder.sync import Sync, repository_path
+    from nlnet_rfp_recorder.timetracking.models import MoU, SyncSettings
+
+    settings = SyncSettings.get()
+    changing = (set_url, set_name, set_email, auto, set_machine)
+    if any(value is not None for value in changing):
+        if auto is not None:
+            answer = auto.strip().lower()
+            if answer not in ("yes", "no", "on", "off"):
+                _fail(f"--auto takes yes or no, not {auto!r}.")
+            settings.auto = answer in ("yes", "on")
+        if set_url:
+            public = _public_github_repository(set_url)
+            if public is not None:
+                _fail(
+                    f"{public} is a public GitHub repository. Your time records "
+                    "would be readable by anyone - make it private first."
+                )
+        if set_machine is not None:
+            _set_machine(settings, set_machine.strip())
+        for field, value in (
+            ("url", set_url),
+            ("name", set_name),
+            ("email", set_email),
+        ):
+            if value is not None:
+                setattr(settings, field, value.strip())
+        settings.save()
+        _echo_sync_settings(settings)
+        return
+
+    if not settings.url:
+        _fail(
+            "No repository to sync with. Create a private git repository and "
+            "run `rfp sync --set-url <url>`."
+        )
+
+    sync = Sync(interactive=True)
+    fetch_errors: list[Exception] = []
+
+    def fetch() -> None:
+        try:
+            sync.fetch()
+        except Exception as error:
+            fetch_errors.append(error)
+
+    typer.echo(f"Syncing with {settings.url} in {repository_path()}")
+    fetching = threading.Thread(target=fetch, daemon=True)
+    fetching.start()
+    failed = False
+    try:
+        selected = MoU.get_selected()
+        if selected is None or not selected.rfp_secret:
+            typer.echo("Skipped `rfp mou update`: no MoU with an RfP secret selected.")
+        else:
+            try:
+                _, backup_file = _backup_database("mou-update")
+                typer.echo(f"Backed up database to {backup_file}")
+                tasks = _update_from_rfp(selected)
+                typer.echo(
+                    f"Updated {len(tasks)} tasks of MoU {selected.display_name}."
+                )
+            except typer.Exit:
+                failed = True  # _fail() already said why
+            except Exception as error:
+                failed = True
+                typer.echo(f"`rfp mou update` failed: {error}", err=True)
+        fetching.join()
+    except KeyboardInterrupt:
+        typer.echo("Sync interrupted.", err=True)
+        raise typer.Exit(code=130) from None
+
+    from nlnet_rfp_recorder.sync import SyncError
+
+    try:
+        if fetch_errors:
+            raise fetch_errors[0]
+        result = sync.import_fetched()
+        _echo_import_result(result)
+        pushed = sync.push()
+    except KeyboardInterrupt:
+        typer.echo("Sync interrupted.", err=True)
+        raise typer.Exit(code=130) from None
+    except SyncError as error:
+        _fail(f"Sync failed: {error}")
+    typer.echo("Pushed this computer's changes." if pushed else "Nothing new to push.")
+    if failed:
+        raise typer.Exit(code=1)
+
+
 def main() -> None:
     from django.db.utils import OperationalError
 
@@ -4155,3 +4561,5 @@ def main() -> None:
             raise
         _report_database_locked(error)
         sys.exit(1)
+    finally:
+        _push_after_command()
