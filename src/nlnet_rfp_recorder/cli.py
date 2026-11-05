@@ -2782,6 +2782,18 @@ def _prompt_for_task(
         restore_completer()
 
 
+def _assign_selected_mou(link: Link) -> None:
+    """Give a link that has neither task nor MoU the selected MoU."""
+    from nlnet_rfp_recorder.timetracking.models import MoU
+
+    if link.task_id is not None or link.mou_id is not None:
+        return
+    mou = MoU.get_selected()
+    if mou is not None:
+        link.mou = mou
+        link.save(update_fields=["mou"])
+
+
 def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
     from django.utils import timezone
 
@@ -2850,6 +2862,9 @@ def _start(link: str, tags: str | None, task_name: str | None = None) -> None:
         desired_tag = tags if tags is not None else _default_tag(resolved_link)
         _apply_start_tag(record.link, desired_tag)
         if record.link.task is None:
+            # Remembered before asking, so cancelling the question below
+            # still leaves the entry in the MoU it was started under.
+            _assign_selected_mou(record.link)
             chosen_task = _prompt_for_task(record, default_task=effective_task)
             if chosen_task is not None:
                 record.link.task = chosen_task
@@ -3042,6 +3057,15 @@ def edit(
         autocompletion=_complete_task_name,
         help="Reassign this time entry's link to a different task (name or alias).",
     ),
+    mou_name: str | None = typer.Option(
+        None,
+        "--mou",
+        autocompletion=_complete_mou_name,
+        help=(
+            "Assign this time entry's link to an MoU. With --task, the task "
+            "is looked up in this MoU instead of the selected one."
+        ),
+    ),
     duration: str | None = typer.Option(
         None,
         "--duration",
@@ -3069,7 +3093,7 @@ def edit(
     db: Path | None = DbOption,
     test: bool = TestOption,
 ) -> None:
-    """Edit a time entry's link, tags, task, start, end, and/or duration.
+    """Edit a time entry's link, tags, MoU, task, start, end, and/or duration.
 
     Defaults to the most recent entry - pass TIMESHEET_PK to edit a
     different one.
@@ -3098,12 +3122,34 @@ def edit(
         for tag in (t.strip() for t in tags.split(",") if t.strip()):
             record.link.add_tag(tag)
 
+    chosen_mou = None
+    if mou_name is not None:
+        if record.link is None:
+            _fail("Cannot change the MoU: this time entry has no link.")
+        from nlnet_rfp_recorder.timetracking.models import MoU as MoUModel
+        from nlnet_rfp_recorder.timetracking.models import resolve_mou_name
+
+        try:
+            chosen_mou = MoUModel.objects.get(name=resolve_mou_name(mou_name))
+        except MoUModel.DoesNotExist:
+            _fail(f"No such MoU: {mou_name}. Run `rfp mou add {mou_name}` first.")
+        task_mou = record.link.task.mou if record.link.task else None
+        if task is None and task_mou is not None and task_mou != chosen_mou:
+            _fail(
+                f"The task {record.link.task.name} belongs to MoU "
+                f"{task_mou.display_name}. Give a task of {chosen_mou.display_name} "
+                "with --task to move the entry."
+            )
+        if record.link.task is None:
+            record.link.mou = chosen_mou
+            record.link.save(update_fields=["mou"])
+
     if task is not None:
         if record.link is None:
             _fail("Cannot change the task: this time entry has no link.")
         from nlnet_rfp_recorder.timetracking.models import MoU, Task, resolve_task_name
 
-        mou = MoU.get_selected()
+        mou = chosen_mou or MoU.get_selected()
         task_name = resolve_task_name(task, mou)
         try:
             resolved_task = Task.objects.get(mou=mou, name=task_name)

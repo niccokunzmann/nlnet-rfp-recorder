@@ -15,6 +15,7 @@ from nlnet_rfp_recorder.github import (
     fetch_states,
 )
 
+from .mou import MoU
 from .tag import TAG_NAMES, Tag
 from .task import Task
 
@@ -35,6 +36,19 @@ class Link(models.Model):
         related_name="links",
         help_text=(
             "The task this link's tracked time counts toward, or None if unassigned."
+        ),
+    )
+    mou = models.ForeignKey(
+        MoU,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="links",
+        help_text=(
+            "The MoU this link belongs to. Follows the task's MoU once it has "
+            "a task; kept on its own for a link that is still without a task, "
+            "e.g. when starting it was cancelled before a task was chosen. "
+            "Set via `rfp edit --mou`."
         ),
     )
     url = models.URLField(
@@ -90,6 +104,20 @@ class Link(models.Model):
                 name="unique_nonempty_link_url",
             )
         ]
+
+    def save(self, *args, **kwargs) -> None:
+        # A link with a task always belongs to the task's MoU.
+        if self.task_id is not None:
+            self.mou_id = self.task.mou_id
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None:
+                kwargs["update_fields"] = {*update_fields, "mou"}
+        super().save(*args, **kwargs)
+
+    @property
+    def effective_mou(self) -> MoU | None:
+        """The task's MoU, else the MoU the link was given on its own."""
+        return self.task.mou if self.task is not None else self.mou
 
     @classmethod
     def get_or_create_for_task(cls, url: str, task: Task | None) -> Link:

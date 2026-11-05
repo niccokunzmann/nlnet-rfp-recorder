@@ -379,7 +379,7 @@ class TimeRecord(models.Model):
     @property
     def row(self) -> TimesheetRow:
         task = self.link.task if self.link else None
-        mou = task.mou if task else None
+        mou = self.link.effective_mou if self.link else None
         tags = (
             ",".join(sorted(tag.name for tag in self.link.tags.all()))
             if self.link
@@ -402,21 +402,28 @@ class TimeRecord(models.Model):
     ) -> TimeRecord:
         from .report import Report
 
-        try:
-            mou = MoU.objects.get(name=row.mou)
-        except MoU.DoesNotExist:
-            raise ValueError(
-                f"No such MoU: {row.mou}. Run `rfp mou add {row.mou}` first."
-            ) from None
-        try:
-            task = Task.objects.get(mou=mou, name=row.task)
-        except Task.DoesNotExist:
-            raise ValueError(
-                f"No such task: {row.task} for MoU {row.mou}. "
-                f"Run `rfp task select {row.task}` first."
-            ) from None
+        mou = None
+        if row.mou or row.task:
+            try:
+                mou = MoU.objects.get(name=row.mou)
+            except MoU.DoesNotExist:
+                raise ValueError(
+                    f"No such MoU: {row.mou}. Run `rfp mou add {row.mou}` first."
+                ) from None
+        task = None
+        if row.task:
+            try:
+                task = Task.objects.get(mou=mou, name=row.task)
+            except Task.DoesNotExist:
+                raise ValueError(
+                    f"No such task: {row.task} for MoU {row.mou}. "
+                    f"Run `rfp task select {row.task}` first."
+                ) from None
 
         link = Link.get_or_create_for_task(row.link, task) if row.link else None
+        if link is not None and task is None and mou and link.mou_id is None:
+            link.mou = mou
+            link.save(update_fields=["mou"])
         if link is not None:
             for tag in filter(None, (t.strip() for t in row.tags.split(","))):
                 link.add_tag(tag)

@@ -70,8 +70,15 @@ class Statistics:
         new_durations: dict[Task | None, timedelta] = {}
         for span in spans:
             task = span.record.link.task if span.record.link else None
-            if mou is not None and (task is None or task.mou_id != mou.pk):
-                continue
+            if mou is not None:
+                link = span.record.link
+                mou_id = (
+                    task.mou_id
+                    if task is not None
+                    else (link.mou_id if link is not None else None)
+                )
+                if mou_id != mou.pk:
+                    continue
             durations[task] = durations.get(task, timedelta()) + span.duration
             if span.record.report_line_id is None:
                 new_durations[task] = (

@@ -6861,3 +6861,96 @@ def test_task_plot_complete_all_shows_tasks_without_personal_budget():
     assert "1b" not in without.output
     assert everything.exit_code == 0, everything.output
     assert "1b" in everything.output
+
+
+def test_review_batch_assigns_the_mou_even_when_the_task_question_is_cancelled():
+    _setup_task_only_start()
+
+    # The input ends at the question: the user cancelled it.
+    result = runner.invoke(
+        app, ["review", "--batch"], input="https://example.com/issues/1\n"
+    )
+
+    assert result.exit_code != 0
+    record = TimeRecord.objects.get()
+    assert record.link.task is None
+    assert record.link.mou == MoU.get_selected()
+    assert record.row.mou == "nlnet-2026"
+    assert "nlnet-2026" in runner.invoke(app, ["timesheet", "list"]).output
+
+
+def test_start_assigns_the_mou_even_when_the_task_question_is_cancelled():
+    _setup_task_only_start()
+
+    runner.invoke(app, ["start", "https://example.com/issues/1"])
+
+    assert TimeRecord.objects.get().link.mou == MoU.get_selected()
+
+
+def test_edit_mou_assigns_a_taskless_entry_to_that_mou():
+    runner.invoke(app, ["mou", "add", "nlnet-2025"])
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    now = timezone.now()
+    link = Link.objects.create(url="https://example.com/issues/1")
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["edit", "--mou", "nlnet-2025"])
+
+    assert result.exit_code == 0, result.output
+    link.refresh_from_db()
+    assert link.mou.name == "nlnet-2025"
+    assert link.task is None
+
+
+def test_edit_mou_with_task_looks_the_task_up_in_that_mou():
+    runner.invoke(app, ["mou", "add", "nlnet-2025"])
+    runner.invoke(app, ["task", "select", "10a"])
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    link = Link.objects.create(url="https://example.com/issues/1")
+    now = timezone.now()
+    TimeRecord.objects.create(
+        link=link, start_time=now - timedelta(hours=1), end_time=now
+    )
+
+    result = runner.invoke(app, ["edit", "--mou", "nlnet-2025", "--task", "10a"])
+
+    assert result.exit_code == 0, result.output
+    link.refresh_from_db()
+    assert (link.task.name, link.mou.name) == ("10a", "nlnet-2025")
+
+
+def test_edit_mou_fails_for_an_unknown_mou_and_for_a_task_of_another_mou():
+    runner.invoke(app, ["mou", "add", "nlnet-2025"])
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+    runner.invoke(app, ["start", "10a", "https://example.com/issues/1"])
+
+    unknown = runner.invoke(app, ["edit", "--mou", "nope"])
+    other = runner.invoke(app, ["edit", "--mou", "nlnet-2025"])
+
+    assert unknown.exit_code != 0
+    assert "No such MoU" in unknown.output
+    assert other.exit_code != 0
+    assert "belongs to MoU" in other.output
+
+
+def test_link_follows_the_mou_of_its_task():
+    mou = MoU.objects.create(name="nlnet-2026")
+    task = Task.objects.create(mou=mou, name="10a")
+    link = Link.objects.create(url="https://example.com/issues/1")
+
+    link.task = task
+    link.save(update_fields=["task"])
+
+    link.refresh_from_db()
+    assert link.mou == mou
+
+
+def test_edit_mou_is_completed():
+    from nlnet_rfp_recorder.cli import _complete_mou_name
+
+    MoU.objects.create(name="nlnet-2025")
+    MoU.objects.create(name="other")
+
+    assert _complete_mou_name("nlnet") == ["nlnet-2025"]
