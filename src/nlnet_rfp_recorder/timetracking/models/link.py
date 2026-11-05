@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 import warnings
 from collections.abc import Iterable
 from datetime import datetime
@@ -15,6 +16,7 @@ from nlnet_rfp_recorder.github import (
     fetch_states,
 )
 
+from .sync import sync_now
 from .tag import TAG_NAMES, Tag
 from .task import Task
 
@@ -27,6 +29,28 @@ def _local_naive(moment: datetime | None) -> datetime | None:
 
 
 class Link(models.Model):
+    uuid = models.UUIDField(
+        default=uuid.uuid4,
+        unique=True,
+        editable=False,
+        help_text="Identifies this link across computers for `rfp sync`.",
+    )
+    modified = models.CharField(
+        max_length=32,
+        default=sync_now,
+        editable=False,
+        help_text=(
+            "When this link last changed (UTC) - set by a database trigger, "
+            "whichever code changed it. The newest version wins in `rfp sync`."
+        ),
+    )
+    modified_by = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        editable=False,
+        help_text="The computer (`rfp sync` machine id) it last changed on.",
+    )
     task = models.ForeignKey(
         Task,
         null=True,

@@ -97,6 +97,51 @@ rfp report
 | `rfp report` | Counts issues once finished regardless of GitHub status, but only counts a PR once it's closed (checked live against GitHub). |
 | `rfp token <token>` (`rfp token` alone for setup steps) | Avoids the unauthenticated GitHub API rate limit, which the report can hit quickly. |
 | `rfp --test <command>` | Try things against a disposable database instead of your real one. |
+| `rfp sync` | Sync time entries and links with your other computers through a private git repository, running `rfp mou update` at the same time. See [Sync between computers](#sync-between-computers). |
+| `rfp sync --set-url <url>` / `--set-name <name>` / `--set-email <email>` | Set the repository, and the author of the sync commits - used by rfp only, no git config is changed. An empty `--set-url ""` turns sync off. GitHub repositories that are public are refused. |
+| `rfp sync --auto yes\|no` | Whether every command syncs before and after it runs (default: yes). `rfp sync` itself always syncs; `--no-sync` on any command skips it once. |
+| `rfp sync --set-machine <id>` | This computer's id in the repository (default: host name and a random part). |
+
+## Sync between computers
+
+Create an empty **private** git repository (e.g. on GitHub) and run on every computer:
+
+```bash
+rfp sync --set-url git@github.com:me/rfp-sync.git
+rfp sync --set-machine laptop      # optional: this computer's id
+rfp sync
+```
+
+The repository is cloned to `rfp-sync/` next to the database. From then on every command syncs before it runs (taking the other computers' changes) and after it ran (pushing its own) - if the repository can be reached. Ctrl+C skips the sync, not the command; without a network the command just runs. `--no-sync` skips it for one command (`rfp start <link> --no-sync`, `rfp --no-sync status`), `rfp sync --auto no` turns it off until `--auto yes`. `rfp sync` itself always syncs, and runs `rfp mou update` for the selected MoU while it fetches.
+
+What is synced:
+
+- **Time entries** - start, end, why they stopped, their link, and the computer they were started on.
+- **Links** - URL, task (by MoU and task name), tags, excluded from reports, and the cached GitHub title and closed date.
+
+Not synced: MoUs, tasks and budgets (`rfp mou update` reads them on each computer; a MoU or task a synced link needs is made by name), reports, aliases, the GitHub token and the RfP secret.
+
+How changes are decided:
+
+- Every time entry and link has a last-modified time and the id of the computer it was changed on. The database stamps them whenever an entry changes, however it was changed. The newest change wins - an edit made offline at 9:00 loses to one made elsewhere at 9:30, even if it is synced later. Equal times are decided by the computer id.
+- A deletion is kept in the files as `"deleted": true` with its time and computer, so it reaches every computer.
+- Time entries come first. A link deleted on one computer comes back if another computer has time entries on it, and a time entry that is in a report on this computer is kept even if another computer deleted it.
+- Every computer writes only its own file, `<computer id>.jsonl`, so git never has to merge. A computer's id can't be one another computer already uses; a database copied to another host gets an id of its own.
+- The same entry on two computers from before sync (e.g. a copied database, where the upgrade gave each copy its own id) - same link, start and end to the microsecond - is kept once.
+- Times are written with their UTC offset, so computers in different time zones agree on the moment.
+- Only the computer that started a timer stops it on suspend (`rfp background-task`). `rfp stop` and `rfp start` still stop a timer started on another computer.
+
+Sync warns when timers run on several computers at once, when a computer's clock is ahead (its changes would win over newer ones), and when it skips an entry it can't read.
+
+Starting on a new computer works from an empty database:
+
+```bash
+rfp sync --set-url git@github.com:me/rfp-sync.git
+rfp sync                       # all time entries and links, with their MoUs and tasks by name
+rfp mou select <name>          # then fill in budgets and reports
+rfp mou secret <link>
+rfp sync
+```
 
 ## Budgets
 
