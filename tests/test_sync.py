@@ -14,6 +14,7 @@ from nlnet_rfp_recorder import cli
 from nlnet_rfp_recorder.cli import app
 from nlnet_rfp_recorder.sync import (
     LINK,
+    TASK,
     TIME_RECORD,
     Remote,
     Sync,
@@ -27,6 +28,7 @@ from nlnet_rfp_recorder.timetracking.models import (
     Link,
     MoU,
     Report,
+    ReportTask,
     SyncDeletion,
     SyncSettings,
     Tag,
@@ -34,6 +36,7 @@ from nlnet_rfp_recorder.timetracking.models import (
     TimeRecord,
     sync_now,
 )
+from nlnet_rfp_recorder.timetracking.models.task import task_uuid
 
 pytestmark = pytest.mark.django_db
 
@@ -1063,13 +1066,12 @@ def test_no_sync_skips_the_sync(repository, args):
         ["mou", "list"],
         ["mou", "add", "nlnet-2026"],
         ["mou", "export"],
-        ["task", "export"],
         ["alias", "list"],
         ["migrate"],
     ],
 )
 def test_commands_without_synced_data_do_not_sync(repository, args):
-    """Only links and time records are synced: commands that neither
+    """Only links, time records and tasks are synced: commands that neither
     read nor change them have nothing to sync."""
     MoU.objects.create(name="nlnet-2026", selected=True)
     with patch.object(Sync, "pull") as pull:
@@ -1150,3 +1152,539 @@ def test_an_unreachable_repository_skips_the_sync(tmp_path):
     assert result.exit_code == 0, result.output
     assert "Sync skipped:" in result.output
     assert not (tmp_path / "work").exists()
+
+
+# --- tasks and their budgets -------------------------------------------------
+
+
+def _task(name="1a", mou_name="nlnet-2026", **values) -> Task:
+    mou, _ = MoU.objects.get_or_create(name=mou_name)
+    return Task.objects.create(mou=mou, name=name, selected=False, **values)
+
+
+def _set_field_versions(task: Task, **versions) -> None:
+    """Give values a version as [when, computer] - None removes it."""
+    field_versions = dict(task.field_versions)
+    for name, value in versions.items():
+        if value is None:
+            field_versions.pop(name, None)
+        else:
+            field_versions[name] = list(value)
+    Task.objects.filter(pk=task.pk).update(field_versions=field_versions)
+    task.refresh_from_db()
+
+
+def _task_entry(
+    modified: str, name="1a", mou_name="nlnet-2026", versions=None, **data
+) -> dict:
+    """A task from the other computer; every value given in `data` has
+    the version `modified` unless `versions` says otherwise."""
+    if versions is None:
+        versions = {field: [modified, OTHER] for field in data}
+    return {
+        "model": TASK,
+        "uuid": str(task_uuid(mou_name, name)),
+        "modified": modified,
+        "modified_by": OTHER,
+        "deleted": False,
+        "mou": mou_name,
+        "task": name,
+        "max_budget": None,
+        "remaining_budget": None,
+        "used_budget": 0.0,
+        "personal_budget": None,
+        "description": "",
+        "versions": versions,
+        **data,
+    }
+
+
+def _get_task(name="1a", mou_name="nlnet-2026") -> Task:
+    return Task.objects.get(mou__name=mou_name, name=name)
+
+
+def test_the_same_task_has_the_same_uuid_on_every_computer():
+    assert _task().uuid == task_uuid("nlnet-2026", "1a")
+    assert _task("1b").uuid != task_uuid("nlnet-2026", "1a")
+    assert _task(mou_name="other").uuid != task_uuid("nlnet-2026", "1a")
+
+
+# The triggers
+
+
+def test_a_new_task_dates_the_values_it_has(machine):
+    task = _task(max_budget=500.0, description="Do it")
+    task.refresh_from_db()
+
+    assert set(task.field_versions) == {"max_budget", "description"}
+    assert task.field_versions["max_budget"][1] == machine
+    assert task.modified_by == machine
+
+
+def test_a_new_task_without_values_has_no_versions():
+    """Defaults - no budget, 0 used, no description - are not known
+    values: they must never win over a budget from elsewhere."""
+    task = _task()
+    task.refresh_from_db()
+
+    assert task.field_versions == {}
+
+
+def _update_personal_budget(task):
+    Task.objects.filter(pk=task.pk).update(personal_budget=100)
+
+
+def _save_personal_budget(task):
+    task.personal_budget = 100
+    task.save()
+
+
+def _set_budget(task):
+    task.set_budget(100)
+
+
+@pytest.mark.parametrize(
+    "change", [_update_personal_budget, _save_personal_budget, _set_budget]
+)
+def test_every_way_of_changing_a_value_dates_it(change, machine):
+    task = _task(max_budget=500.0)
+    _set_version(task, EARLIER, "someone")
+    _set_field_versions(task, max_budget=(EARLIER, "someone"))
+
+    change(task)
+
+    task.refresh_from_db()
+    assert task.personal_budget == 100
+    assert task.field_versions["personal_budget"][0] > EARLIER
+    assert task.field_versions["personal_budget"][1] == machine
+    assert task.field_versions["max_budget"] == [EARLIER, "someone"]
+    assert task.modified > EARLIER
+
+
+def test_clearing_a_value_dates_it():
+    task = _task(personal_budget=300.0)
+    _set_field_versions(task, personal_budget=(EARLIER, "someone"))
+
+    Task.objects.filter(pk=task.pk).update(personal_budget=None)
+
+    task.refresh_from_db()
+    assert task.field_versions["personal_budget"][0] > EARLIER
+
+
+def test_selecting_a_task_is_not_a_change():
+    task = _task(max_budget=500.0)
+    _set_version(task, EARLIER, "someone")
+    _set_field_versions(task, max_budget=(EARLIER, "someone"))
+
+    Task.objects.filter(pk=task.pk).update(selected=True)
+    task.selected = False
+    task.save()
+
+    task.refresh_from_db()
+    assert task.modified == EARLIER
+    assert task.field_versions == {"max_budget": [EARLIER, "someone"]}
+
+
+def test_saving_a_task_loaded_before_does_not_lose_versions():
+    """A task object from before a change still has the old versions in
+    memory: saving it must not write them back."""
+    task = _task()
+    stale = Task.objects.get(pk=task.pk)
+    Task.objects.filter(pk=task.pk).update(personal_budget=100)
+
+    stale.description = "Do it"
+    stale.save()
+
+    task.refresh_from_db()
+    assert set(task.field_versions) == {"personal_budget", "description"}
+
+
+def test_removing_the_mou_notes_its_tasks_as_deleted():
+    """A task without MoU is not synced: the others must not think it
+    is still there - and this computer must not take it back."""
+    task = _task(max_budget=500.0)
+
+    MoU.objects.all().delete()
+
+    assert SyncDeletion.objects.filter(model=TASK, uuid=task.uuid.hex).exists()
+
+
+def test_deleting_a_task_is_noted_for_the_others():
+    task = _task()
+
+    task.delete()
+
+    assert SyncDeletion.objects.filter(model=TASK, uuid=task.uuid.hex).exists()
+
+
+def test_deleting_a_task_without_mou_is_not_noted():
+    task = _task()
+    MoU.objects.all().delete()
+    SyncDeletion.objects.all().delete()
+
+    Task.objects.all().delete()
+
+    assert not SyncDeletion.objects.filter(model=TASK, uuid=task.uuid.hex).exists()
+
+
+# Export
+
+
+def test_tasks_are_exported_with_their_values_and_versions():
+    task = _task(max_budget=500.0, personal_budget=300.0, description="Do it")
+    task.refresh_from_db()
+
+    entry = _by_uuid(export_entries(Remote()))[str(task.uuid)]
+
+    assert entry["model"] == TASK
+    assert (entry["mou"], entry["task"]) == ("nlnet-2026", "1a")
+    assert entry["max_budget"] == 500.0
+    assert entry["personal_budget"] == 300.0
+    assert entry["description"] == "Do it"
+    assert entry["remaining_budget"] is None
+    assert set(entry["versions"]) == {"max_budget", "personal_budget", "description"}
+
+
+def test_a_task_without_mou_is_exported_as_deleted():
+    task = _task()
+    MoU.objects.all().delete()
+
+    assert _by_uuid(export_entries(Remote()))[str(task.uuid)]["deleted"]
+
+
+# Merging
+
+
+def test_a_new_task_comes_with_its_values():
+    result = apply_entries(
+        Remote.of(_task_entry(LATER, max_budget=500.0, personal_budget=300.0))
+    )
+
+    task = _get_task()
+    assert (task.max_budget, task.personal_budget) == (500.0, 300.0)
+    assert task.field_versions["max_budget"] == [LATER, OTHER]
+    assert not task.selected
+    assert (task.modified, task.modified_by) == (LATER, OTHER)
+    assert result.changed == 1
+
+
+def test_a_newer_value_wins():
+    task = _task(personal_budget=100.0)
+    _set_field_versions(task, personal_budget=(EARLIER, "here"))
+
+    apply_entries(Remote.of(_task_entry(LATER, personal_budget=200.0)))
+
+    task.refresh_from_db()
+    assert task.personal_budget == 200.0
+    assert task.field_versions["personal_budget"] == [LATER, OTHER]
+
+
+def test_an_older_value_loses():
+    task = _task(personal_budget=100.0)
+    _set_field_versions(task, personal_budget=(LATER, "here"))
+
+    result = apply_entries(Remote.of(_task_entry(EARLIER, personal_budget=200.0)))
+
+    task.refresh_from_db()
+    assert task.personal_budget == 100.0
+    assert task.field_versions["personal_budget"] == [LATER, "here"]
+    assert result.changed == 0
+
+
+def test_a_value_never_set_there_does_not_wipe_it_here():
+    """The other computer never had the budget - its task is newer, but
+    without a version for the budget it does not touch the one here."""
+    task = _task(max_budget=500.0, personal_budget=300.0, used_budget=50.0)
+    _set_version(task, EARLIER)
+    _set_field_versions(
+        task,
+        max_budget=(EARLIER, "here"),
+        personal_budget=(EARLIER, "here"),
+        used_budget=(EARLIER, "here"),
+    )
+
+    apply_entries(Remote.of(_task_entry(LATER, description="From NLnet")))
+
+    task.refresh_from_db()
+    assert (task.max_budget, task.personal_budget, task.used_budget) == (
+        500.0,
+        300.0,
+        50.0,
+    )
+    assert task.description == "From NLnet"
+
+
+def test_values_are_merged_one_by_one():
+    task = _task(max_budget=500.0, personal_budget=300.0)
+    _set_field_versions(
+        task, max_budget=(EARLIER, "here"), personal_budget=(LATER, "here")
+    )
+
+    apply_entries(
+        Remote.of(
+            _task_entry(
+                MIDDLE,
+                max_budget=600.0,
+                personal_budget=100.0,
+            )
+        )
+    )
+
+    task.refresh_from_db()
+    assert (task.max_budget, task.personal_budget) == (600.0, 300.0)
+
+
+def test_a_value_cleared_there_later_is_cleared_here():
+    task = _task(personal_budget=300.0)
+    _set_field_versions(task, personal_budget=(EARLIER, "here"))
+
+    apply_entries(Remote.of(_task_entry(LATER, personal_budget=None)))
+
+    task.refresh_from_db()
+    assert task.personal_budget is None
+
+
+def test_a_value_cleared_here_later_stays_cleared():
+    task = _task()
+    _set_field_versions(task, personal_budget=(LATER, "here"))
+
+    apply_entries(Remote.of(_task_entry(EARLIER, personal_budget=300.0)))
+
+    task.refresh_from_db()
+    assert task.personal_budget is None
+
+
+def test_a_used_budget_of_0_from_nlnet_counts():
+    task = _task(used_budget=50.0)
+    _set_field_versions(task, used_budget=(EARLIER, "here"))
+
+    apply_entries(Remote.of(_task_entry(LATER, used_budget=0.0)))
+
+    task.refresh_from_db()
+    assert task.used_budget == 0.0
+
+
+def test_equal_times_are_decided_by_the_computer():
+    task = _task(personal_budget=100.0)
+    _set_field_versions(task, personal_budget=(LATER, "a-computer"))
+
+    apply_entries(
+        Remote.of(
+            _task_entry(
+                LATER,
+                personal_budget=200.0,
+                versions={"personal_budget": [LATER, "z-computer"]},
+            )
+        )
+    )
+
+    task.refresh_from_db()
+    assert task.personal_budget == 200.0
+
+
+def test_merging_twice_changes_nothing_the_second_time():
+    remote = Remote.of(_task_entry(LATER, max_budget=500.0))
+    apply_entries(remote)
+
+    assert apply_entries(remote).changed == 0
+
+
+def test_versions_that_are_none_are_ignored():
+    task = _task(personal_budget=100.0)
+    _set_field_versions(task, personal_budget=(EARLIER, "here"))
+
+    result = apply_entries(
+        Remote.of(
+            _task_entry(
+                LATER,
+                personal_budget=200.0,
+                versions={"personal_budget": "yesterday", "max_budget": [1, 2]},
+            ),
+        )
+    )
+
+    task.refresh_from_db()
+    assert task.personal_budget == 100.0
+    assert not result.warnings
+
+
+def test_a_value_that_is_no_number_is_skipped_with_a_warning():
+    task = _task(personal_budget=100.0)
+    _set_field_versions(task, personal_budget=(EARLIER, "here"))
+
+    result = apply_entries(Remote.of(_task_entry(LATER, personal_budget="lots")))
+
+    task.refresh_from_db()
+    assert task.personal_budget == 100.0
+    assert result.warnings
+
+
+def test_an_entry_without_versions_changes_no_value():
+    """An entry that comes without versions does not know any value."""
+    task = _task(personal_budget=100.0)
+    entry = _task_entry(LATER, personal_budget=200.0)
+    del entry["versions"]
+
+    apply_entries(Remote.of(entry))
+
+    task.refresh_from_db()
+    assert task.personal_budget == 100.0
+
+
+def test_a_task_made_by_a_synced_link_takes_the_budget():
+    """Links make a task by name - with no budget. That task must not
+    win over the budget of the computer that has it."""
+    apply_entries(
+        Remote.of(
+            _link_entry(_new_uuid(), LATER, mou="nlnet-2026", task="1a"),
+            _task_entry(EARLIER, personal_budget=300.0),
+        )
+    )
+
+    task = _get_task()
+    assert task.personal_budget == 300.0
+    assert not task.selected
+
+
+def test_a_task_made_by_a_link_here_takes_the_budget():
+    _record()
+    link = Link.objects.get()
+    link.task = _task()
+    link.save()
+
+    apply_entries(Remote.of(_task_entry(EARLIER, max_budget=500.0)))
+
+    assert _get_task().max_budget == 500.0
+
+
+def test_a_task_deleted_here_is_not_made_again():
+    task = _task(max_budget=500.0)
+    task.delete()
+
+    apply_entries(Remote.of(_task_entry(EARLIER, max_budget=500.0)))
+
+    assert not Task.objects.exists()
+
+
+def test_a_task_deleted_here_comes_back_if_changed_there_later():
+    task = _task(max_budget=500.0)
+    task.delete()
+
+    apply_entries(Remote.of(_task_entry("2999-01-01T00:00:00.000Z", max_budget=1.0)))
+
+    assert _get_task().max_budget == 1.0
+
+
+def test_a_task_deleted_there_is_not_made_here():
+    entry = _task_entry(EARLIER, max_budget=500.0)
+
+    result = apply_entries(Remote.of(entry, _deleted(TASK, entry["uuid"], LATER)))
+
+    assert not Task.objects.exists()
+    assert result.total == 0
+
+
+def test_the_mou_of_a_task_removed_here_is_not_made_again():
+    _task(max_budget=500.0)
+    MoU.objects.all().delete()
+
+    apply_entries(Remote.of(_task_entry(EARLIER, max_budget=500.0)))
+
+    assert not MoU.objects.exists()
+
+
+# Deleting
+
+
+def test_a_deleted_task_is_deleted():
+    task = _task()
+    _set_version(task, EARLIER)
+
+    result = apply_entries(Remote.of(_deleted(TASK, str(task.uuid), LATER)))
+
+    assert not Task.objects.exists()
+    assert result.deleted == 1
+    assert not SyncDeletion.objects.exists()
+
+
+def test_a_task_changed_here_after_its_deletion_is_kept():
+    task = _task()
+    _set_version(task, LATER)
+
+    apply_entries(Remote.of(_deleted(TASK, str(task.uuid), EARLIER)))
+
+    assert Task.objects.exists()
+
+
+def test_a_deleted_task_with_links_here_is_kept():
+    task = _task()
+    Link.objects.create(url="https://github.com/o/r/issues/1", task=task)
+    _set_version(task, EARLIER)
+
+    result = apply_entries(Remote.of(_deleted(TASK, str(task.uuid), LATER)))
+
+    task.refresh_from_db()
+    assert task.modified > LATER
+    assert result.restored == 1
+
+
+def test_a_deleted_task_in_a_report_here_is_kept():
+    task = _task()
+    report = Report.objects.create(id="report-1", mou=task.mou)
+    ReportTask.objects.create(report=report, task=task, budget=10)
+    _set_version(task, EARLIER)
+
+    apply_entries(Remote.of(_deleted(TASK, str(task.uuid), LATER)))
+
+    assert Task.objects.filter(pk=task.pk).exists()
+
+
+def test_a_deleted_task_keeps_the_values_of_a_later_version_there():
+    """Deleted at MIDDLE, but its budget changed before - the values
+    are merged first, then the deletion only applies if it is newer."""
+    task = _task()
+    _set_version(task, EARLIER)
+    entry = _task_entry(LATER, max_budget=500.0)
+
+    apply_entries(Remote.of(entry, _deleted(TASK, entry["uuid"], MIDDLE)))
+
+    task.refresh_from_db()
+    assert task.max_budget == 500.0
+
+
+# Through git
+
+
+def test_task_budgets_go_from_one_computer_to_the_other(repository, tmp_path):
+    """This computer has the budget, the other one made the task later
+    without it: after the sync, both have the budget."""
+    task = _task(max_budget=500.0, personal_budget=300.0)
+    _set_version(task, EARLIER, "computer-a")
+    _other_computer_pushes(
+        repository, tmp_path, [_task_entry(LATER, description="From NLnet")]
+    )
+
+    sync = Sync(interactive=False)
+    sync.pull()
+    sync.push()
+
+    task.refresh_from_db()
+    assert (task.max_budget, task.personal_budget) == (500.0, 300.0)
+    assert task.description == "From NLnet"
+    pushed = _by_uuid(read_file(sync.git.path / sync.file_name))[str(task.uuid)]
+    assert (pushed["max_budget"], pushed["personal_budget"]) == (500.0, 300.0)
+    assert pushed["description"] == "From NLnet"
+    assert pushed["versions"]["description"] == [LATER, OTHER]
+
+
+def test_a_task_from_another_computer_is_not_pushed_back_changed(repository, tmp_path):
+    entry = _task_entry(LATER, max_budget=500.0)
+    _other_computer_pushes(repository, tmp_path, [entry])
+
+    sync = Sync(interactive=False)
+    sync.pull()
+    sync.push()
+
+    pushed = _by_uuid(read_file(sync.git.path / sync.file_name))[entry["uuid"]]
+    assert pushed["versions"] == entry["versions"]
+    assert (pushed["modified"], pushed["modified_by"]) == (LATER, OTHER)

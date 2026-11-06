@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import uuid as uuid_module
 import warnings
 from datetime import timedelta
 from functools import cached_property
@@ -20,10 +21,30 @@ from nlnet_rfp_recorder.warnings import TaskWarning
 
 from .github_token import GitHubToken
 from .mou import MoU
+from .sync import sync_now
 
 if TYPE_CHECKING:
     from .link import Link
     from .time_record import TimeRecord
+
+# Tasks are known by MoU and name on every computer: their sync uuid is
+# made from both, so computers that made the same task on their own agree.
+TASK_UUID_NAMESPACE = uuid_module.UUID("6f3c1f0e-5a1b-4e7c-9d2a-2b7e8c4d1a90")
+
+# What `rfp sync` takes over from other computers, each value with its
+# own version (see field_versions and sync.py).
+SYNCED_TASK_FIELDS = (
+    "max_budget",
+    "remaining_budget",
+    "used_budget",
+    "personal_budget",
+    "description",
+)
+
+
+def task_uuid(mou_name: str, task_name: str) -> uuid_module.UUID:
+    return uuid_module.uuid5(TASK_UUID_NAMESPACE, f"{mou_name}/{task_name}")
+
 
 task_name_validator = RegexValidator(
     regex=r"^\d+[a-z]+$",
@@ -100,11 +121,72 @@ class Task(models.Model):
             "status`/`select` and `rfp task list`."
         ),
     )
+    uuid = models.UUIDField(
+        default=uuid_module.uuid4,
+        db_index=True,
+        editable=False,
+        help_text=(
+            "Identifies this task across computers for `rfp sync`: made "
+            "from the MoU's and the task's name (see task_uuid)."
+        ),
+    )
+    modified = models.CharField(
+        max_length=32,
+        default=sync_now,
+        editable=False,
+        help_text=(
+            "When this task's budget or description last changed (UTC) - "
+            "set by a database trigger. Decides between a deletion and a "
+            "change in `rfp sync`; values are decided by field_versions."
+        ),
+    )
+    modified_by = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        editable=False,
+        help_text="The computer (`rfp sync` machine id) it last changed on.",
+    )
+    field_versions = models.JSONField(
+        default=dict,
+        blank=True,
+        editable=False,
+        help_text=(
+            "For each synced value that was set or changed here or came "
+            "from another computer: [when (UTC), computer] - set by a "
+            "database trigger. In `rfp sync` the newest version of a value "
+            "wins; a value without version (never set) never wins."
+        ),
+    )
 
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["mou", "name"], name="unique_task_per_mou")
         ]
+
+    # Kept by the database triggers and `rfp sync` alone: saving a task
+    # loaded before a trigger changed them must not write them back.
+    SYNC_BOOKKEEPING = frozenset({"modified", "modified_by", "field_versions"})
+
+    def save(self, *args, **kwargs) -> None:
+        update_fields = kwargs.get("update_fields")
+        if not self._state.adding and self.pk is not None:
+            if update_fields is None:
+                update_fields = [
+                    field.name
+                    for field in self._meta.concrete_fields
+                    if not field.primary_key
+                ]
+            update_fields = [
+                name for name in update_fields if name not in self.SYNC_BOOKKEEPING
+            ]
+        if self.mou_id is not None:
+            self.uuid = task_uuid(self.mou.name, self.name)
+            if update_fields is not None and "uuid" not in update_fields:
+                update_fields = [*update_fields, "uuid"]
+        if update_fields is not None:
+            kwargs["update_fields"] = update_fields
+        super().save(*args, **kwargs)
 
     @classmethod
     def select(cls, name: str, mou: MoU | None = None) -> Task:

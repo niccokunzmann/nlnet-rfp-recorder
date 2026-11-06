@@ -88,13 +88,15 @@ class SyncSettings(models.Model):
 
 
 class SyncDeletion(models.Model):
-    """A time entry or link deleted here, written by a database trigger.
+    """A time entry, link or task deleted here, written by a database trigger.
 
     Kept until a push put the deletion into the repository - from then on
     the files remember it (as `"deleted": true`) and the row is removed.
     """
 
-    model = models.CharField(max_length=32, help_text="'link' or 'time_record'.")
+    model = models.CharField(
+        max_length=32, help_text="'link', 'time_record' or 'task'."
+    )
     uuid = models.CharField(max_length=32, help_text="The uuid, as 32 hex digits.")
     deleted_at = models.CharField(
         max_length=32, help_text="When it was deleted: ISO 8601 in UTC."

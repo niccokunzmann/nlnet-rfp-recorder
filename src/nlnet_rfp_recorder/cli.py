@@ -78,7 +78,7 @@ def _setup(db: Path | None, test: bool = False, sync: bool = True) -> None:
     """Point Django at the database, migrate it and - when `rfp sync` has
     a repository and `sync` is set - sync before and after the command.
 
-    Only links and time records are synced: a command that neither reads
+    Only links, time records and tasks are synced: a command that neither reads
     nor changes them passes sync=False and has no --no-sync option.
     """
     if test:
@@ -1177,6 +1177,7 @@ def mou_update(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Update tasks and reports from NLnet's RfP pages.
 
@@ -1190,7 +1191,7 @@ def mou_update(
     the page and pass the file to also update the task descriptions and
     budgets.
     """
-    _setup(db, test, sync=False)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     selected = MoU.get_selected()
@@ -1606,9 +1607,10 @@ def task_export(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Export the current MoU's tasks as CSV."""
-    _setup(db, test, sync=False)
+    _setup(db, test, sync=not no_sync)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     mou = MoU.get_selected()

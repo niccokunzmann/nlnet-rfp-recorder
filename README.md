@@ -112,18 +112,20 @@ rfp sync --set-machine laptop      # optional: this computer's id
 rfp sync
 ```
 
-The repository is cloned to `rfp-sync/` next to the database. From then on every command that reads or changes time entries or links syncs before it runs (taking the other computers' changes) and after it ran (pushing its own) - if the repository can be reached. Commands that only touch what is not synced (`rfp version`, `rfp token`, `rfp mou list/add/select/secret/update/export`, `rfp task export`, `rfp alias ...`, `rfp migrate`, `rfp backup`) don't sync. Ctrl+C skips the sync, not the command; without a network the command just runs. `--no-sync` skips it for one command (`rfp start <link> --no-sync`, `rfp --no-sync status`), `rfp sync --auto no` turns it off until `--auto yes`. `rfp sync` itself always syncs, and runs `rfp mou update` for the selected MoU while it fetches.
+The repository is cloned to `rfp-sync/` next to the database. From then on every command that reads or changes time entries, links or tasks syncs before it runs (taking the other computers' changes) and after it ran (pushing its own) - if the repository can be reached. Commands that only touch what is not synced (`rfp version`, `rfp token`, `rfp mou list/add/select/secret/export`, `rfp alias ...`, `rfp migrate`, `rfp backup`) don't sync. Ctrl+C skips the sync, not the command; without a network the command just runs. `--no-sync` skips it for one command (`rfp start <link> --no-sync`, `rfp --no-sync status`), `rfp sync --auto no` turns it off until `--auto yes`. `rfp sync` itself always syncs, and runs `rfp mou update` for the selected MoU while it fetches.
 
 What is synced:
 
 - **Time entries** - start, end, why they stopped, their link, and the computer they were started on.
 - **Links** - URL, task (by MoU and task name), tags, excluded from reports, and the cached GitHub title and closed date.
+- **Tasks** - by MoU and task name: maximum, personal, used and remaining budget, and description. Which task is selected stays with each computer.
 
-Not synced: MoUs, tasks and budgets (`rfp mou update` reads them on each computer; a MoU or task a synced link needs is made by name), reports, aliases, the GitHub token and the RfP secret.
+Not synced: MoUs (a MoU a synced task or link needs is made by name), which task is selected, reports, aliases, the GitHub token and the RfP secret.
 
 How changes are decided:
 
 - Every time entry and link has a last-modified time and the id of the computer it was changed on. The database stamps them whenever an entry changes, however it was changed. The newest change wins - an edit made offline at 9:00 loses to one made elsewhere at 9:30, even if it is synced later. Equal times are decided by the computer id.
+- Tasks are merged value by value: every budget and the description has its own last-modified time and computer, and the newest wins. A value that was never set on a computer has none, so that computer never wipes it on the others - e.g. one that got the task only by name with a link, or never ran `rfp mou update`; it takes the value over instead. A value cleared on purpose (e.g. by `rfp task import`) stays cleared. A task is only deleted while no link or report on this computer needs it; removing a MoU removes its tasks from the sync too.
 - A deletion is kept in the files as `"deleted": true` with its time and computer, so it reaches every computer.
 - Time entries come first. A link deleted on one computer comes back if another computer has time entries on it, and a time entry that is in a report on this computer is kept even if another computer deleted it.
 - Every computer writes only its own file, `<computer id>.jsonl`, so git never has to merge. A computer's id can't be one another computer already uses; a database copied to another host gets an id of its own.
@@ -137,8 +139,8 @@ Starting on a new computer works from an empty database:
 
 ```bash
 rfp sync --set-url git@github.com:me/rfp-sync.git
-rfp sync                       # all time entries and links, with their MoUs and tasks by name
-rfp mou select <name>          # then fill in budgets and reports
+rfp sync                       # all time entries, links and tasks with their budgets
+rfp mou select <name>          # then the reports
 rfp mou secret <link>
 rfp sync
 ```
@@ -172,3 +174,4 @@ Every task has these budgets (EUR):
 make init    # uv sync + pre-commit install
 make test
 ```
+# ai.pycal.org

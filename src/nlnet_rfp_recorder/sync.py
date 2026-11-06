@@ -1,4 +1,4 @@
-"""Synchronize time records and links between computers through git.
+"""Synchronize time records, links and tasks between computers through git.
 
 Every computer writes only its own file, `<machine>.jsonl`, to the
 repository - one JSON object per line and per synced object:
@@ -22,6 +22,14 @@ deletion it cannot be sure of: a link that still has time records here
 is not deleted but restored, and so is a time record that is part of a
 report here. A restored object gets a new `modified`, so the other
 computers restore it too.
+
+Tasks - known by MoU and name, see task_uuid - carry their budget and
+description, merged value by value: every value has its own version
+(`versions`: [when, computer], see Task.field_versions) and the newest
+version wins. A value that was never set has no version, so a computer
+that never read the budget does not wipe it on the others - it takes it
+over. A value that was cleared on purpose has one, and stays cleared.
+A task is only deleted while no link or report here needs it.
 """
 
 from __future__ import annotations
@@ -40,7 +48,8 @@ from typing import Any
 BRANCH = "main"
 LINK = "link"
 TIME_RECORD = "time_record"
-MODELS = (LINK, TIME_RECORD)
+TASK = "task"
+MODELS = (LINK, TIME_RECORD, TASK)
 # A change dated further ahead than this comes from a computer whose
 # clock is wrong: its changes would win over everything until then.
 CLOCK_TOLERANCE = timedelta(minutes=5)
@@ -136,6 +145,32 @@ def serialize_time_record(record) -> dict[str, Any]:
     }
 
 
+def serialize_task(task) -> dict[str, Any]:
+    from nlnet_rfp_recorder.timetracking.models.task import SYNCED_TASK_FIELDS
+
+    return {
+        "mou": task.mou.name,
+        "task": task.name,
+        **{name: getattr(task, name) for name in SYNCED_TASK_FIELDS},
+        "versions": {
+            name: task.field_versions[name]
+            for name in SYNCED_TASK_FIELDS
+            if _field_version((task.field_versions or {}).get(name)) is not None
+        },
+    }
+
+
+def _field_version(value: Any) -> Version | None:
+    """A value's version, None if it has none (or one that is not one)."""
+    if (
+        isinstance(value, list | tuple)
+        and len(value) == 2
+        and all(isinstance(part, str) for part in value)
+    ):
+        return (value[0], value[1])
+    return None
+
+
 def _entry(model: str, obj, serialize: Callable[[Any], dict]) -> Entry:
     return {
         "model": model,
@@ -163,9 +198,11 @@ def _key_of(entry: Entry) -> Key:
 
 def local_objects() -> dict[Key, tuple[Any, Entry]]:
     """Every synced object in the database with its entry for the file."""
-    from nlnet_rfp_recorder.timetracking.models import Link, TimeRecord
+    from nlnet_rfp_recorder.timetracking.models import Link, Task, TimeRecord
 
     objects: dict[Key, tuple[Any, Entry]] = {}
+    for task in Task.objects.select_related("mou").filter(mou__isnull=False):
+        objects[(TASK, str(task.uuid))] = (task, _entry(TASK, task, serialize_task))
     for link in Link.objects.select_related("task__mou").prefetch_related("tags"):
         objects[(LINK, str(link.uuid))] = (link, _entry(LINK, link, serialize_link))
     for record in TimeRecord.objects.select_related("link"):
@@ -327,6 +364,7 @@ class _Importer:
         from nlnet_rfp_recorder.timetracking.models import (
             Link,
             SyncDeletion,
+            Task,
             TimeRecord,
         )
 
@@ -339,8 +377,13 @@ class _Importer:
                 deletion.deleted_at,
                 deletion.deleted_by,
             )
-        for model, model_class in ((LINK, Link), (TIME_RECORD, TimeRecord)):
-            for uuid, modified, modified_by in model_class.objects.values_list(
+        synced = (
+            (LINK, Link.objects),
+            (TIME_RECORD, TimeRecord.objects),
+            (TASK, Task.objects.filter(mou__isnull=False)),
+        )
+        for model, objects in synced:
+            for uuid, modified, modified_by in objects.values_list(
                 "uuid", "modified", "modified_by"
             ):
                 self.local[(model, str(uuid))] = (modified, modified_by)
@@ -356,13 +399,20 @@ class _Importer:
             if self.is_newer(entry)
         ]
         self._warn_about_clocks(newer)
-        # Links before the time records that point to them; deletions
-        # last, after a merged or restored link has its records.
+        # Every task is merged, not only the newer ones: an older version
+        # of the task can still have a newer version of one value.
+        for key, entry in sorted(self.remote.live.items()):
+            if key[0] == TASK:
+                self._safely(self._merge_task, entry)
+        # Tasks before the links on them, links before the time records
+        # that point to them; deletions last, after a merged or restored
+        # link has its records and a task its links.
         steps: list[tuple[str, bool, Callable[[Entry], None]]] = [
             (LINK, False, self._apply_link),
             (TIME_RECORD, False, self._apply_time_record),
             (TIME_RECORD, True, self._delete_time_record),
             (LINK, True, self._delete_link),
+            (TASK, True, self._delete_task),
         ]
         for model, deleted, apply in steps:
             for entry in newer:
@@ -411,6 +461,66 @@ class _Importer:
                 "Stop the one you are not using with `rfp stop` there."
             )
 
+    # --- tasks
+
+    def _merge_task(self, entry: Entry) -> None:
+        from nlnet_rfp_recorder.timetracking.models import MoU, Task
+        from nlnet_rfp_recorder.timetracking.models.task import SYNCED_TASK_FIELDS
+
+        task = (
+            Task.objects.filter(uuid=entry["uuid"], mou__isnull=False).first()
+            or Task.objects.filter(mou__name=entry["mou"], name=entry["task"]).first()
+        )
+        created = task is None
+        if created:
+            newest = self.remote.newest.get(_key_of(entry))
+            if newest is None or newest.get("deleted") or not self.is_newer(entry):
+                return  # deleted there, or here after this version
+            mou, _ = MoU.objects.get_or_create(name=entry["mou"])
+            task = Task.objects.create(mou=mou, name=entry["task"], selected=False)
+
+        versions = dict(task.field_versions or {})
+        theirs = entry.get("versions")
+        if not isinstance(theirs, dict):
+            theirs = {}
+        values: dict[str, Any] = {}
+        for name in SYNCED_TASK_FIELDS:
+            their_version = _field_version(theirs.get(name))
+            if their_version is None:
+                continue  # never set there: whatever is here stays
+            our_version = _field_version(versions.get(name))
+            if our_version is None or their_version > our_version:
+                values[name] = entry.get(name)
+                versions[name] = list(their_version)
+
+        if values:
+            Task.objects.filter(pk=task.pk).update(**values, field_versions=versions)
+            if any(getattr(task, name) != value for name, value in values.items()):
+                self.result.changed += 1
+        if created:
+            _stamp(Task, task.pk, version(entry))
+        elif values:
+            # The values are of this version now - unless the task changed
+            # here later, which a deletion from before must not undo.
+            _stamp(
+                Task, task.pk, max(version(entry), (task.modified, task.modified_by))
+            )
+
+    def _delete_task(self, entry: Entry) -> None:
+        from nlnet_rfp_recorder.timetracking.models import ReportTask, Task
+
+        task = Task.objects.filter(uuid=entry["uuid"], mou__isnull=False).first()
+        if task is None or not _is_newer_than(entry, task):
+            return
+        if task.links.exists() or ReportTask.objects.filter(task=task).exists():
+            # Links or reports here still count on it: keep it everywhere.
+            _restore(Task, task.pk)
+            self.result.restored += 1
+            return
+        task.delete()
+        _forget_deletion(TASK, entry["uuid"])
+        self.result.deleted += 1
+
     # --- links
 
     def _apply_link(self, entry: Entry) -> None:
@@ -431,7 +541,9 @@ class _Importer:
             # into an empty database - is made by name; `rfp mou update`
             # fills it in.
             mou, _ = MoU.objects.get_or_create(name=entry["mou"])
-            task, _ = Task.objects.get_or_create(mou=mou, name=entry["task"])
+            task, _ = Task.objects.get_or_create(
+                mou=mou, name=entry["task"], defaults={"selected": False}
+            )
 
         link = Link.objects.filter(uuid=entry["uuid"]).first()
         if link is None and url:
