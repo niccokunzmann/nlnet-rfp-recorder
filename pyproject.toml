@@ -34,6 +34,9 @@ dev = [
 [tool.ruff]
 line-length = 88
 target-version = "py314"
+# The Claude Code hooks run with the system's python3, which can be older
+# than 3.14: formatting them for 3.14 (e.g. `except A, B:`) breaks them.
+extend-exclude = [".claude"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]

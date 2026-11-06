@@ -159,7 +159,7 @@ def repo_root(cwd: str) -> Path | None:
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
-    except OSError, subprocess.CalledProcessError:
+    except (OSError, subprocess.CalledProcessError):
         return fallback
     return Path(toplevel) if toplevel else fallback
 
