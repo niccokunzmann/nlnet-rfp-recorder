@@ -1055,6 +1055,31 @@ def test_no_sync_skips_the_sync(repository, args):
     assert not cli._sync_pending
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["version"],
+        ["token"],
+        ["mou", "list"],
+        ["mou", "add", "nlnet-2026"],
+        ["mou", "export"],
+        ["task", "export"],
+        ["alias", "list"],
+        ["migrate"],
+    ],
+)
+def test_commands_without_synced_data_do_not_sync(repository, args):
+    """Only links and time records are synced: commands that neither
+    read nor change them have nothing to sync."""
+    MoU.objects.create(name="nlnet-2026", selected=True)
+    with patch.object(Sync, "pull") as pull:
+        result = runner.invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    pull.assert_not_called()
+    assert not cli._sync_pending
+
+
 def test_no_sync_lasts_one_invocation(repository):
     runner.invoke(app, ["--no-sync", "timesheet", "list"])
     with patch.object(Sync, "pull") as pull:

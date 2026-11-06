@@ -90,7 +90,7 @@ rfp report
 | `rfp mou plot complete` | Bars for the whole MoU: personal budget in €, light green submitted, green worked since, and yellow where you should be today if the budget is used up evenly from the start date to the deadline. Ends with how many hours you are behind or in front, your average daily (Mo-Fr) and weekly work in total and over the last 30 days, and what is required per day and week to finish by the deadline. |
 | `rfp mou plot calendar` | Heat map of hours worked per day, from the MoU's start date to its deadline (or today); fits the terminal width. |
 | `rfp mou deadline [YYYY-MM-DD]` / `--clear` | Set, show or remove the MoU's deadline: the date until which all assigned personal budget needs to be used up. `rfp mou status` shows the start date (the first time record on one of its tasks), the days left and the personal budget still to use. |
-| `rfp mou secret <link\|secret>` | Remember the secret of your NLnet Request for Payment page, from the whole link or - once the project is known, or when the MoU is named like it (2026-04-3e6) - just the secret. |
+| `rfp mou secret [<link\|secret>]` | Remember the secret of your NLnet Request for Payment page, from the whole link or - once the project is known, or when the MoU is named like it (2026-04-3e6) - just the secret. Without an argument, it asks for the link on standard input so the secret stays out of your shell history. |
 | `rfp mou update [saved-page.html]` | Reads NLnet's RfP pages with GET requests only - it never sends a POST, so nothing can be submitted. Every request on the overview goes to the matching report (the most links and task totals in common) with its status (confirmed, approved and paid date, declined or retracted - those claim no money) and the amounts requested per task; reports of this tool are renamed to `<MoU>-<date>-<recipient>-<index on the page>`, other people's requests become reports of their own. The task list is only on the "New request" form, which NLnet opens with a POST: open it in your browser, save the page and pass the file to also update the task descriptions, maximum, remaining and used budgets and what is left. |
 | `rfp mou import <path\|link>` | Alternatively import a budget document (milestone table or takentaal) from a file or stdin, or an RfP link (remembers the secret and reads the requests). |
 | `rfp status` / `rfp task` / `rfp mou status` | Check where things stand. |
@@ -99,7 +99,7 @@ rfp report
 | `rfp --test <command>` | Try things against a disposable database instead of your real one. |
 | `rfp sync` | Sync time entries and links with your other computers through a private git repository, running `rfp mou update` at the same time. See [Sync between computers](#sync-between-computers). |
 | `rfp sync --set-url <url>` / `--set-name <name>` / `--set-email <email>` | Set the repository, and the author of the sync commits - used by rfp only, no git config is changed. An empty `--set-url ""` turns sync off. GitHub repositories that are public are refused. |
-| `rfp sync --auto yes\|no` | Whether every command syncs before and after it runs (default: yes). `rfp sync` itself always syncs; `--no-sync` on any command skips it once. |
+| `rfp sync --auto yes\|no` | Whether every command working on time entries or links syncs before and after it runs (default: yes). `rfp sync` itself always syncs; `--no-sync` on any command skips it once. |
 | `rfp sync --set-machine <id>` | This computer's id in the repository (default: host name and a random part). |
 
 ## Sync between computers
@@ -112,7 +112,7 @@ rfp sync --set-machine laptop      # optional: this computer's id
 rfp sync
 ```
 
-The repository is cloned to `rfp-sync/` next to the database. From then on every command syncs before it runs (taking the other computers' changes) and after it ran (pushing its own) - if the repository can be reached. Ctrl+C skips the sync, not the command; without a network the command just runs. `--no-sync` skips it for one command (`rfp start <link> --no-sync`, `rfp --no-sync status`), `rfp sync --auto no` turns it off until `--auto yes`. `rfp sync` itself always syncs, and runs `rfp mou update` for the selected MoU while it fetches.
+The repository is cloned to `rfp-sync/` next to the database. From then on every command that reads or changes time entries or links syncs before it runs (taking the other computers' changes) and after it ran (pushing its own) - if the repository can be reached. Commands that only touch what is not synced (`rfp version`, `rfp token`, `rfp mou list/add/select/secret/update/export`, `rfp task export`, `rfp alias ...`, `rfp migrate`, `rfp backup`) don't sync. Ctrl+C skips the sync, not the command; without a network the command just runs. `--no-sync` skips it for one command (`rfp start <link> --no-sync`, `rfp --no-sync status`), `rfp sync --auto no` turns it off until `--auto yes`. `rfp sync` itself always syncs, and runs `rfp mou update` for the selected MoU while it fetches.
 
 What is synced:
 

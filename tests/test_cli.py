@@ -6739,6 +6739,17 @@ def test_mou_secret_bare_secret_uses_project_named_mou():
     assert MoU.objects.get().rfp_project == "2026-04-3e6"
 
 
+def test_mou_secret_without_argument_reads_link_from_stdin():
+    runner.invoke(app, ["mou", "add", "nlnet-2026"])
+
+    result = runner.invoke(app, ["mou", "secret"], input=f"{RFP_LINK}\n")
+
+    assert result.exit_code == 0, result.output
+    mou = MoU.objects.get()
+    assert (mou.rfp_project, mou.rfp_secret) == ("2026-04-3e6", RFP_SECRET)
+    assert RFP_SECRET not in result.output
+
+
 def test_mou_update_fails_without_secret():
     runner.invoke(app, ["mou", "add", "nlnet-2026"])
 

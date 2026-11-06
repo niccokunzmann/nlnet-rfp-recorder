@@ -76,7 +76,11 @@ TEST_DB_FILE = Path(tempfile.gettempdir()) / "rfp-test.sqlite3"
 
 def _setup(db: Path | None, test: bool = False, sync: bool = True) -> None:
     """Point Django at the database, migrate it and - when `rfp sync` has
-    a repository and `sync` is set - sync before and after the command."""
+    a repository and `sync` is set - sync before and after the command.
+
+    Only links and time records are synced: a command that neither reads
+    nor changes them passes sync=False and has no --no-sync option.
+    """
     if test:
         db = TEST_DB_FILE
     if db is not None:
@@ -776,11 +780,9 @@ def callback(
 
 
 @app.command()
-def version(
-    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
-) -> None:
+def version(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Print the installed version."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     typer.echo(get_version("nlnet-rfp-recorder"))
 
 
@@ -806,10 +808,9 @@ def token(
     value: str | None = typer.Argument(None),
     db: Path | None = DbOption,
     test: bool = TestOption,
-    no_sync: bool = NoSyncOption,
 ) -> None:
     """Save a GitHub token, or print how to create one if none is given."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     if value is None:
         typer.echo(TOKEN_HELP)
         return
@@ -930,11 +931,9 @@ def mou_deadline(
 
 
 @mou_app.command("list")
-def mou_list(
-    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
-) -> None:
+def mou_list(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """List all MoUs."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     mous = MoU.objects.all()
@@ -952,10 +951,9 @@ def mou_add(
     name: str,
     db: Path | None = DbOption,
     test: bool = TestOption,
-    no_sync: bool = NoSyncOption,
 ) -> None:
     """Add (and select) an MoU, creating it if it doesn't exist yet."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     from django.core.exceptions import ValidationError
 
     from nlnet_rfp_recorder.timetracking.models import MoU
@@ -972,10 +970,9 @@ def mou_select(
     name: str = typer.Argument(..., autocompletion=_complete_mou_name),
     db: Path | None = DbOption,
     test: bool = TestOption,
-    no_sync: bool = NoSyncOption,
 ) -> None:
     """Select an existing MoU without creating it."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     from nlnet_rfp_recorder.timetracking.models import MoU, resolve_mou_name
 
     name = resolve_mou_name(name)
@@ -1133,24 +1130,31 @@ def _update_reports_from_rfp(mou: MoU) -> None:
 
 @mou_app.command("secret")
 def mou_secret(
-    link: str = typer.Argument(
-        ..., help="NLnet RfP link (with project and secret) or just the secret."
+    link: str | None = typer.Argument(
+        None,
+        help=(
+            "NLnet RfP link (with project and secret) or just the secret. "
+            "Asked for on standard input when omitted, which keeps it out "
+            "of the shell history."
+        ),
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
-    no_sync: bool = NoSyncOption,
 ) -> None:
     """Set the selected MoU's RfP page secret from a link or directly.
 
     A bare secret works when the project id is known already (from an
     earlier link) or is the MoU's name, e.g. 2026-04-3e6.
+    Without an argument, the link is read from standard input.
     """
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     selected = MoU.get_selected()
     if selected is None:
         _fail("No MoU selected. Run `rfp mou add <name>` first.")
+    if link is None:
+        link = typer.prompt("RfP link or secret", hide_input=True).strip()
     try:
         selected.set_rfp_link(link)
     except ValueError as error:
@@ -1173,7 +1177,6 @@ def mou_update(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
-    no_sync: bool = NoSyncOption,
 ) -> None:
     """Update tasks and reports from NLnet's RfP pages.
 
@@ -1187,7 +1190,7 @@ def mou_update(
     the page and pass the file to also update the task descriptions and
     budgets.
     """
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     selected = MoU.get_selected()
@@ -1204,10 +1207,9 @@ def mou_export(
     name: str | None = typer.Argument(None, autocompletion=_complete_mou_name),
     db: Path | None = DbOption,
     test: bool = TestOption,
-    no_sync: bool = NoSyncOption,
 ) -> None:
     """Print the raw budget text last imported for a MoU (default: selected)."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     from nlnet_rfp_recorder.timetracking.models import MoU, resolve_mou_name
 
     if name is not None:
@@ -1604,10 +1606,9 @@ def task_export(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
-    no_sync: bool = NoSyncOption,
 ) -> None:
     """Export the current MoU's tasks as CSV."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     from nlnet_rfp_recorder.timetracking.models import MoU
 
     mou = MoU.get_selected()
@@ -4131,10 +4132,9 @@ def alias_set(
     alias: str = typer.Argument(...),
     db: Path | None = DbOption,
     test: bool = TestOption,
-    no_sync: bool = NoSyncOption,
 ) -> None:
     """Give a MoU, task, or repository URL a short alias."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     from nlnet_rfp_recorder.timetracking.models import Alias, MoU
 
     mou = MoU.get_selected() if item == "task" else None
@@ -4157,10 +4157,9 @@ def alias_remove(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
-    no_sync: bool = NoSyncOption,
 ) -> None:
     """Remove an alias, identified by its alias or the id it names."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     from nlnet_rfp_recorder.timetracking.models import Alias, MoU
 
     mou = MoU.get_selected() if item == "task" else None
@@ -4188,10 +4187,9 @@ def alias_rename(
     new_alias: str = typer.Argument(...),
     db: Path | None = DbOption,
     test: bool = TestOption,
-    no_sync: bool = NoSyncOption,
 ) -> None:
     """Rename an existing alias."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     from nlnet_rfp_recorder.timetracking.models import Alias, MoU
 
     mou = MoU.get_selected() if item == "task" else None
@@ -4227,10 +4225,9 @@ def alias_list(
     item: AliasItemType | None = typer.Argument(None),
     db: Path | None = DbOption,
     test: bool = TestOption,
-    no_sync: bool = NoSyncOption,
 ) -> None:
     """List aliases, optionally filtered to one item type."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     from nlnet_rfp_recorder.timetracking.models import Alias
 
     aliases = Alias.objects.all()
@@ -4247,11 +4244,9 @@ def alias_list(
 
 
 @app.command()
-def migrate(
-    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
-) -> None:
+def migrate(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Create or update the database schema."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     from django.conf import settings
 
     typer.echo(f"Migrated {settings.DATABASES['default']['NAME']}")
@@ -4284,11 +4279,9 @@ def _backup_database(action: str) -> tuple[Path, Path]:
 
 
 @app.command()
-def backup(
-    db: Path | None = DbOption, test: bool = TestOption, no_sync: bool = NoSyncOption
-) -> None:
+def backup(db: Path | None = DbOption, test: bool = TestOption) -> None:
     """Copy the database file, timestamped, next to itself."""
-    _setup(db, test, sync=not no_sync)
+    _setup(db, test, sync=False)
     database_file, backup_file = _backup_database("backup")
     typer.echo(f"Backed up {database_file} to {backup_file}")
 
