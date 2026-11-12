@@ -112,15 +112,15 @@ rfp sync --set-machine laptop      # optional: this computer's id
 rfp sync
 ```
 
-The repository is cloned to `rfp-sync/` next to the database. From then on every command that reads or changes time entries, links or tasks syncs before it runs (taking the other computers' changes) and after it ran (pushing its own) - if the repository can be reached. Commands that only touch what is not synced (`rfp version`, `rfp token`, `rfp mou list/add/select/secret/export`, `rfp alias ...`, `rfp migrate`, `rfp backup`) don't sync. Ctrl+C skips the sync, not the command; without a network the command just runs. `--no-sync` skips it for one command (`rfp start <link> --no-sync`, `rfp --no-sync status`), `rfp sync --auto no` turns it off until `--auto yes`. `rfp sync` itself always syncs, and runs `rfp mou update` for the selected MoU while it fetches.
+The repository is cloned to `rfp-sync/` next to the database. From then on every command that reads or changes time entries, links or tasks syncs before it runs (taking the other computers' changes) and after it ran (pushing its own) - if the repository can be reached. Commands that only touch what is not synced (`rfp version`, `rfp token`, `rfp mou list/add/select/secret/export`, `rfp alias ... mou/url`, `rfp migrate`, `rfp backup`) don't sync. Ctrl+C skips the sync, not the command; without a network the command just runs. `--no-sync` skips it for one command (`rfp start <link> --no-sync`, `rfp --no-sync status`), `rfp sync --auto no` turns it off until `--auto yes`. `rfp sync` itself always syncs, and runs `rfp mou update` for the selected MoU while it fetches.
 
 What is synced:
 
-- **Time entries** - start, end, why they stopped, their link, and the computer they were started on.
+- **Time entries** - start, end, why they stopped, their link, the computer they were started on, and the NLnet request of the report they are in. Reports themselves are not synced, but `rfp mou update` reads every request from NLnet: so another computer also knows which of your time is reported and what your requests claim per task (`rfp task plot complete`, `rfp status`), and does not report it again.
 - **Links** - URL, task (by MoU and task name), tags, excluded from reports, and the cached GitHub title and closed date.
-- **Tasks** - by MoU and task name: maximum, personal, used and remaining budget, and description. Which task is selected stays with each computer.
+- **Tasks** - by MoU and task name: maximum, personal, used and remaining budget, description and alias. Which task is selected stays with each computer. An alias names one task of a MoU: given to two tasks on two computers, the one given later keeps it.
 
-Not synced: MoUs (a MoU a synced task or link needs is made by name), which task is selected, reports, aliases, the GitHub token and the RfP secret.
+Not synced: MoUs (a MoU a synced task or link needs is made by name), which task is selected, reports, MoU and URL aliases, the GitHub token and the RfP secret.
 
 How changes are decided:
 

@@ -40,6 +40,9 @@ SYNCED_TASK_FIELDS = (
     "personal_budget",
     "description",
 )
+# Also synced with its own version, but kept in the Alias table: the
+# task's alias (see Task.alias).
+TASK_ALIAS_FIELD = "alias"
 
 
 def task_uuid(mou_name: str, task_name: str) -> uuid_module.UUID:
@@ -364,9 +367,10 @@ class Task(models.Model):
         top of it. Excludes links the user has permanently excluded from
         reports (see Link.excluded_from_reports).
         """
+        from .time_record import TimeRecord
+
         return self.links.filter(
-            time_records__isnull=False,
-            time_records__report_line__isnull=True,
+            time_records__in=TimeRecord.objects.unreported(),
             excluded_from_reports=False,
         ).distinct()
 
@@ -421,7 +425,7 @@ class Task(models.Model):
         from .time_record import TimeRecord
 
         link_ids = [link.id for link in self.links_with_unreported_time]
-        return TimeRecord.objects.filter(link_id__in=link_ids, report_line__isnull=True)
+        return TimeRecord.objects.unreported().filter(link_id__in=link_ids)
 
     @property
     def duration(self) -> timedelta:
@@ -438,13 +442,25 @@ class Task(models.Model):
 
         if settings.RFP_EUROS_PER_HOUR is None:
             return 0.0
-        # Only my own reports (they have lines), and only those that claim money.
-        budgets = ReportTask.objects.filter(
-            task=self,
-            report__declined=False,
-            report__retracted=False,
-            report__lines__isnull=False,
-        ).distinct()
+        from django.db.models import Q
+
+        from .time_record import TimeRecord
+
+        # Only my own reports, and only those that claim money. Mine have
+        # lines - or, made on another computer, hold my time (synced with
+        # the request it is in, see TimeRecord.rfp_request).
+        my_requests = (
+            TimeRecord.objects.exclude(rfp_request="").values("rfp_request").distinct()
+        )
+        budgets = (
+            ReportTask.objects.filter(
+                task=self, report__declined=False, report__retracted=False
+            )
+            .filter(
+                Q(report__lines__isnull=False) | Q(report__rfp_request__in=my_requests)
+            )
+            .distinct()
+        )
         return float(sum(budget.budget for budget in budgets))
 
     @property

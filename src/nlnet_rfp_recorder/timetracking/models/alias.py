@@ -106,7 +106,15 @@ class Alias(models.Model):
         else:
             target = id_or_target
 
-        cls.conflicts_for(item_type, target, alias, mou).delete()
+        conflicts = list(cls.conflicts_for(item_type, target, alias, mou))
+        if len(conflicts) == 1 and (conflicts[0].target, conflicts[0].alias) == (
+            target,
+            alias,
+        ):
+            # Already so: keeping the row keeps `rfp sync` from taking it
+            # for a change made now (see triggers.py).
+            return conflicts[0]
+        cls.objects.filter(pk__in=[conflict.pk for conflict in conflicts]).delete()
 
         return cls.objects.create(
             item_type=item_type,

@@ -59,9 +59,27 @@ STOP_REASONS = (
 )
 
 
+def claimed_requests() -> models.QuerySet:
+    """The NLnet requests (ids) of the reports that claim money."""
+    from .report import Report
+
+    return (
+        Report.objects.filter(declined=False, retracted=False)
+        .exclude(rfp_request="")
+        .values("rfp_request")
+    )
+
+
 class TimeRecordManager(models.Manager):
     def running(self) -> models.QuerySet[TimeRecord]:
         return self.filter(end_time__isnull=True)
+
+    def unreported(self) -> models.QuerySet[TimeRecord]:
+        """Time in no report here - and in no claiming report made on
+        another computer (see rfp_request)."""
+        return self.filter(report_line__isnull=True).exclude(
+            rfp_request__in=claimed_requests()
+        )
 
 
 class TimeRecord(models.Model):
@@ -131,6 +149,17 @@ class TimeRecord(models.Model):
         help_text=(
             "The report line this time entry has been claimed by, or "
             "None if unreported."
+        ),
+    )
+    rfp_request = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The NLnet request of the report this time entry is in, kept "
+            "by a database trigger from report_line. Synced: another "
+            "computer has no report lines, but `rfp mou update` gives it "
+            "the request - so it knows this time is reported."
         ),
     )
 

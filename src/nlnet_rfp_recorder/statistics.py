@@ -61,8 +61,13 @@ class Statistics:
         cls, start: date | None, end: date | None, mou: MoU | None = None
     ) -> Statistics:
         from nlnet_rfp_recorder.timetracking.models import TimeRecord
+        from nlnet_rfp_recorder.timetracking.models.time_record import (
+            claimed_requests,
+        )
 
         spans = TimeRecord.get_statistics(start=start, end=end)
+        # Reported on another computer: in a claiming report it made.
+        claimed = set(claimed_requests().values_list("rfp_request", flat=True))
         rate = settings.RFP_EUROS_PER_HOUR
         threshold = settings.REVIEW_DEFAULT_EXCLUDE_BELOW
 
@@ -80,7 +85,10 @@ class Statistics:
                 if mou_id != mou.pk:
                     continue
             durations[task] = durations.get(task, timedelta()) + span.duration
-            if span.record.report_line_id is None:
+            if (
+                span.record.report_line_id is None
+                and span.record.rfp_request not in claimed
+            ):
                 new_durations[task] = (
                     new_durations.get(task, timedelta()) + span.duration
                 )

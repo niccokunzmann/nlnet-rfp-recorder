@@ -30,6 +30,9 @@ version wins. A value that was never set has no version, so a computer
 that never read the budget does not wipe it on the others - it takes it
 over. A value that was cleared on purpose has one, and stays cleared.
 A task is only deleted while no link or report here needs it.
+
+A task's alias is one more such value. An alias names one task of a MoU:
+given to two tasks on two computers, the one given later keeps it.
 """
 
 from __future__ import annotations
@@ -142,22 +145,42 @@ def serialize_time_record(record) -> dict[str, Any]:
         "end_time": _datetime(record.end_time),
         "stop_reason": record.stop_reason,
         "computer": record.computer,
+        "rfp_request": record.rfp_request,
     }
 
 
 def serialize_task(task) -> dict[str, Any]:
-    from nlnet_rfp_recorder.timetracking.models.task import SYNCED_TASK_FIELDS
+    from nlnet_rfp_recorder.timetracking.models.task import (
+        SYNCED_TASK_FIELDS,
+        TASK_ALIAS_FIELD,
+    )
 
     return {
         "mou": task.mou.name,
         "task": task.name,
         **{name: getattr(task, name) for name in SYNCED_TASK_FIELDS},
+        TASK_ALIAS_FIELD: task.alias,
         "versions": {
             name: task.field_versions[name]
-            for name in SYNCED_TASK_FIELDS
+            for name in (*SYNCED_TASK_FIELDS, TASK_ALIAS_FIELD)
             if _field_version((task.field_versions or {}).get(name)) is not None
         },
     }
+
+
+def _alias_value(value: Any) -> str | None:
+    """A task alias from a file; ValueError if it cannot be one."""
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 64
+        or any(character.isspace() for character in value)
+        or value[0].isdigit()
+    ):
+        raise ValueError(f"{value!r} is no task alias")
+    return value
 
 
 def _field_version(value: Any) -> Version | None:
@@ -465,14 +488,19 @@ class _Importer:
 
     def _merge_task(self, entry: Entry) -> None:
         from nlnet_rfp_recorder.timetracking.models import MoU, Task
-        from nlnet_rfp_recorder.timetracking.models.task import SYNCED_TASK_FIELDS
+        from nlnet_rfp_recorder.timetracking.models.task import (
+            SYNCED_TASK_FIELDS,
+            TASK_ALIAS_FIELD,
+        )
 
-        task = (
+        found = (
             Task.objects.filter(uuid=entry["uuid"], mou__isnull=False).first()
             or Task.objects.filter(mou__name=entry["mou"], name=entry["task"]).first()
         )
-        created = task is None
-        if created:
+        created = found is None
+        if found is not None:
+            task = found
+        else:
             newest = self.remote.newest.get(_key_of(entry))
             if newest is None or newest.get("deleted") or not self.is_newer(entry):
                 return  # deleted there, or here after this version
@@ -493,18 +521,87 @@ class _Importer:
                 values[name] = entry.get(name)
                 versions[name] = list(their_version)
 
-        if values:
+        alias_changed = False
+        their_version = _field_version(theirs.get(TASK_ALIAS_FIELD))
+        our_version = _field_version(versions.get(TASK_ALIAS_FIELD))
+        took_alias = their_version is not None and (
+            our_version is None or their_version > our_version
+        )
+        if took_alias:
+            try:
+                alias = _alias_value(entry.get(TASK_ALIAS_FIELD))
+            except ValueError as error:
+                took_alias = False
+                self.result.warnings.append(
+                    f"Kept the alias of task {task.name}: {error}, "
+                    f"from {entry.get('modified_by') or 'a computer'}."
+                )
+            else:
+                alias_changed = self._set_alias(task, alias, their_version)
+                versions[TASK_ALIAS_FIELD] = list(their_version)
+
+        # After the alias: its triggers date it now, this dates it right.
+        if values or took_alias:
             Task.objects.filter(pk=task.pk).update(**values, field_versions=versions)
-            if any(getattr(task, name) != value for name, value in values.items()):
+            if alias_changed or any(
+                getattr(task, name) != value for name, value in values.items()
+            ):
                 self.result.changed += 1
         if created:
             _stamp(Task, task.pk, version(entry))
-        elif values:
+        elif values or took_alias:
             # The values are of this version now - unless the task changed
             # here later, which a deletion from before must not undo.
             _stamp(
                 Task, task.pk, max(version(entry), (task.modified, task.modified_by))
             )
+
+    def _set_alias(self, task, alias: str | None, alias_version: Version) -> bool:
+        """Give the task this alias - unless another task of its MoU got
+        the same alias later, then the task has none. A task that got it
+        earlier loses it, but keeps its version: the newer alias decides
+        on every computer, whichever task is merged first.
+
+        Returns whether the task's alias changed. The caller dates it.
+        """
+        from nlnet_rfp_recorder.timetracking.models import Alias, Task
+        from nlnet_rfp_recorder.timetracking.models.task import TASK_ALIAS_FIELD
+
+        current = task.alias
+        if alias is not None:
+            holders = Alias.objects.filter(
+                item_type="task", mou=task.mou, alias=alias
+            ).exclude(target=task.name)
+            for holder in holders:
+                other = Task.objects.filter(mou=task.mou, name=holder.target).first()
+                other_version = (
+                    None
+                    if other is None
+                    else _field_version(
+                        (other.field_versions or {}).get(TASK_ALIAS_FIELD)
+                    )
+                )
+                if other_version is not None and other_version > alias_version:
+                    alias = None  # the other task got it later
+                    break
+                holder.delete()
+                if other is not None:
+                    # Undo what the trigger dated: this is not a change
+                    # made here, and the other task's version stays.
+                    Task.objects.filter(pk=other.pk).update(
+                        field_versions=other.field_versions,
+                        modified=other.modified,
+                        modified_by=other.modified_by,
+                    )
+                    self.result.changed += 1
+        if alias == current:
+            return False
+        Alias.objects.filter(item_type="task", mou=task.mou, target=task.name).delete()
+        if alias is not None:
+            Alias.objects.create(
+                item_type="task", mou=task.mou, target=task.name, alias=alias
+            )
+        return True
 
     def _delete_task(self, entry: Entry) -> None:
         from nlnet_rfp_recorder.timetracking.models import ReportTask, Task
@@ -649,10 +746,21 @@ class _Importer:
         record.end_time = end_time
         record.stop_reason = entry.get("stop_reason") or "user"
         record.computer = entry.get("computer") or record.computer
+        # Which request the time is in comes from the report here, if it
+        # is in one; else from the computer that has the report.
+        theirs = entry.get("rfp_request")
+        if not isinstance(theirs, str):
+            theirs = None  # from a computer that does not sync it yet
+        if record.report_line_id is None and theirs is not None:
+            record.rfp_request = theirs
         record.modified, record.modified_by = version(entry)
         record.save()
         _stamp(TimeRecord, record.pk, version(entry))
         self.result.changed += 1
+        record.refresh_from_db(fields=["rfp_request"])
+        if theirs is not None and record.rfp_request != theirs:
+            # The other computer does not know the report here: tell it.
+            _restore(TimeRecord, record.pk)
 
     def _delete_time_record(self, entry: Entry) -> None:
         from nlnet_rfp_recorder.timetracking.models import TimeRecord

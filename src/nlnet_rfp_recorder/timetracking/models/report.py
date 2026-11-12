@@ -191,9 +191,7 @@ def _billable_and_excluded_links(mou: MoU) -> tuple[list[TimeRecord], list[Link]
     for links in links_by_task.values():
         billable_ids = {link.id for link in links if not link.is_pr or link.is_closed}
         records += list(
-            TimeRecord.objects.filter(
-                link_id__in=billable_ids, report_line__isnull=True
-            )
+            TimeRecord.objects.unreported().filter(link_id__in=billable_ids)
         )
         excluded_links += [link for link in links if link.is_pr and not link.is_closed]
     return records, excluded_links

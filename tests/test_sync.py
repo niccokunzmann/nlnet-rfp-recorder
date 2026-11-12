@@ -25,6 +25,7 @@ from nlnet_rfp_recorder.sync import (
     write_file,
 )
 from nlnet_rfp_recorder.timetracking.models import (
+    Alias,
     Link,
     MoU,
     Report,
@@ -1066,20 +1067,43 @@ def test_no_sync_skips_the_sync(repository, args):
         ["mou", "list"],
         ["mou", "add", "nlnet-2026"],
         ["mou", "export"],
-        ["alias", "list"],
+        ["alias", "list", "url"],
+        ["alias", "set", "url", "https://github.com/o/r", "r"],
+        ["alias", "set", "mou", "nlnet-2026", "n"],
+        ["alias", "set", "task", "1a", "api", "--no-sync"],
         ["migrate"],
     ],
 )
 def test_commands_without_synced_data_do_not_sync(repository, args):
     """Only links, time records and tasks are synced: commands that neither
     read nor change them have nothing to sync."""
-    MoU.objects.create(name="nlnet-2026", selected=True)
+    _task("1a", mou_name="nlnet-2026")
+    MoU.objects.filter(name="nlnet-2026").update(selected=True)
     with patch.object(Sync, "pull") as pull:
         result = runner.invoke(app, args)
 
     assert result.exit_code == 0, result.output
     pull.assert_not_called()
     assert not cli._sync_pending
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["alias", "list"],
+        ["alias", "list", "task"],
+        ["alias", "set", "task", "1a", "api"],
+    ],
+)
+def test_commands_on_task_aliases_sync(repository, args):
+    _task("1a", mou_name="nlnet-2026")
+    MoU.objects.filter(name="nlnet-2026").update(selected=True)
+    with patch.object(Sync, "pull", return_value=MagicMock(total=0, warnings=[])):
+        with patch.object(Sync, "fetch"):
+            result = runner.invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    assert cli._sync_pending
 
 
 def test_no_sync_lasts_one_invocation(repository):
@@ -1688,3 +1712,530 @@ def test_a_task_from_another_computer_is_not_pushed_back_changed(repository, tmp
     pushed = _by_uuid(read_file(sync.git.path / sync.file_name))[entry["uuid"]]
     assert pushed["versions"] == entry["versions"]
     assert (pushed["modified"], pushed["modified_by"]) == (LATER, OTHER)
+
+
+# --- task aliases ------------------------------------------------------------
+
+
+def _alias(task: Task, alias: str) -> Alias:
+    return Alias.create("task", task.name, alias, mou=task.mou)
+
+
+def _aliases(mou_name="nlnet-2026") -> dict[str, str]:
+    """task name -> alias"""
+    return dict(
+        Alias.objects.filter(item_type="task", mou__name=mou_name).values_list(
+            "target", "alias"
+        )
+    )
+
+
+def test_giving_a_task_an_alias_dates_it(machine):
+    task = _task()
+    _set_version(task, EARLIER, "someone")
+
+    _alias(task, "api")
+
+    task.refresh_from_db()
+    assert task.field_versions["alias"][1] == machine
+    assert task.modified > EARLIER
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda: Alias.objects.filter(alias="api").delete(),
+        lambda: Alias.objects.filter(alias="api").update(alias="web"),
+    ],
+)
+def test_removing_or_renaming_an_alias_dates_it(change):
+    task = _task()
+    _alias(task, "api")
+    _set_field_versions(task, alias=(EARLIER, "someone"))
+
+    change()
+
+    task.refresh_from_db()
+    assert task.field_versions["alias"][0] > EARLIER
+
+
+def test_moving_an_alias_dates_both_tasks():
+    first, second = _task("1a"), _task("1b")
+    _alias(first, "api")
+    _set_field_versions(first, alias=(EARLIER, "someone"))
+
+    _alias(second, "api")
+
+    first.refresh_from_db()
+    second.refresh_from_db()
+    assert first.field_versions["alias"][0] > EARLIER
+    assert "alias" in second.field_versions
+
+
+def test_setting_the_same_alias_again_is_no_change():
+    """`rfp task import` sets every alias in the file again."""
+    task = _task()
+    _alias(task, "api")
+    _set_field_versions(task, alias=(EARLIER, "someone"))
+
+    _alias(task, "api")
+
+    task.refresh_from_db()
+    assert task.field_versions["alias"] == [EARLIER, "someone"]
+
+
+def test_mou_and_url_aliases_date_no_task():
+    task = _task()
+    _set_version(task, EARLIER, "someone")
+
+    Alias.create("mou", "nlnet-2026", "n")
+    Alias.create("url", "https://github.com/o/r", "r")
+
+    task.refresh_from_db()
+    assert "alias" not in task.field_versions
+    assert task.modified == EARLIER
+
+
+def test_a_task_is_exported_with_its_alias():
+    task = _task()
+    _alias(task, "api")
+    task.refresh_from_db()
+
+    entry = _by_uuid(export_entries(Remote()))[str(task.uuid)]
+
+    assert entry["alias"] == "api"
+    assert entry["versions"]["alias"] == task.field_versions["alias"]
+
+
+def test_a_task_without_alias_exports_none_without_version():
+    task = _task()
+
+    entry = _by_uuid(export_entries(Remote()))[str(task.uuid)]
+
+    assert entry["alias"] is None
+    assert "alias" not in entry["versions"]
+
+
+def test_a_new_task_comes_with_its_alias():
+    result = apply_entries(Remote.of(_task_entry(LATER, alias="api")))
+
+    task = _get_task()
+    assert task.alias == "api"
+    assert task.field_versions["alias"] == [LATER, OTHER]
+    assert (task.modified, task.modified_by) == (LATER, OTHER)
+    assert result.changed == 1
+
+
+def test_a_newer_alias_wins():
+    task = _task()
+    _alias(task, "api")
+    _set_version(task, EARLIER)
+    _set_field_versions(task, alias=(EARLIER, "here"))
+
+    apply_entries(Remote.of(_task_entry(LATER, alias="web")))
+
+    task.refresh_from_db()
+    assert _aliases() == {"1a": "web"}
+    assert task.field_versions["alias"] == [LATER, OTHER]
+    assert (task.modified, task.modified_by) == (LATER, OTHER)
+
+
+def test_an_older_alias_loses():
+    task = _task()
+    _alias(task, "api")
+    _set_field_versions(task, alias=(LATER, "here"))
+
+    result = apply_entries(Remote.of(_task_entry(EARLIER, alias="web")))
+
+    assert _aliases() == {"1a": "api"}
+    assert result.changed == 0
+
+
+def test_an_alias_removed_there_later_is_removed_here():
+    task = _task()
+    _alias(task, "api")
+    _set_field_versions(task, alias=(EARLIER, "here"))
+
+    apply_entries(Remote.of(_task_entry(LATER, alias=None)))
+
+    task.refresh_from_db()
+    assert _aliases() == {}
+    assert task.field_versions["alias"] == [LATER, OTHER]
+
+
+def test_an_alias_never_set_there_is_kept_here():
+    task = _task()
+    _alias(task, "api")
+    _set_version(task, EARLIER)
+
+    apply_entries(Remote.of(_task_entry(LATER, description="From NLnet")))
+
+    assert _aliases() == {"1a": "api"}
+
+
+def test_an_entry_from_before_aliases_were_synced_keeps_the_alias():
+    task = _task()
+    _alias(task, "api")
+    entry = _task_entry(LATER, description="From NLnet")
+    assert "alias" not in entry
+
+    apply_entries(Remote.of(entry))
+
+    assert task.alias == "api"
+
+
+@pytest.mark.parametrize("alias", ["has space", "", "1x", 42])
+def test_an_alias_that_cannot_be_one_is_skipped_with_a_warning(alias):
+    task = _task()
+    _alias(task, "api")
+    _set_field_versions(task, alias=(EARLIER, "here"))
+
+    result = apply_entries(
+        Remote.of(_task_entry(LATER, alias=alias, description="From NLnet"))
+    )
+
+    task.refresh_from_db()
+    assert _aliases() == {"1a": "api"}
+    assert task.field_versions["alias"] == [EARLIER, "here"]
+    assert task.description == "From NLnet"
+    assert result.warnings
+
+
+def test_the_same_alias_merged_twice_changes_nothing_the_second_time():
+    remote = Remote.of(_task_entry(LATER, alias="api"))
+    apply_entries(remote)
+
+    assert apply_entries(remote).changed == 0
+    assert _get_task().field_versions["alias"] == [LATER, OTHER]
+
+
+def test_an_alias_given_to_another_task_later_moves_there():
+    first = _task("1a")
+    _task("1b")
+    _alias(first, "api")
+    _set_version(first, EARLIER)
+    _set_field_versions(first, alias=(EARLIER, "here"))
+
+    apply_entries(Remote.of(_task_entry(LATER, name="1b", alias="api")))
+
+    first.refresh_from_db()
+    assert _aliases() == {"1b": "api"}
+    # The first task lost it to a newer alias, not by a change here.
+    assert first.field_versions["alias"] == [EARLIER, "here"]
+    assert first.modified == EARLIER
+
+
+def test_an_alias_given_to_another_task_here_later_stays_here():
+    first = _task("1a")
+    _task("1b")
+    _alias(first, "api")
+    _set_field_versions(first, alias=(LATER, "here"))
+
+    apply_entries(Remote.of(_task_entry(EARLIER, name="1b", alias="api")))
+
+    assert _aliases() == {"1a": "api"}
+    assert _get_task("1b").field_versions["alias"] == [EARLIER, OTHER]
+
+
+@pytest.mark.parametrize("order", [("1a", "1b"), ("1b", "1a")])
+def test_two_tasks_with_the_same_alias_agree_whatever_comes_first(order):
+    """Both computers gave the alias to a different task: the newer
+    one keeps it, on every computer."""
+    _task("1a")
+    _task("1b")
+    times = {"1a": EARLIER, "1b": LATER}
+
+    for name in order:
+        apply_entries(Remote.of(_task_entry(times[name], name=name, alias="api")))
+
+    assert _aliases() == {"1b": "api"}
+
+
+def test_aliases_of_the_same_name_in_two_mous_are_kept():
+    task = _task(mou_name="other")
+    _alias(task, "api")
+
+    apply_entries(Remote.of(_task_entry(LATER, alias="api")))
+
+    assert _aliases() == {"1a": "api"}
+    assert _aliases("other") == {"1a": "api"}
+
+
+def test_task_aliases_go_from_one_computer_to_the_other(repository, tmp_path):
+    task = _task("1a")
+    _alias(task, "api")
+    _other_computer_pushes(
+        repository, tmp_path, [_task_entry(LATER, name="1b", alias="web")]
+    )
+
+    sync = Sync(interactive=False)
+    sync.pull()
+    sync.push()
+
+    assert _aliases() == {"1a": "api", "1b": "web"}
+    pushed = _by_uuid(read_file(sync.git.path / sync.file_name))
+    assert pushed[str(task.uuid)]["alias"] == "api"
+    other = pushed[str(task_uuid("nlnet-2026", "1b"))]
+    assert other["alias"] == "web"
+    assert other["versions"]["alias"] == [LATER, OTHER]
+
+
+def test_migrating_dates_the_aliases_there_are(machine):
+    from importlib import import_module
+
+    from django.apps import apps
+
+    migration = import_module(
+        "nlnet_rfp_recorder.timetracking.migrations.0031_task_alias_versions"
+    )
+    aliased, plain = _task("1a"), _task("1b")
+    _alias(aliased, "api")
+    _set_field_versions(aliased, alias=None)
+    _set_version(aliased, EARLIER)
+
+    migration.date_task_aliases(apps, None)
+
+    aliased.refresh_from_db()
+    plain.refresh_from_db()
+    assert aliased.field_versions["alias"][1] == machine
+    assert aliased.modified > EARLIER
+    assert "alias" not in plain.field_versions
+
+
+# --- time reported on another computer ---------------------------------------
+
+
+def _reported_task(rate_settings, hours=1.0):
+    """A task with `hours` of tracked time, as synced to this computer."""
+    rate_settings.RFP_EUROS_PER_HOUR = 20.0
+    task = _task(max_budget=500.0)
+    link = Link.objects.create(url="https://github.com/o/r/issues/1", task=task)
+    start = datetime(2026, 11, 1, 9, 0)
+    record = TimeRecord.objects.create(
+        link=link, start_time=start, end_time=start + timedelta(hours=hours)
+    )
+    return task, record
+
+
+def _nlnet_report(task, request="req-1", budget=20, **status) -> Report:
+    """A request as `rfp mou update` brings it in: no lines, just what
+    it claims per task."""
+    report = Report.objects.create(
+        id=f"nlnet-2026-{request}", mou=task.mou, rfp_request=request, **status
+    )
+    ReportTask.objects.create(report=report, task=task, budget=budget, requested=True)
+    return report
+
+
+def test_time_in_a_report_gets_its_request(settings):
+    task, record = _reported_task(settings)
+    report = Report.create(task.mou)
+    report.add_time_record(record)
+    record.refresh_from_db()
+    assert record.rfp_request == ""
+    _set_version(record, EARLIER)
+
+    Report.objects.filter(pk=report.pk).update(rfp_request="req-1")
+
+    record.refresh_from_db()
+    assert record.rfp_request == "req-1"
+    assert record.modified > EARLIER  # so the other computers learn it
+
+
+def test_time_put_in_a_report_with_a_request_gets_it(settings):
+    task, record = _reported_task(settings)
+    report = Report.create(task.mou)
+    Report.objects.filter(pk=report.pk).update(rfp_request="req-1")
+    report.refresh_from_db()
+
+    report.add_time_record(record)
+
+    record.refresh_from_db()
+    assert record.rfp_request == "req-1"
+
+
+def test_time_taken_out_of_a_report_loses_its_request(settings):
+    task, record = _reported_task(settings)
+    report = Report.create(task.mou)
+    report.add_time_record(record)
+    Report.objects.filter(pk=report.pk).update(rfp_request="req-1")
+    record.refresh_from_db()
+
+    report.remove_time_record(record)
+
+    record.refresh_from_db()
+    assert record.rfp_request == ""
+
+
+def test_time_of_a_removed_report_loses_its_request(settings):
+    task, record = _reported_task(settings)
+    report = Report.create(task.mou)
+    report.add_time_record(record)
+    Report.objects.filter(pk=report.pk).update(rfp_request="req-1")
+
+    Report.objects.filter(pk=report.pk).delete()
+
+    record.refresh_from_db()
+    assert record.rfp_request == ""
+
+
+def test_time_keeps_its_request_when_the_report_is_renamed(settings):
+    task, record = _reported_task(settings)
+    report = Report.create(task.mou)
+    report.add_time_record(record)
+    Report.objects.filter(pk=report.pk).update(rfp_request="req-1")
+    report.refresh_from_db()
+
+    report.rename("nlnet-2026-2026-11-01-me-1")
+
+    record.refresh_from_db()
+    assert record.rfp_request == "req-1"
+
+
+def test_the_request_of_time_is_synced(settings):
+    task, record = _reported_task(settings)
+    TimeRecord.objects.filter(pk=record.pk).update(rfp_request="req-1")
+
+    entry = _by_uuid(export_entries(Remote()))[str(record.uuid)]
+
+    assert entry["rfp_request"] == "req-1"
+
+
+def test_time_reported_on_another_computer_is_reported_here(settings):
+    task, record = _reported_task(settings)
+    _set_version(record, EARLIER)
+    entry = _record_entry(str(record.uuid), str(record.link.uuid), LATER)
+    entry.update(
+        start_time="2026-11-01T09:00:00+01:00",
+        end_time="2026-11-01T10:00:00+01:00",
+        rfp_request="req-1",
+    )
+
+    apply_entries(Remote.of(entry))
+
+    record.refresh_from_db()
+    assert record.rfp_request == "req-1"
+    assert record.modified == LATER
+
+
+def test_the_report_here_decides_the_request_of_its_time(settings):
+    """This computer has the report: an edit from elsewhere that does not
+    know the request does not take it - and the others learn it."""
+    task, record = _reported_task(settings)
+    report = Report.create(task.mou)
+    report.add_time_record(record)
+    Report.objects.filter(pk=report.pk).update(rfp_request="req-1")
+    entry = _record_entry(str(record.uuid), str(record.link.uuid), LATER)
+    entry.update(
+        start_time="2026-11-01T09:00:00+01:00",
+        end_time="2026-11-01T10:00:00+01:00",
+        rfp_request="",
+    )
+
+    apply_entries(Remote.of(entry))
+
+    record.refresh_from_db()
+    assert record.rfp_request == "req-1"
+    assert record.modified > LATER
+
+
+def test_an_entry_without_request_keeps_the_one_here(settings):
+    """From a computer that does not sync the request yet."""
+    task, record = _reported_task(settings)
+    TimeRecord.objects.filter(pk=record.pk).update(rfp_request="req-1")
+    _set_version(record, EARLIER)
+    entry = _record_entry(str(record.uuid), str(record.link.uuid), LATER)
+    entry.update(
+        start_time="2026-11-01T09:00:00+01:00",
+        end_time="2026-11-01T10:00:00+01:00",
+    )
+
+    apply_entries(Remote.of(entry))
+
+    record.refresh_from_db()
+    assert record.rfp_request == "req-1"
+    assert record.modified == LATER
+
+
+def test_my_request_counts_as_reported_without_report_lines(settings):
+    task, record = _reported_task(settings)
+    TimeRecord.objects.filter(pk=record.pk).update(rfp_request="req-1")
+    _nlnet_report(task, budget=25)
+
+    assert task.reported_budget == 25
+    assert list(task.tracked_time_records) == []
+    assert task.unreported_budget == 0
+    assert task.budget == 25
+
+
+def test_my_request_is_not_used_by_others(settings):
+    task, record = _reported_task(settings)
+    TimeRecord.objects.filter(pk=record.pk).update(rfp_request="req-1")
+    _nlnet_report(task, budget=25)
+    Task.objects.filter(pk=task.pk).update(used_budget=25)
+    task.refresh_from_db()
+
+    assert task.used_by_others == 0
+
+
+def test_the_request_of_someone_else_is_used_by_others(settings):
+    task, record = _reported_task(settings)
+    TimeRecord.objects.filter(pk=record.pk).update(rfp_request="req-1")
+    _nlnet_report(task, budget=25)
+    _nlnet_report(task, request="req-2", budget=100)
+    Task.objects.filter(pk=task.pk).update(used_budget=125)
+    task.refresh_from_db()
+
+    assert task.reported_budget == 25
+    assert task.used_by_others == 100
+
+
+def test_time_of_a_declined_request_counts_as_not_reported(settings):
+    task, record = _reported_task(settings)
+    TimeRecord.objects.filter(pk=record.pk).update(rfp_request="req-1")
+    _nlnet_report(task, budget=25, declined=True)
+
+    assert task.reported_budget == 0
+    assert list(task.tracked_time_records) == [record]
+    assert task.unreported_budget == 20
+
+
+def test_time_of_a_request_this_computer_does_not_know_yet_counts_once(settings):
+    """Before `rfp mou update` here, the time is counted as worked."""
+    task, record = _reported_task(settings)
+    TimeRecord.objects.filter(pk=record.pk).update(rfp_request="req-1")
+
+    assert task.reported_budget == 0
+    assert task.unreported_budget == 20
+
+
+def test_time_reported_on_another_computer_is_not_reported_again(settings):
+    task, record = _reported_task(settings)
+    TimeRecord.objects.filter(pk=record.pk).update(rfp_request="req-1")
+    _nlnet_report(task)
+
+    report = Report.create(task.mou)
+    report.add_unreported_time_records()
+
+    assert not report.lines.exists()
+
+
+def test_the_triggers_are_made_anew(settings):
+    """An older version of a trigger is replaced, not kept."""
+    from django.db import connection
+
+    from nlnet_rfp_recorder.timetracking import triggers
+
+    with connection.cursor() as cursor:
+        cursor.execute("DROP TRIGGER rfp_sync_time_record_modified")
+        cursor.execute(
+            "CREATE TRIGGER rfp_sync_time_record_modified AFTER UPDATE ON "
+            "timetracking_timerecord BEGIN SELECT 1; END"
+        )
+    triggers.install(connection)
+
+    task, record = _reported_task(settings)
+    _set_version(record, EARLIER)
+    TimeRecord.objects.filter(pk=record.pk).update(rfp_request="req-1")
+    record.refresh_from_db()
+    assert record.modified > EARLIER

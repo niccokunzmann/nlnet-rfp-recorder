@@ -4134,9 +4134,11 @@ def alias_set(
     alias: str = typer.Argument(...),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Give a MoU, task, or repository URL a short alias."""
-    _setup(db, test, sync=False)
+    # Task aliases are synced, MoU and url aliases are not.
+    _setup(db, test, sync=item in (None, "task") and not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Alias, MoU
 
     mou = MoU.get_selected() if item == "task" else None
@@ -4159,9 +4161,11 @@ def alias_remove(
     ),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Remove an alias, identified by its alias or the id it names."""
-    _setup(db, test, sync=False)
+    # Task aliases are synced, MoU and url aliases are not.
+    _setup(db, test, sync=item in (None, "task") and not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Alias, MoU
 
     mou = MoU.get_selected() if item == "task" else None
@@ -4189,9 +4193,11 @@ def alias_rename(
     new_alias: str = typer.Argument(...),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """Rename an existing alias."""
-    _setup(db, test, sync=False)
+    # Task aliases are synced, MoU and url aliases are not.
+    _setup(db, test, sync=item in (None, "task") and not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Alias, MoU
 
     mou = MoU.get_selected() if item == "task" else None
@@ -4227,9 +4233,11 @@ def alias_list(
     item: AliasItemType | None = typer.Argument(None),
     db: Path | None = DbOption,
     test: bool = TestOption,
+    no_sync: bool = NoSyncOption,
 ) -> None:
     """List aliases, optionally filtered to one item type."""
-    _setup(db, test, sync=False)
+    # Task aliases are synced, MoU and url aliases are not.
+    _setup(db, test, sync=item in (None, "task") and not no_sync)
     from nlnet_rfp_recorder.timetracking.models import Alias
 
     aliases = Alias.objects.all()
